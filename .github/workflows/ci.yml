@@ -1,6 +1,6 @@
-# Typecheck, lint (Biome and Obsidian's own review rules) and build, on every push and
-# pull request. The test suite runs in the private monorepo this is published from.
-# Actions are pinned by commit, not tag: a moved tag would run someone else's code here.
+# Typecheck, lint (Biome and Obsidian's own review rules) and build, on every push to
+# `main` and every pull request. Actions are pinned by commit, not tag: a moved tag would
+# run someone else's code here.
 name: CI
 on:
   push:
@@ -9,24 +9,22 @@ on:
 permissions:
   contents: read
 jobs:
-  check:
+  # Its own job, so it reports as its own status and a failure here does not hide the
+  # results below. `.github/scripts/check-pins.sh` says what it accepts and why.
+  pins:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # Dependabot rewrites the `uses:` lines, so the rule that each is pinned by commit
-      # is checked rather than trusted. `.github/` belongs to this repository, not to the
-      # export, so this is the one place the rule can live.
-      # A local action (`./…`) has no ref to pin; a quoted value is unquoted first.
-      - name: Every action is pinned by commit
-        run: |
-          bad=$(grep -rnE '^\s*-?\s*uses:' .github \
-            | sed -E "s/uses:[[:space:]]*[\"']?([^\"'[:space:]]+)[\"']?/uses: \\1/" \
-            | grep -vE 'uses: (\./|[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$))' || true)
-          if [ -n "$bad" ]; then
-            echo "$bad"
-            echo "::error::pin every action by a 40-hex commit sha"
-            exit 1
-          fi
+        with:
+          persist-credentials: false
+      - run: bash .github/scripts/check-pins.sh
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # No token left in `.git/config` for the install and build scripts that run after.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           # `packageManager`, so the workflow and the manifest cannot name two versions.
