@@ -2,6 +2,11 @@
 
 Each release's section becomes its release notes. Newest first.
 
+## 0.0.3
+
+- Updated the signing library the plugin uses to prove it is your device
+  (`@noble/ed25519` 3.2.0), and the bundler that builds it. No change in behaviour.
+
 ## 0.0.2
 
 - **Installs on desktop Obsidian again.** 0.0.1 asked for Obsidian 1.13.8, which was only
