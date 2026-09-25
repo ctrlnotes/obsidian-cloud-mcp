@@ -1,0 +1,5 @@
+node_modules/
+# The bundle is attached to a GitHub release, never committed.
+main.js
+# Written by Obsidian when the plugin is loaded from this directory.
+data.json

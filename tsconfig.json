@@ -1,0 +1,33 @@
+// Ported from glass-1's plugin/tsconfig.json, with one change: that repo type-checked this
+// package with a second compiler (`@typescript/native`, an alias for a 7.x prerelease) kept
+// in step with a sibling `contract/` package. Neither exists here — this repository pins
+// TypeScript to 6.0.3 everywhere (root CLAUDE.md) — so this project uses the one plain
+// `typescript` devDependency, the same as `apps/client`.
+{
+  "compilerOptions": {
+    "target": "es2018",
+    "lib": ["es2018", "dom"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    // esbuild transpiles file by file and never sees the program, so a construct needing
+    // whole-program knowledge (`const enum`, a re-export that turns out to be a type) would
+    // compile to something broken. This makes tsc refuse those instead.
+    "isolatedModules": true,
+    "noUncheckedIndexedAccess": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    // Obsidian's own `obsidian.d.ts` (checked at 1.13.1) does not typecheck cleanly on
+    // every version — `Menu`, `Modal` and `PopoverSuggest` have disagreed with
+    // `HistoryHandler` in the past. Re-test on every `obsidian` bump before relying on it.
+    "skipLibCheck": true,
+    // Explicit rather than left to automatic @types discovery: under `moduleResolution:
+    // "bundler"`, tsc otherwise reports `node:fs`-style imports as "Cannot find name" even
+    // with `@types/node` installed — measured, not assumed.
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

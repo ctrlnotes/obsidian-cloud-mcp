@@ -1,0 +1,15 @@
+// The plugin's own Biome config. There is no root `biome.jsonc` in this repository to
+// inherit from — `apps/client` carries its own for the same reason (its own
+// `@biomejs/biome` devDependency, its own `includes`) — so this restates rather than
+// overrides anything. No `linter` block: Biome enables its recommended rules by default.
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.9/schema.json",
+  "files": {
+    "includes": ["**", "!main.js"]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  }
+}
