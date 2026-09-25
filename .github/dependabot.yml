@@ -1,0 +1,20 @@
+# Keeps the pinned GitHub Actions current. Each is pinned by commit with its version in a
+# trailing comment; Dependabot updates both.
+#
+# **Only `github-actions`, on purpose.** Everything outside `.github/` is written by an
+# export from the private monorepo the plugin is developed in, `package.json` included —
+# its dependencies are pinned to the exact versions that repository's tests ran against.
+# A Dependabot pull request against `package.json` here would be overwritten by the next
+# export, and would build a release against versions no test ran. Dependency updates
+# happen there; vulnerability alerts for them still arrive here.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"
