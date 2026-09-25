@@ -10,6 +10,7 @@ const facts = (over = {}) => ({
   changelog: CHANGELOG,
   releases: [{ id: 1, tag: "0.0.1", draft: false, assets: ["main.js", "manifest.json"] }],
   tagExists: false,
+  baseVersion: "0.0.1",
   ...over,
 });
 
@@ -31,6 +32,15 @@ describe("changelogSection", () => {
     expect(changelogSection(CHANGELOG, "0.0.1")).toBe("First release.");
   });
 
+  it("accepts CRLF line endings", () => {
+    expect(changelogSection(CHANGELOG.replaceAll("\n", "\r\n"), "0.0.2")).toBe("Fixed a thing.");
+  });
+
+  it("does not take a heading inside a code fence for a section", () => {
+    const text = "## 0.0.2\n\nSee:\n\n```md\n## 0.0.1\n```\n\n## 0.0.1\n\nFirst.\n";
+    expect(changelogSection(text, "0.0.2")).toBe("See:\n\n```md\n## 0.0.1\n```");
+  });
+
   it("is null for a missing or empty section", () => {
     expect(changelogSection(CHANGELOG, "0.0.3")).toBeNull();
     expect(changelogSection("## 0.0.3\n\n## 0.0.2\n\nx\n", "0.0.3")).toBeNull();
@@ -44,19 +54,22 @@ describe("decide", () => {
     expect(d).toMatchObject({ action: "release", version: "0.0.2", notes: "Fixed a thing." });
   });
 
-  it("releases the first version when nothing is released yet", () => {
+  // The bootstrap: the version was set before any release job existed, so the base already
+  // carries it, and there is no earlier run to re-run.
+  it("releases the first version when nothing is released yet, even from a base that had it", () => {
     const d = decide(
       facts({
         manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
         versions: { "0.0.1": "1.13.8" },
         releases: [],
+        baseVersion: "0.0.1",
       }),
     );
     expect(d.problems).toEqual([]);
     expect(d.action).toBe("release");
   });
 
-  it("compares against an existing release instead of releasing it again", () => {
+  it("recognises the latest release instead of releasing it again", () => {
     const d = decide(
       facts({
         manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
@@ -64,7 +77,7 @@ describe("decide", () => {
       }),
     );
     expect(d.problems).toEqual([]);
-    expect(d.action).toBe("compare");
+    expect(d.action).toBe("released");
   });
 
   // Each refusal, one at a time, so a check that stopped firing is named by its own case.
@@ -127,13 +140,33 @@ describe("decide", () => {
     expect(d.problems.join("\n")).toMatch(/published without manifest\.json/);
   });
 
-  // `gh release create` makes a draft, uploads, then publishes: a run that died between
-  // those leaves a draft and a tag. Nothing of it was public, so it is replaced, not trusted
-  // and not treated as a release that already happened.
-  it("replaces a draft a failed run left behind", () => {
+  // A release job that failed or was cancelled after a bump merged leaves the version set
+  // and unreleased. The next change must not publish its own code under that version.
+  it("refuses to finish a pending release from a later change", () => {
+    const d = decide(facts({ baseVersion: "0.0.2" }));
+    expect(d.action).toBe("none");
+    expect(d.problems.join("\n")).toMatch(/release 0\.0\.2 is pending/);
+  });
+
+  it("refuses a manifest that names an older release than the latest (a reverted bump)", () => {
     const d = decide(
       facts({
-        tagExists: true,
+        manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
+        versions: { "0.0.1": "1.13.8" },
+        releases: [
+          { id: 1, tag: "0.0.1", draft: false, assets: ["main.js", "manifest.json"] },
+          { id: 2, tag: "0.0.2", draft: false, assets: ["main.js", "manifest.json"] },
+        ],
+      }),
+    );
+    expect(d.action).toBe("none");
+    expect(d.problems.join("\n")).toMatch(/advertise an older version/);
+  });
+
+  // A draft is never public, and the read-only token `check` and `plan` use cannot see one.
+  it("ignores drafts", () => {
+    const d = decide(
+      facts({
         releases: [
           { id: 1, tag: "0.0.1", draft: false, assets: ["main.js", "manifest.json"] },
           { id: 9, tag: "0.0.2", draft: true, assets: ["main.js"] },
@@ -141,6 +174,6 @@ describe("decide", () => {
       }),
     );
     expect(d.problems).toEqual([]);
-    expect(d).toMatchObject({ action: "release", deleteDraft: 9 });
+    expect(d.action).toBe("release");
   });
 });
