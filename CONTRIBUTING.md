@@ -7,6 +7,8 @@ Thanks for looking. Issues and pull requests are welcome.
 - **Pull requests**: run `bun run typecheck`, `bun run lint` and `bun run test` first;
   CI runs the same, plus the build. `lint` includes Obsidian's own review rules at zero
   warnings, because a release that fails the community directory's review is delisted.
+- **Releases** are pull requests that bump the version; [RELEASING.md](RELEASING.md) says
+  how, and what CI refuses.
 - **Security issues**: do not open a public issue. Report privately through GitHub
   (Security → Report a vulnerability) or email security@ctrlnotes.app.
 

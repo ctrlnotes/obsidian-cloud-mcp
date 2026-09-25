@@ -39,3 +39,51 @@ jobs:
       - run: bun run lint
       - run: bun run test
       - run: bun run build
+      # Refuses in the pull request what the release job would refuse after the merge:
+      # a bad version, versions.json or CHANGELOG.md, or shipped files that changed
+      # without a version bump. See RELEASING.md.
+      - run: node tools/release.mjs check
+        env:
+          GH_TOKEN: ${{ github.token }}
+  # Tags and publishes a new version on the push that carries it (RELEASING.md). The only
+  # job with write access, and only on a push to `main`: never on a pull request.
+  release:
+    needs: [pins, check]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      # Sets `version` only when this push releases one; otherwise the steps below skip.
+      - id: plan
+        run: node tools/release.mjs release --notes "$RUNNER_TEMP/notes.md"
+      - if: steps.plan.outputs.version != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+      - if: steps.plan.outputs.version != ''
+        run: >
+          gh release create "$VERSION" main.js manifest.json
+          --target "$GITHUB_SHA" --title "$VERSION" --notes-file "$RUNNER_TEMP/notes.md" --latest
+        env:
+          VERSION: ${{ steps.plan.outputs.version }}
