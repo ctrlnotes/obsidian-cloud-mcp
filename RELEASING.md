@@ -32,6 +32,10 @@ release's.
 - `versions.json` not mapping the version to `minAppVersion`, not having it as its highest
   key, or naming a version that was never released (an older Obsidian would get a 404);
 - a missing `CHANGELOG.md` section;
+- a `minAppVersion` newer than Obsidian's current desktop release, read from the feed the
+  app updates from. Set it to the lowest version whose APIs the plugin needs (lint's
+  `no-unsupported-api` names them), never to "the latest": 0.0.1 asked for 1.13.8, which was
+  only ever released for Android, and no desktop Obsidian could install it;
 - a `manifest.json` that differs from the latest release's without a version bump, or that
   names an older version than the latest release (a reverted bump);
 - **a pending release**: a version set by an earlier change whose release never finished

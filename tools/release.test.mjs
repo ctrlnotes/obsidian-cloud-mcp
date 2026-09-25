@@ -5,12 +5,13 @@ const CHANGELOG = "# Changelog\n\n## 0.0.2\n\nFixed a thing.\n\n## 0.0.1\n\nFirs
 
 /** Facts for a repository that has released 0.0.1 and is about to release 0.0.2. */
 const facts = (over = {}) => ({
-  manifest: { version: "0.0.2", minAppVersion: "1.13.8" },
-  versions: { "0.0.1": "1.13.8", "0.0.2": "1.13.8" },
+  manifest: { version: "0.0.2", minAppVersion: "1.13.4" },
+  versions: { "0.0.1": "1.13.4", "0.0.2": "1.13.4" },
   changelog: CHANGELOG,
   releases: [{ id: 1, tag: "0.0.1", draft: false, assets: ["main.js", "manifest.json"] }],
   tagExists: false,
   baseVersion: "0.0.1",
+  desktopLatest: "1.13.7",
   ...over,
 });
 
@@ -59,8 +60,8 @@ describe("decide", () => {
   it("releases the first version when nothing is released yet, even from a base that had it", () => {
     const d = decide(
       facts({
-        manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
-        versions: { "0.0.1": "1.13.8" },
+        manifest: { version: "0.0.1", minAppVersion: "1.13.4" },
+        versions: { "0.0.1": "1.13.4" },
         releases: [],
         baseVersion: "0.0.1",
       }),
@@ -72,8 +73,8 @@ describe("decide", () => {
   it("recognises the latest release instead of releasing it again", () => {
     const d = decide(
       facts({
-        manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
-        versions: { "0.0.1": "1.13.8" },
+        manifest: { version: "0.0.1", minAppVersion: "1.13.4" },
+        versions: { "0.0.1": "1.13.4" },
       }),
     );
     expect(d.problems).toEqual([]);
@@ -82,20 +83,20 @@ describe("decide", () => {
 
   // Each refusal, one at a time, so a check that stopped firing is named by its own case.
   it.each([
-    ["a v prefix", { manifest: { version: "v0.0.2", minAppVersion: "1.13.8" } }, /not x\.y\.z/],
+    ["a v prefix", { manifest: { version: "v0.0.2", minAppVersion: "1.13.4" } }, /not x\.y\.z/],
     [
       "versions.json not mapping the version",
-      { versions: { "0.0.1": "1.13.8" } },
+      { versions: { "0.0.1": "1.13.4" } },
       /must map "0\.0\.2"/,
     ],
     [
       "versions.json mapping it to another minAppVersion",
-      { versions: { "0.0.1": "1.13.8", "0.0.2": "1.12.0" } },
-      /minAppVersion "1\.13\.8"/,
+      { versions: { "0.0.1": "1.13.4", "0.0.2": "1.12.0" } },
+      /minAppVersion "1\.13\.4"/,
     ],
     [
       "a higher key in versions.json than the manifest",
-      { versions: { "0.0.1": "1.13.8", "0.0.2": "1.13.8", "0.0.3": "1.13.8" } },
+      { versions: { "0.0.1": "1.13.4", "0.0.2": "1.13.4", "0.0.3": "1.13.4" } },
       /highest version is 0\.0\.3/,
     ],
     ["no changelog section", { changelog: "## 0.0.1\n\nFirst.\n" }, /no non-empty "## 0\.0\.2"/],
@@ -103,21 +104,31 @@ describe("decide", () => {
       "a version below the highest release",
       {
         releases: [{ id: 3, tag: "0.0.3", draft: false, assets: ["main.js", "manifest.json"] }],
-        versions: { "0.0.2": "1.13.8" },
+        versions: { "0.0.2": "1.13.4" },
       },
       /must be above the highest release, 0\.0\.3/,
     ],
     ["a tag with no release", { tagExists: true }, /tag 0\.0\.2 exists with no release/],
+    // 0.0.1 shipped with minAppVersion 1.13.8, an Android-only release: no desktop could
+    // install it. The desktop feed said 1.13.7.
+    [
+      "a minAppVersion newer than the current desktop release",
+      {
+        manifest: { version: "0.0.2", minAppVersion: "1.13.8" },
+        versions: { "0.0.1": "1.13.4", "0.0.2": "1.13.8" },
+      },
+      /minAppVersion 1\.13\.8 is newer than Obsidian's current desktop release, 1\.13\.7/,
+    ],
     [
       "a versions.json key that is not x.y.z",
-      { versions: { "0.0.1": "1.13.8", "0.0.1-beta": "1.13.8", "0.0.2": "1.13.8" } },
+      { versions: { "0.0.1": "1.13.4", "0.0.1-beta": "1.13.4", "0.0.2": "1.13.4" } },
       /key "0\.0\.1-beta" is not x\.y\.z/,
     ],
     [
       "a version in versions.json that was never released (skipped, or never shipped)",
       {
-        manifest: { version: "0.0.3", minAppVersion: "1.13.8" },
-        versions: { "0.0.1": "1.13.8", "0.0.2": "1.13.8", "0.0.3": "1.13.8" },
+        manifest: { version: "0.0.3", minAppVersion: "1.13.4" },
+        versions: { "0.0.1": "1.13.4", "0.0.2": "1.13.4", "0.0.3": "1.13.4" },
         changelog: "## 0.0.3\n\nThird.\n",
       },
       /names 0\.0\.2, which has no published release/,
@@ -131,8 +142,8 @@ describe("decide", () => {
   it("refuses a published release that is missing an asset", () => {
     const d = decide(
       facts({
-        manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
-        versions: { "0.0.1": "1.13.8" },
+        manifest: { version: "0.0.1", minAppVersion: "1.13.4" },
+        versions: { "0.0.1": "1.13.4" },
         releases: [{ id: 1, tag: "0.0.1", draft: false, assets: ["main.js"] }],
       }),
     );
@@ -151,8 +162,8 @@ describe("decide", () => {
   it("refuses a manifest that names an older release than the latest (a reverted bump)", () => {
     const d = decide(
       facts({
-        manifest: { version: "0.0.1", minAppVersion: "1.13.8" },
-        versions: { "0.0.1": "1.13.8" },
+        manifest: { version: "0.0.1", minAppVersion: "1.13.4" },
+        versions: { "0.0.1": "1.13.4" },
         releases: [
           { id: 1, tag: "0.0.1", draft: false, assets: ["main.js", "manifest.json"] },
           { id: 2, tag: "0.0.2", draft: false, assets: ["main.js", "manifest.json"] },
