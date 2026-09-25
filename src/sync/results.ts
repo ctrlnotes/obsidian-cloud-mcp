@@ -4,13 +4,14 @@ import type { Change } from "./derive.ts";
 /**
  * Obey the vault's verdict on one change we pushed.
  *
- * **One at a time, not batched.** Glass-1 pushed a whole batch and correlated `results[i]`
- * to `sent[i]` BY INDEX, because a rename followed by an edit inside one settle window was
- * two changes at the same path and a path-keyed map lost the rename's result. Our wire has
- * no batch — one `Up::Put`/`Up::Delete`/`Up::Rename` gets exactly one `Down::Applied` or
- * `Down::Refused` in reply — so there is no index to get wrong and nothing here to
- * correlate at all: the caller already knows which `Change` this answers, because it is
- * the only one it is waiting on.
+ * **One change at a time, whatever the frame.** Glass-1 pushed a whole batch and correlated
+ * `results[i]` to `sent[i]` BY INDEX, because a rename followed by an edit inside one settle
+ * window was two changes at the same path and a path-keyed map lost the rename's result. Our
+ * wire answers one `Up::Put`/`Up::Delete`/`Up::Rename` with exactly one `Down::Applied` or
+ * `Down::Refused`, so there is no index to get wrong. Its one batch, `put_batch` (bulk-ingest
+ * design BI5), carries puts to DISTINCT paths only and is answered per path, so the pump
+ * splits that answer into one verdict per change before it reaches here — the case that
+ * broke Glass-1, two changes at one path, cannot be in a batch at all.
  *
  * **There is no `merged` or `conflicted` status on our wire, and that is not a gap.**
  * An earlier prototype's server handed a resolved conflict back as a distinct `ChangeResult` carrying

@@ -63,6 +63,7 @@ import {
   type SettingsHost,
 } from "./settings-tab.ts";
 import { type Applied, pullIfUnchanged, type VaultFiles } from "./sync/apply.ts";
+import { batchLimitsFrom } from "./sync/batch.ts";
 import { type Change, deriveChanges, type ReadableFiles, syncablePath } from "./sync/derive.ts";
 import { Fetcher } from "./sync/fetcher.ts";
 import { type ScannableVault, scanManifest } from "./sync/manifest-scan.ts";
@@ -922,6 +923,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // A fresh connection (first handshake, or any reconnect): retry whatever was
             // in flight when the last one died (§11's content-addressing makes that safe),
             // and flush anything the user edited while disconnected.
+            //
+            // The batch limits first (BI5): they belong to THIS connection's vault, and the
+            // re-send `resume` makes is planned against them. A vault that advertises none
+            // gets every put singly, exactly as before batching existed.
+            pump.setBatchLimits(batchLimitsFrom(down));
             pump.resume();
             this.settler?.touch();
             // A reconnect is also a relink's most likely moment — re-scan the
@@ -1466,10 +1472,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         unsyncable: this.shadowed.length + this.withheld.size,
       });
 
-      for (const [i, change] of changes.entries()) {
+      // A window at a time: a whole batch against a vault that takes them (BI5), one change
+      // against one that does not — which is exactly the one-at-a-time loop this replaced.
+      // The window is re-read each time round, because a reconnect in the middle of a long
+      // first sync may land on a vault with different limits.
+      for (let start = 0; start < changes.length; ) {
         const pump = this.pump;
         if (pump === null || this.socket?.isReady !== true) {
-          // Disconnected mid-loop (unpair, a terminal closing, or unload). `change` and
+          // Disconnected mid-loop (unpair, a terminal closing, or unload). This window and
           // everything still behind it in `changes` were derived from `touched` but never
           // sent — blocker fix: losing them here silently drops the rest of this settle's
           // batch, not just the one change that happened to be at the front.
@@ -1479,17 +1489,30 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           // still be handshaking when the derive finishes. Sending then throws inside the
           // pump; handing the changes back instead lets `ready`'s `settler.touch()` derive
           // and send them once, on a connection that can carry them.
-          this.redirtyRemaining(changes.slice(i));
+          this.redirtyRemaining(changes.slice(start));
           break;
         }
-        try {
-          const outcome = await pump.push(change);
-          this.applyPushOutcome(outcome);
-        } catch (e) {
-          console.warn(`Ctrl Notes: could not send ${change.path}`, e);
-          // Retried on the next settle, not lost — the same blocker fix: everything from
-          // `change` onward, not only the one that threw.
-          this.redirtyRemaining(changes.slice(i));
+        const slice = changes.slice(start, start + pump.windowSize());
+        const settled = await Promise.allSettled(pump.pushAll(slice));
+        const failed: Change[] = [];
+        for (const [i, result] of settled.entries()) {
+          const change = slice[i] as Change;
+          if (result.status === "fulfilled") {
+            // In order, so two outcomes for one path apply as the queue sent them.
+            this.applyPushOutcome(result.value);
+          } else {
+            console.warn(`Ctrl Notes: could not send ${change.path}`, result.reason);
+            failed.push(change);
+          }
+        }
+        start += slice.length;
+        // Progress an import can see: the count falls a window at a time, not all at once
+        // at the end.
+        this.setStatus({ pending: changes.length - start });
+        if (failed.length > 0) {
+          // Retried on the next settle, not lost — the same blocker fix: whatever failed in
+          // this window and everything behind it, not only the one that threw.
+          this.redirtyRemaining([...failed, ...changes.slice(start)]);
           break;
         }
       }

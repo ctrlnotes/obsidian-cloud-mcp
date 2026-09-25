@@ -1,0 +1,17 @@
+{
+  "type": "put_batch",
+  "puts": [
+    {
+      "path": "projects/alpha.md",
+      "base_sha": "9f2c1a4e7b3d5f6081a2c4e6f8091a2b3c4d5e6f7081920a3b4c5d6e7f809102",
+      "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809",
+      "bytes": 1024
+    },
+    {
+      "path": "projects/beta.md",
+      "base_sha": null,
+      "sha": "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8091a",
+      "bytes": 2048
+    }
+  ]
+}

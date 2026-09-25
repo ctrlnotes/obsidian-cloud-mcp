@@ -30,6 +30,7 @@ describe("every documented down fixture decodes", () => {
     "down.snapshot_page.json",
     "down.closing.json",
     "down.closing_never.json",
+    "down.applied_batch.json",
   ])("%s", (name) => {
     expect(() => decodeDown(fixture(`vault-sync/${name}`))).not.toThrow();
   });
@@ -138,6 +139,53 @@ describe("a closing's retry field", () => {
     ["null", { retry: null }],
   ])("%s decodes as later, without throwing", (_label, extra) => {
     expect(retry(extra)).toBe("later");
+  });
+});
+
+/**
+ * Bulk-ingest design BI5. A vault older than `put_batch` sends a `ready` with no limits, and
+ * that must read as "no batching", not as a malformed frame — a decode error on `ready` would
+ * fail the handshake with every vault not yet moved to a batching release.
+ */
+describe("the batch limits a ready frame carries", () => {
+  it("read as 0 and 0 when the vault sends none", () => {
+    expect(decodeDown({ type: "ready", seq: 7 })).toEqual({
+      type: "ready",
+      seq: 7,
+      max_batch_ops: 0,
+      max_batch_bytes: 0,
+    });
+  });
+
+  it("are read when present", () => {
+    expect(
+      decodeDown({ type: "ready", seq: 7, max_batch_ops: 100, max_batch_bytes: 4194304 }),
+    ).toMatchObject({ max_batch_ops: 100, max_batch_bytes: 4194304 });
+  });
+
+  it("are still an error when present and not numbers", () => {
+    expect(() => decodeDown({ type: "ready", seq: 7, max_batch_ops: "100" })).toThrow();
+  });
+});
+
+describe("an applied_batch answer", () => {
+  it("needs both lists", () => {
+    expect(() => decodeDown({ type: "applied_batch", applied: [] })).toThrow(/refused/);
+    expect(() => decodeDown({ type: "applied_batch", refused: [] })).toThrow(/applied/);
+  });
+
+  it("carries a null seq and a null current_sha through", () => {
+    expect(
+      decodeDown({
+        type: "applied_batch",
+        applied: [{ path: "a.md", seq: null, sha: "s" }],
+        refused: [{ path: "b.md", reason: "r", current_sha: null }],
+      }),
+    ).toEqual({
+      type: "applied_batch",
+      applied: [{ path: "a.md", seq: null, sha: "s" }],
+      refused: [{ path: "b.md", reason: "r", current_sha: null }],
+    });
   });
 });
 

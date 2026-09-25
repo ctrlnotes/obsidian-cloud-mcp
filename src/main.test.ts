@@ -2570,3 +2570,102 @@ describe("a parked device", () => {
     });
   });
 });
+
+/**
+ * Bulk-ingest design BI5, end to end through the shell: a first sync against a vault that
+ * advertises batch limits in `ready` goes up a window at a time as `put_batch` frames, and one
+ * against a vault that advertises none goes exactly as it did before batching existed.
+ */
+describe("a first sync, batched when the vault takes batches", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  /**
+   * A vault on the other end that answers every upload as landed: `applied_batch` for a
+   * batch, `applied` for a single put. Answered a microtask later, as a real socket would —
+   * never from inside the `send` call, which would land an answer before the batch's binary
+   * frames had been written.
+   */
+  const acceptEverything = (ws: FakeWebSocket): void => {
+    const rawSend = ws.send.bind(ws);
+    let seq = 0;
+    ws.send = (data: string | Uint8Array) => {
+      rawSend(data);
+      if (typeof data !== "string") return;
+      const frame = JSON.parse(data) as {
+        type?: string;
+        path?: string;
+        sha?: string;
+        puts?: { path: string; sha: string }[];
+      };
+      if (frame.type === "put_batch") {
+        const applied = (frame.puts ?? []).map((p) => ({ path: p.path, seq: ++seq, sha: p.sha }));
+        queueMicrotask(() => ws.emit({ type: "applied_batch", applied, refused: [] }));
+      } else if (frame.type === "put") {
+        const answer = { type: "applied", path: frame.path, seq: ++seq, sha: frame.sha };
+        queueMicrotask(() => ws.emit(answer));
+      }
+    };
+  };
+
+  /** Load a never-synced device holding `n` small notes and bring it up with this `ready`. */
+  const firstSync = async (n: number, ready: Record<string, unknown>) => {
+    stubWebSocket();
+    const files: Record<string, string> = {};
+    for (let i = 0; i < n; i++) files[`note-${String(i).padStart(3, "0")}.md`] = `note ${i}\n`;
+    const plugin = await load(files, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    acceptEverything(ws);
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({ type: "ready", seq: 0, ...ready });
+    return { plugin, ws, paths: Object.keys(files) };
+  };
+
+  /**
+   * 250 notes against a vault taking 100 at a time: 100, 100 and 50, and nothing single.
+   *
+   * **Proven able to fail** by leaving `pushTouched` on the one-at-a-time loop: every note
+   * goes as its own `put` and no `put_batch` is sent.
+   */
+  it("sends 250 small files as 3 put_batch frames against a ready advertising 100 / 4 MiB", async () => {
+    const { plugin, ws, paths } = await firstSync(250, {
+      max_batch_ops: 100,
+      max_batch_bytes: 4194304,
+    });
+    const batched = () =>
+      ws
+        .upFrames()
+        .filter((f) => f.type === "put_batch")
+        .map((f) => (f.puts as { path: string }[]).map((p) => p.path));
+    await vi.waitFor(() => expect(batched().flat()).toHaveLength(250), UNTIL);
+    await settleMicrotasks(QUIET_MS + 500); // quiet window: nothing else goes up
+
+    expect(batched().map((b) => b.length)).toEqual([100, 100, 50]);
+    expect(new Set(batched().flat())).toEqual(new Set(paths));
+    expect(ws.upFrames().filter((f) => f.type === "put")).toEqual([]);
+    // One binary frame per entry: every note fits one.
+    expect(ws.sent.filter((d) => typeof d !== "string")).toHaveLength(250);
+    expect(plugin.syncStatus().pending).toBe(0);
+  });
+
+  /** A vault older than the frame sends a `ready` with no limits: every put goes singly, which
+   * is the only thing such a vault can answer. */
+  it("sends every put as a put against a ready with no batch fields", async () => {
+    const { ws, paths } = await firstSync(5, {});
+    await vi.waitFor(
+      () => expect(ws.upFrames().filter((f) => f.type === "put")).toHaveLength(5),
+      UNTIL,
+    );
+    await settleMicrotasks(QUIET_MS + 500);
+
+    expect(ws.upFrames().filter((f) => f.type === "put_batch")).toEqual([]);
+    expect(
+      ws
+        .upFrames()
+        .filter((f) => f.type === "put")
+        .map((f) => f.path)
+        .sort(),
+    ).toEqual(paths.sort());
+  });
+});

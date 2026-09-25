@@ -12,6 +12,10 @@ Each release's section becomes its release notes. Newest first.
 - **An upload in progress keeps its vault awake.** While changes are waiting to be sent, a
   reconnect waits at most 30 seconds, so a large first sync is never left half-finished
   while its vault goes to sleep.
+- **A first sync uploads notes in batches.** Against a vault that supports it, up to 100
+  small files (or 4 MiB) go up in one round trip instead of one each, so a large vault's
+  first sync takes minutes rather than hours. Larger files, deletes and renames go one at
+  a time as before, and so does everything against a vault that has not been updated.
 - Speaks sync protocol version 4, and still version 3 for vaults not yet updated. Vaults
   on version 4 refuse older plugins with a message asking you to update.
 

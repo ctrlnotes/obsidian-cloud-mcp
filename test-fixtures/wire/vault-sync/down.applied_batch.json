@@ -1,0 +1,17 @@
+{
+  "type": "applied_batch",
+  "applied": [
+    {
+      "path": "projects/alpha.md",
+      "seq": 4821,
+      "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+    }
+  ],
+  "refused": [
+    {
+      "path": "projects/beta.md",
+      "reason": "the uploaded bytes do not match the declared sha",
+      "current_sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+    }
+  ]
+}

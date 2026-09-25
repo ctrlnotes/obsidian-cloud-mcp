@@ -1,11 +1,21 @@
 // SyncPump's tests.
 
 import { describe, expect, it, type Mock, vi } from "vitest";
-import type { DownApplied, DownEvent, DownRefused, DownSnapshot, Up } from "../wire.ts";
+import type {
+  DownApplied,
+  DownAppliedBatch,
+  DownEvent,
+  DownRefused,
+  DownSnapshot,
+  Up,
+  UpPutBatch,
+} from "../wire.ts";
 import { MAX_FRAME_BYTES } from "../wire.ts";
 import type { ApplyDeps, VaultFiles } from "./apply.ts";
+import type { Change } from "./derive.ts";
 import { contentHash } from "./hash.ts";
-import { Pump, type PumpDeps, type SyncTransport } from "./pump.ts";
+import { PUT_CHUNK_BYTES, Pump, type PumpDeps, type SyncTransport } from "./pump.ts";
+import { planRetry } from "./retry.ts";
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
 
@@ -751,5 +761,242 @@ describe("Pump — an unpushed edit is handed back, not overwritten", () => {
     expect(h.vault.text("n.md")).toBe("local edit\n");
     expect(kept).toEqual(["n.md"]);
     expect(h.cursors).toEqual([9]);
+  });
+});
+
+/**
+ * Bulk-ingest design BI5: against a vault that advertised batch limits in `ready`, consecutive
+ * small puts at the head of the queue leave as one `put_batch`, and one `applied_batch`
+ * settles them all by path. Still single-flight: batching changes the unit, not the
+ * concurrency.
+ */
+describe("Pump — put_batch", () => {
+  const LIMITS = { maxOps: 100, maxBytes: 4 * 1024 * 1024 };
+  const put = (path: string, size = 3): Change => ({
+    op: "put",
+    path,
+    base: null,
+    content: new Uint8Array(size).fill(path.length),
+    hash: `sha-${path}`,
+  });
+  const batching = () => {
+    const h = harness();
+    h.pump.setBatchLimits(LIMITS);
+    return h;
+  };
+  const batches = (h: ReturnType<typeof harness>): UpPutBatch[] =>
+    h.transport.sent.filter((u): u is UpPutBatch => u.type === "put_batch");
+  const answer = (h: ReturnType<typeof harness>, down: Omit<DownAppliedBatch, "type">) =>
+    h.pump.handleDown({ type: "applied_batch", ...down });
+
+  /**
+   * One header, then exactly one binary frame per entry, in order, with an empty file as a
+   * zero-length frame: the vault correlates frames with entries by position. **Proven able to
+   * fail** by skipping the frame of an empty entry: the frame lengths read `[3, 5]`, and every
+   * frame after the empty file would belong to the wrong entry.
+   */
+  it("sends consecutive small puts as one put_batch, then one binary frame each", () => {
+    const h = batching();
+    const changes = [put("a.md", 3), put("b.md", 0), put("c.md", 5)];
+    void h.pump.pushAll(changes);
+
+    expect(h.transport.sent).toEqual([
+      {
+        type: "put_batch",
+        puts: [
+          { path: "a.md", base_sha: null, sha: "sha-a.md", bytes: 3 },
+          { path: "b.md", base_sha: null, sha: "sha-b.md", bytes: 0 },
+          { path: "c.md", base_sha: null, sha: "sha-c.md", bytes: 5 },
+        ],
+      },
+    ]);
+    expect(h.transport.binary.map((b) => b.byteLength)).toEqual([3, 0, 5]);
+    expect(h.transport.binary).toEqual(changes.map((c) => (c.op === "put" ? c.content : null)));
+  });
+
+  it("settles every entry by path from one applied_batch, and a refused one reaches onRefused and retry.ts", async () => {
+    const h = batching();
+    const [a, b, c] = h.pump.pushAll([put("a.md"), put("b.md"), put("c.md")]);
+    const refused = { path: "b.md", reason: "stale", current_sha: "cur" };
+    // Out of order on purpose: the answer is keyed by path, never by position.
+    void answer(h, {
+      applied: [
+        { path: "c.md", seq: 12, sha: "sha-c.md" },
+        { path: "a.md", seq: null, sha: "sha-a.md" },
+      ],
+      refused: [refused],
+    });
+
+    await expect(a).resolves.toMatchObject({ hashes: { "a.md": "sha-a.md" }, refused: null });
+    await expect(c).resolves.toMatchObject({ hashes: { "c.md": "sha-c.md" }, refused: null });
+    const outcomeB = await (b as Promise<{ refused: DownRefused | null }>);
+    expect(outcomeB.refused).toEqual({ type: "refused", ...refused });
+    expect(h.refusals).toEqual([{ type: "refused", ...refused }]);
+    // What `main.ts` does with it: a current sha to reconcile against, so it is redirtied.
+    expect(planRetry(h.refusals).redirty).toEqual([{ path: "b.md", currentSha: "cur" }]);
+    expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  it("sends a put larger than one chunk alone, between batches", async () => {
+    const h = batching();
+    const big = put("big.png", 300 * 1024);
+    const done = h.pump.pushAll([put("a.md"), put("b.md"), big, put("c.md"), put("d.md")]);
+
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put_batch"]);
+    void answer(h, {
+      applied: [
+        { path: "a.md", seq: 1, sha: "sha-a.md" },
+        { path: "b.md", seq: 2, sha: "sha-b.md" },
+      ],
+      refused: [],
+    });
+    await Promise.all(done.slice(0, 2));
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put_batch", "put"]);
+    // Today's chunked put: more than one frame, because it is more than one chunk.
+    expect(h.transport.binary.length).toBe(2 + Math.ceil((300 * 1024) / PUT_CHUNK_BYTES));
+
+    void h.pump.handleDown({ type: "applied", path: "big.png", seq: 3, sha: "sha-big.png" });
+    await done[2];
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put_batch", "put", "put_batch"]);
+    expect(batches(h)[1]?.puts.map((p) => p.path)).toEqual(["c.md", "d.md"]);
+  });
+
+  it("ends a batch at a delete or a rename, which go as their own frames", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([
+      put("a.md"),
+      put("b.md"),
+      { op: "delete", path: "x.md", base: "bx" },
+      { op: "rename", path: "z.md", from: "y.md", base: "by" },
+      put("c.md"),
+    ]);
+    void answer(h, {
+      applied: [
+        { path: "a.md", seq: 1, sha: "sha-a.md" },
+        { path: "b.md", seq: 2, sha: "sha-b.md" },
+      ],
+      refused: [],
+    });
+    await Promise.all(done.slice(0, 2));
+    void h.pump.handleDown({ type: "applied", path: "x.md", seq: 3, sha: "" });
+    await done[2];
+    void h.pump.handleDown({ type: "applied", path: "z.md", seq: 4, sha: "sz" });
+    await done[3];
+
+    // A lone put after them is a plain put, not a batch of one.
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put_batch", "delete", "rename", "put"]);
+  });
+
+  /** A vault without the frame drops it in silence: sending one would stall the queue for
+   * good. **Proven able to fail** by defaulting the limits to the wire's constants. */
+  it("sends every put singly without limits", async () => {
+    const h = harness();
+    const done = h.pump.pushAll([put("a.md"), put("b.md")]);
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put"]);
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: "sha-a.md" });
+    await done[0];
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put", "put"]);
+    expect(h.pump.windowSize()).toBe(1);
+  });
+
+  it("rejects an entry the answer does not name, rather than leaving it pending", async () => {
+    const h = batching();
+    const [a, b] = h.pump.pushAll([put("a.md"), put("b.md")]);
+    void answer(h, { applied: [{ path: "a.md", seq: 1, sha: "sha-a.md" }], refused: [] });
+
+    await expect(a).resolves.toMatchObject({ hashes: { "a.md": "sha-a.md" } });
+    await expect(b).rejects.toThrow(/b\.md/);
+    expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  it("ignores a single answer while a batch is in flight, and a batch answer while none is", async () => {
+    const h = batching();
+    const [a] = h.pump.pushAll([put("a.md")]); // alone: a plain put
+    void answer(h, { applied: [{ path: "a.md", seq: 1, sha: "wrong" }], refused: [] });
+    expect(h.pump.hasOutstanding()).toBe(true);
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: "sha-a.md" });
+    await a;
+
+    const [b, c] = h.pump.pushAll([put("b.md"), put("c.md")]);
+    void h.pump.handleDown({ type: "applied", path: "b.md", seq: 2, sha: "wrong" });
+    expect(h.pump.hasOutstanding()).toBe(true);
+    void answer(h, {
+      applied: [
+        { path: "b.md", seq: 2, sha: "sha-b.md" },
+        { path: "c.md", seq: 3, sha: "sha-c.md" },
+      ],
+      refused: [],
+    });
+    await expect(b).resolves.toMatchObject({ hashes: { "b.md": "sha-b.md" } });
+    await c;
+  });
+
+  /** §11 for a batch: a drop leaves every entry at the head of the queue, and `resume()`
+   * sends them all again — re-planned against whatever limits the new connection has. */
+  it("a drop plus resume() re-sends the whole in-flight batch", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([put("a.md"), put("b.md"), put("c.md")]);
+    expect(batches(h)).toHaveLength(1);
+
+    h.pump.resume();
+    expect(batches(h)).toHaveLength(2);
+    expect(batches(h)[1]).toEqual(batches(h)[0]);
+    expect(h.transport.binary).toHaveLength(6);
+
+    // A reconnect to a vault that no longer batches: the same heads, one at a time.
+    h.pump.setBatchLimits(null);
+    h.pump.resume();
+    expect(h.transport.sent.map((u) => u.type)).toEqual(["put_batch", "put_batch", "put"]);
+    for (const [i, path] of ["a.md", "b.md", "c.md"].entries()) {
+      void h.pump.handleDown({ type: "applied", path, seq: i + 1, sha: `sha-${path}` });
+      await done[i];
+    }
+  });
+
+  it("abandon() rejects every batched entry", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([put("a.md"), put("b.md"), put("c.md")]);
+    h.pump.abandon();
+    for (const d of done) await expect(d).rejects.toThrow();
+    expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  it("a batch whose send throws rejects every entry and leaves nothing to re-send", async () => {
+    const h = batching();
+    const send = h.transport.send.bind(h.transport);
+    let ready = false;
+    h.transport.send = (up) => {
+      if (!ready) throw new Error("cannot send before the sync handshake completes");
+      send(up);
+    };
+    const done = h.pump.pushAll([put("a.md"), put("b.md")]);
+    for (const d of done) await expect(d).rejects.toThrow();
+    ready = true;
+    h.pump.resume();
+    expect(h.transport.sent).toEqual([]);
+  });
+
+  it("pushAll rejects an oversize change alone and still sends the rest", async () => {
+    const h = batching();
+    const huge = put("huge.bin", MAX_FRAME_BYTES + 1);
+    const [a, bad, b] = h.pump.pushAll([put("a.md"), huge, put("b.md")]);
+    await expect(bad).rejects.toThrow(/MAX_FRAME_BYTES/);
+    expect(batches(h)[0]?.puts.map((p) => p.path)).toEqual(["a.md", "b.md"]);
+    void answer(h, {
+      applied: [
+        { path: "a.md", seq: 1, sha: "sha-a.md" },
+        { path: "b.md", seq: 2, sha: "sha-b.md" },
+      ],
+      refused: [],
+    });
+    await a;
+    await b;
+  });
+
+  it("offers a window of a whole batch only while the vault takes them", () => {
+    const h = harness();
+    expect(h.pump.windowSize()).toBe(1);
+    h.pump.setBatchLimits(LIMITS);
+    expect(h.pump.windowSize()).toBe(100);
   });
 });

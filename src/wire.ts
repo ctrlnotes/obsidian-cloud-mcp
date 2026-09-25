@@ -135,7 +135,33 @@ export interface UpWant {
   readonly shas: readonly string[];
 }
 
-export type Up = UpHello | UpAck | UpPut | UpDelete | UpRename | UpSnapshot | UpWant;
+/** One entry of a {@link UpPutBatch}: the header of a `put`, without its `type`. */
+export interface BatchPutEntry {
+  readonly path: string;
+  readonly base_sha: string | null;
+  readonly sha: string;
+  readonly bytes: number;
+}
+
+/**
+ * Several puts in one frame (bulk-ingest design BI5), answered by one {@link DownAppliedBatch}.
+ *
+ * **Exactly `puts.length` binary frames follow, one per entry, in order** — entry i's WHOLE
+ * content in frame i, a zero-length frame for an empty file, nothing interleaved. The vault
+ * correlates by position, and a frame whose length is not its entry's `bytes` refuses that
+ * entry alone. So only content that fits one frame is ever batched (`sync/batch.ts`'s
+ * `BATCH_ENTRY_MAX_BYTES`); anything larger goes alone as an ordinary chunked `put`.
+ *
+ * **Sent only to a vault that advertised it** in `ready` (`DownReady.max_batch_ops`). A vault
+ * without it drops an unknown frame in silence, and the pump would wait for an answer that
+ * never comes. Puts only: a delete or a rename is always its own frame.
+ */
+export interface UpPutBatch {
+  readonly type: "put_batch";
+  readonly puts: readonly BatchPutEntry[];
+}
+
+export type Up = UpHello | UpAck | UpPut | UpPutBatch | UpDelete | UpRename | UpSnapshot | UpWant;
 
 /** The plugin only ever sends `Up` frames; this is the whole of that job. */
 export function encodeUp(up: Up): string {
@@ -153,6 +179,13 @@ export interface DownChallenge {
 export interface DownReady {
   readonly type: "ready";
   readonly seq: number;
+  /**
+   * The most entries this vault takes in one {@link UpPutBatch}, and the most content bytes
+   * across them (bulk-ingest design BI5). **0 means "no batching"**, which is what a vault
+   * older than the frame looks like: it sends neither field, and every put goes singly.
+   */
+  readonly max_batch_ops: number;
+  readonly max_batch_bytes: number;
 }
 
 export interface DownEvent {
@@ -178,6 +211,33 @@ export interface DownRefused {
   readonly path: string;
   readonly reason: string;
   readonly current_sha: string | null;
+}
+
+/** One entry of a batch that landed. `seq` is that entry's own event, or `null` when the vault
+ * already held those bytes there and wrote nothing. */
+export interface AppliedBatchEntry {
+  readonly path: string;
+  readonly seq: number | null;
+  readonly sha: string;
+}
+
+/** One entry of a batch the vault refused — the same meaning as a {@link DownRefused}. */
+export interface RefusedBatchEntry {
+  readonly path: string;
+  readonly reason: string;
+  readonly current_sha: string | null;
+}
+
+/**
+ * The one answer to a {@link UpPutBatch} (bulk-ingest design BI5). **Every entry of the batch
+ * appears in exactly one of the two lists**, keyed by path (a batch's paths are distinct). A
+ * refused entry never refuses its neighbours: a stale base on one path is reconciled or
+ * refused alone, and the rest land.
+ */
+export interface DownAppliedBatch {
+  readonly type: "applied_batch";
+  readonly applied: readonly AppliedBatchEntry[];
+  readonly refused: readonly RefusedBatchEntry[];
 }
 
 export interface SnapshotEntry {
@@ -248,6 +308,7 @@ export type Down =
   | DownEvent
   | DownApplied
   | DownRefused
+  | DownAppliedBatch
   | DownSnapshot
   | DownBlob
   | DownNoBlob
@@ -320,6 +381,19 @@ function numOrNull(v: unknown, field: string): number | null {
   return v === null ? null : num(v, field);
 }
 
+/**
+ * A count a vault older than the field does not send: absent is 0, which every caller reads as
+ * "not offered". Present and not a number is still an error, like {@link optionalStrOrNull}.
+ */
+function optionalNum(v: unknown, field: string): number {
+  return v === undefined ? 0 : num(v, field);
+}
+
+function array(v: unknown, field: string): unknown[] {
+  if (!Array.isArray(v)) throw new DownDecodeError(`\`${field}\` must be an array`);
+  return v;
+}
+
 function record(v: unknown): Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     throw new DownDecodeError("a frame must be a JSON object");
@@ -349,7 +423,12 @@ export function decodeDown(raw: unknown): Down {
       };
     }
     case "ready":
-      return { type: "ready", seq: num(v.seq, "seq") };
+      return {
+        type: "ready",
+        seq: num(v.seq, "seq"),
+        max_batch_ops: optionalNum(v.max_batch_ops, "max_batch_ops"),
+        max_batch_bytes: optionalNum(v.max_batch_bytes, "max_batch_bytes"),
+      };
     case "event":
       return {
         type: "event",
@@ -373,6 +452,26 @@ export function decodeDown(raw: unknown): Down {
         path: str(v.path, "path"),
         reason: str(v.reason, "reason"),
         current_sha: strOrNull(v.current_sha, "current_sha"),
+      };
+    case "applied_batch":
+      return {
+        type: "applied_batch",
+        applied: array(v.applied, "applied").map((a) => {
+          const e = record(a);
+          return {
+            path: str(e.path, "path"),
+            seq: numOrNull(e.seq, "seq"),
+            sha: str(e.sha, "sha"),
+          };
+        }),
+        refused: array(v.refused, "refused").map((r) => {
+          const e = record(r);
+          return {
+            path: str(e.path, "path"),
+            reason: str(e.reason, "reason"),
+            current_sha: strOrNull(e.current_sha, "current_sha"),
+          };
+        }),
       };
     case "snapshot": {
       const files = v.files;

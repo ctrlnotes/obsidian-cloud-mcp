@@ -17,9 +17,10 @@ import type { DownRefused } from "../wire.ts";
  * `planRetry` to rebuild a `create` from the SENT change, because the batch was the only
  * surviving copy of a rejected edit's content: an inbound change riding in on the SAME
  * response had already overwritten the path on disk by the time the batch's results were
- * dispatched. Our wire has no batch — one push gets exactly one answer, and nothing else
- * touches that path in between — so a rejected push never has its own local content
- * clobbered out from under it, and there is no rescue copy to build.
+ * dispatched. Our wire answers each push on its own — even a `put_batch` is answered per
+ * path, and inbound events arrive as frames of their own, never inside the answer — so a
+ * rejected push never has its own local content clobbered out from under it, and there is
+ * no rescue copy to build.
  *
  * **A routine "we both changed this" never reaches this file at all.** Reading
  * `apps/vault/src/http/routes/sync.rs`'s `apply_upload`: a stale `base_sha` triggers

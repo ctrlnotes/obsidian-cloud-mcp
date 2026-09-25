@@ -209,7 +209,8 @@ describe("SyncSocket", () => {
   it("a ready frame carries the cursor we resume from", async () => {
     const h = harness();
     await connected(h, 4821);
-    expect(h.frames).toEqual([{ type: "ready", seq: 4821 }]);
+    // No batch limits on the frame: a vault that does not batch, read as 0 and 0.
+    expect(h.frames).toEqual([{ type: "ready", seq: 4821, max_batch_ops: 0, max_batch_bytes: 0 }]);
   });
 
   it("a terminal closing frame is surfaced to the user, not retried forever", async () => {
