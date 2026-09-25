@@ -16,9 +16,14 @@ jobs:
       # Dependabot rewrites the `uses:` lines, so the rule that each is pinned by commit
       # is checked rather than trusted. `.github/` belongs to this repository, not to the
       # export, so this is the one place the rule can live.
+      # A local action (`./…`) has no ref to pin; a quoted value is unquoted first.
       - name: Every action is pinned by commit
         run: |
-          if grep -rnE '^\s*-?\s*uses:' .github | grep -vE 'uses:\s*[^@]+@[0-9a-f]{40}(\s|$)'; then
+          bad=$(grep -rnE '^\s*-?\s*uses:' .github \
+            | sed -E "s/uses:[[:space:]]*[\"']?([^\"'[:space:]]+)[\"']?/uses: \\1/" \
+            | grep -vE 'uses: (\./|[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$))' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad"
             echo "::error::pin every action by a 40-hex commit sha"
             exit 1
           fi
