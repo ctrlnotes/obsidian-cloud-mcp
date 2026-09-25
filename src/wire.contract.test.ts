@@ -1,0 +1,162 @@
+// The plugin's half of the cross-service wire contract (`wire/vault-sync/README.md`).
+//
+// The vault reads `Up` fixtures straight into `vault::sync::wire::Up`
+// (`apps/vault/tests/wire_contract_sync.rs`) and serialises a representative `Down` value
+// against each `down.*.json` fixture. This is the mirror image: it encodes a representative
+// `Up` value and checks it against the fixture's shape, and it decodes each `down.*.json`
+// fixture with this plugin's own decoder and checks that succeeds.
+//
+// Adding or renaming a field on either side is a breaking change to a deployed interface.
+// This test fails until the matching fixture is updated, which is the point: the fixture is
+// where the two services agree, so it has to change first.
+
+import { describe, expect, test } from "vitest";
+import { assertShape, fixture, type JsonValue } from "./testing/wire-fixture.ts";
+import { decodeDown, encodeUp, type Up } from "./wire.ts";
+
+function encodedShape(up: Up): JsonValue {
+  return JSON.parse(encodeUp(up)) as JsonValue;
+}
+
+describe("up frames: the plugin's encoder matches the fixture's shape", () => {
+  test("hello", () => {
+    assertShape(
+      fixture("vault-sync/up.hello.json"),
+      encodedShape({
+        type: "hello",
+        wire_version: 3,
+        device_id: "dev-a1b2c3",
+        signature: "c2ln",
+        since_seq: 41,
+      }),
+    );
+  });
+
+  test("ack", () => {
+    assertShape(fixture("vault-sync/up.ack.json"), encodedShape({ type: "ack", seq: 4821 }));
+  });
+
+  test("put", () => {
+    assertShape(
+      fixture("vault-sync/up.put.json"),
+      encodedShape({
+        type: "put",
+        path: "projects/alpha.md",
+        base_sha: "9f2c1a4e",
+        sha: "1a2b3c4d",
+        bytes: 1024,
+      }),
+    );
+  });
+
+  test("delete", () => {
+    assertShape(
+      fixture("vault-sync/up.delete.json"),
+      encodedShape({ type: "delete", path: "projects/alpha.md", base_sha: "9f2c1a4e" }),
+    );
+  });
+
+  test("rename", () => {
+    assertShape(
+      fixture("vault-sync/up.rename.json"),
+      encodedShape({ type: "rename", from: "a.md", to: "b.md" }),
+    );
+  });
+
+  test("snapshot", () => {
+    assertShape(fixture("vault-sync/up.snapshot.json"), encodedShape({ type: "snapshot" }));
+  });
+});
+
+// Minor/nit fix, folded into one: the checks below used to be one-directional — they
+// proved `decodeDown` does not throw and named the right `.type`, but nothing checked the
+// SHAPE it produced against the fixture. `decodeDown` builds a fresh object literal from
+// only the fields it knows, so a field ADDED to a fixture (the vault growing `Down::Event`
+// a new field, say) was silently dropped here while the Rust side alone would have
+// demanded the fixture change first. `assertShape` runs both directions: a fixture field
+// the plugin never reads is "missing field", and a plugin field the fixture never declared
+// (unreachable today, since `decodeDown` only ever emits modelled keys) is "not in the
+// wire fixture" — the same two-sided check `up frames` above already gets from
+// `encodedShape`.
+describe("down frames: the plugin's decoder accepts the fixture verbatim, in shape too", () => {
+  test("challenge", () => {
+    const f = fixture("vault-sync/down.challenge.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("challenge");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("ready", () => {
+    const f = fixture("vault-sync/down.ready.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("ready");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("event", () => {
+    const f = fixture("vault-sync/down.event.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("event");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  // A second fixture for the same variant: `rename` is the only kind that
+  // populates `from`, and it is the field the plugin cannot apply the event
+  // without. Testing only the `null` case would leave the shape that matters
+  // unchecked on both sides of the contract.
+  test("event (rename, carrying `from`)", () => {
+    const f = fixture("vault-sync/down.event_rename.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("event");
+    expect(d.type === "event" && d.from).toBe("projects/alpha.md");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  // The page that carries the new meaning: "do not apply this yet". A fixture
+  // showing only `more: false` would leave the shape that changes behaviour
+  // untested on both sides.
+  test("snapshot (a page, with more to come)", () => {
+    const f = fixture("vault-sync/down.snapshot_page.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("snapshot");
+    expect(d.type === "snapshot" && d.more).toBe(true);
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("applied", () => {
+    const f = fixture("vault-sync/down.applied.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("applied");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("refused", () => {
+    const f = fixture("vault-sync/down.refused.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("refused");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("snapshot", () => {
+    const f = fixture("vault-sync/down.snapshot.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("snapshot");
+    if (d.type === "snapshot") {
+      expect(d.files.length).toBeGreaterThan(0);
+    }
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("closing", () => {
+    const f = fixture("vault-sync/down.closing.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("closing");
+    assertShape(f, d as unknown as JsonValue);
+  });
+});
+
+test("the checked-in fixtures load", () => {
+  // If path resolution broke, every contract test above would silently start throwing on
+  // load rather than checking anything.
+  expect(fixture("vault-sync/up.ack.json")).toHaveProperty("type", "ack");
+});

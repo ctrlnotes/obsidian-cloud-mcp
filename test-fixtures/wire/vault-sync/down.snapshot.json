@@ -1,0 +1,11 @@
+{
+  "type": "snapshot",
+  "seq": 4821,
+  "files": [
+    {
+      "path": "projects/alpha.md",
+      "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"
+    }
+  ],
+  "more": false
+}

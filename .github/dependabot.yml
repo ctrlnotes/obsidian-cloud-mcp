@@ -1,5 +1,10 @@
-# Keeps the pinned GitHub Actions current: each is pinned by commit with its version in a
-# trailing comment, and Dependabot updates both. One grouped pull request a week.
+# Keeps the pinned GitHub Actions and the bun dependencies current, one grouped pull
+# request per ecosystem per week. Each action is pinned by commit with its version in a
+# trailing comment, and Dependabot updates both.
+#
+# `eslint-plugin-obsidianmd` is pinned exactly on purpose: it is the community directory's
+# own review rule set, and a new rule should arrive as a pull request here, where CI shows
+# what it finds, not as a surprise at the next release's review.
 #
 # `cooldown` waits a week after a release before proposing it, so a compromised release
 # that is pulled within days never reaches this repository. Security updates are not
@@ -17,3 +22,14 @@ updates:
         patterns: ["*"]
     commit-message:
       prefix: "CI"
+  - package-ecosystem: bun
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "Deps"

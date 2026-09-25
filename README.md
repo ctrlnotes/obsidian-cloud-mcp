@@ -19,7 +19,7 @@ community directory asks plugins to state the following up front, and so do we.
 - **Payment is required for continued use.** A free **7-day trial**, for one vault with
   10 GB, starts when you pair your first device. Some accounts, including most that sign
   up with an email address at their own or a company's domain, are not offered the trial
-  and start on the paid plan. After that, the standard plan is **$10
+  and start on the paid plan. After that, the standard plan is **$25
   per vault per month**, with 10 GB included per vault and $1 per GB per month above that.
   Current pricing is on [ctrlnotes.app](https://ctrlnotes.app).
 - **It uses the network, and only these services:**
@@ -151,16 +151,19 @@ likely means.
 
 ## Development
 
-This repository is published from a private monorepo, where the plugin is built, linted
-with Obsidian's own review rules (`eslint-plugin-obsidianmd`, pinned, zero warnings) and
-tested before each release. Issues are welcome here. To build it yourself:
+Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
 bun install
 bun run typecheck
-bun run lint
+bun run lint               # Biome, then Obsidian's own review rules at zero warnings
+bun run test
 bun run build              # writes main.js
+bun run install-to-vault -- /absolute/path/to/a/vault   # copy the build in to try it
 ```
+
+`lint` runs the Obsidian community directory's own review rules
+(`eslint-plugin-obsidianmd`, pinned), so a release meets nothing CI has not already.
 
 The plugin reads and writes files through Obsidian's `DataAdapter` rather than the `Vault`
 API that Obsidian's guidelines prefer. That is deliberate for a sync engine: it has to
