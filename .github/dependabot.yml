@@ -1,0 +1,19 @@
+# Keeps the pinned GitHub Actions current: each is pinned by commit with its version in a
+# trailing comment, and Dependabot updates both. One grouped pull request a week.
+#
+# `cooldown` waits a week after a release before proposing it, so a compromised release
+# that is pulled within days never reaches this repository. Security updates are not
+# delayed by it.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "CI"
