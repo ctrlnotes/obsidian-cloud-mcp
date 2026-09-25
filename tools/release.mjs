@@ -15,6 +15,10 @@
 // `main.js` on `main` may run ahead of the latest release: code accumulates between releases
 // and ships with the next version bump. Only the manifest is held to the release.
 //
+// `minAppVersion` is held to Obsidian's current desktop release, read from the feed the app
+// itself updates from. A plugin asking for a newer Obsidian than exists cannot be installed:
+// 0.0.1 asked for 1.13.8, which was an Android-only release, and no desktop could run it.
+//
 // `BASE_SHA` names the commit this change is measured against: a pull request's base, or the
 // previous tip of `main` for a push. It is how an unreleased version is told apart from a
 // release left pending by a failed run (see `decide`).
@@ -83,11 +87,20 @@ export function changelogSection(changelog, version) {
  *   releases: {tag: string, draft: boolean, assets: string[]}[],
  *   tagExists: boolean,
  *   baseVersion: string | null,
+ *   desktopLatest: string,
  * }} facts
  * @returns {{problems: string[], action: "release" | "released" | "none",
  *   version: string, notes: string | null}}
  */
-export function decide({ manifest, versions, changelog, releases, tagExists, baseVersion }) {
+export function decide({
+  manifest,
+  versions,
+  changelog,
+  releases,
+  tagExists,
+  baseVersion,
+  desktopLatest,
+}) {
   const problems = [];
   const { version, minAppVersion } = manifest;
   let notes = null;
@@ -101,6 +114,15 @@ export function decide({ manifest, versions, changelog, releases, tagExists, bas
   if (!SEMVER.test(version)) {
     problems.push(`manifest.json's version "${version}" is not x.y.z (Obsidian's tags carry no v)`);
     return out("none");
+  }
+  if (!SEMVER.test(minAppVersion)) {
+    problems.push(`manifest.json's minAppVersion "${minAppVersion}" is not x.y.z`);
+  } else if (compareVersions(minAppVersion, desktopLatest) > 0) {
+    problems.push(
+      `minAppVersion ${minAppVersion} is newer than Obsidian's current desktop release, ` +
+        `${desktopLatest}: no desktop could install this. Use the lowest version whose APIs ` +
+        "the plugin needs (lint's no-unsupported-api says which).",
+    );
   }
   const keys = Object.keys(versions);
   for (const key of keys) {
@@ -214,7 +236,18 @@ function baseVersion(repo) {
   return raw === null ? null : JSON.parse(raw).version;
 }
 
-function facts(repo) {
+/** Obsidian's current desktop version, from the feed the app's own updater reads. */
+async function desktopLatest() {
+  const url =
+    "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/desktop-releases.json";
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`${url} answered ${response.status}`);
+  const { latestVersion } = await response.json();
+  if (!SEMVER.test(latestVersion ?? "")) throw new Error(`${url} has no x.y.z latestVersion`);
+  return latestVersion;
+}
+
+async function facts(repo) {
   const manifest = JSON.parse(read("manifest.json"));
   const tag = gh(["api", `repos/${repo}/git/ref/tags/${manifest.version}`], { notFound: true });
   return {
@@ -224,6 +257,7 @@ function facts(repo) {
     releases: listReleases(repo),
     tagExists: tag !== null,
     baseVersion: baseVersion(repo),
+    desktopLatest: await desktopLatest(),
   };
 }
 
@@ -243,7 +277,7 @@ function fail(messages) {
   process.exit(1);
 }
 
-function main(argv) {
+async function main(argv) {
   const mode = argv[0];
   const notesAt = argv.includes("--notes") ? argv[argv.indexOf("--notes") + 1] : undefined;
   if (!["check", "plan", "publish"].includes(mode)) {
@@ -267,7 +301,7 @@ function main(argv) {
     return;
   }
 
-  const decision = decide(facts(repo));
+  const decision = decide(await facts(repo));
   if (decision.problems.length > 0) fail(decision.problems);
 
   if (decision.action === "released") {
@@ -299,4 +333,4 @@ function main(argv) {
   console.log(`planning release ${decision.version}`);
 }
 
-if (process.argv[1] === fileURLToPath(import.meta.url)) main(process.argv.slice(2));
+if (process.argv[1] === fileURLToPath(import.meta.url)) await main(process.argv.slice(2));

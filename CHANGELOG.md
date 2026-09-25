@@ -2,6 +2,12 @@
 
 Each release's section becomes its release notes. Newest first.
 
+## 0.0.2
+
+- **Installs on desktop Obsidian again.** 0.0.1 asked for Obsidian 1.13.8, which was only
+  ever released for Android, so no desktop Obsidian could install it. This release needs
+  1.13.4 or later.
+
 ## 0.0.1
 
 The first release.
