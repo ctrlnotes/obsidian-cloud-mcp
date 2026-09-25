@@ -58,9 +58,22 @@ describe("README.md", () => {
     expect(readme).not.toMatch(/being\s+built\s+alongside|nowhere\s+to\s+land/i);
   });
 
-  // Until the plugin is listed, the README says so (#174).
-  it("says the plugin is not in the community directory", () => {
+  // Until the plugin is listed, the README says so, and says how to install it anyway.
+  // The BRAT steps were walked in a real Obsidian 1.13.7 on 2026-09-25: BRAT's own dialog,
+  // this repository, "Latest version", then the plugin installed, enabled and loaded.
+  it("says the plugin is not in the community directory, and how to install it with BRAT", () => {
     expect(readme).toMatch(/not\s+in\s+Obsidian's\s+community\s+directory/i);
+    expect(readme).toMatch(/BRAT:\s+Plugins:\s+Add\s+a\s+beta\s+plugin\s+for\s+testing/);
+    expect(readme).toMatch(/`ctrlnotes\/obsidian-cloud-mcp`/);
+  });
+
+  // The README states the minimum Obsidian a reader needs; it must be the manifest's, or a
+  // reader on an older version installs and gets refused (0.0.1's 1.13.8 was one).
+  it("states the manifest's minimum Obsidian version", () => {
+    const { minAppVersion } = JSON.parse(readFileSync(new URL("manifest.json", ROOT), "utf8")) as {
+      minAppVersion: string;
+    };
+    expect(readme).toContain(`Obsidian ${minAppVersion} or later`);
   });
 
   // Every relative link and every `src/…` path the README names must exist in this

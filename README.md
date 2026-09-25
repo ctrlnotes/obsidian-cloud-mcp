@@ -6,7 +6,15 @@ through a remote MCP server you sign in to. An edit an agent makes appears here;
 you make here is there for the agent. Every device that pairs with the same Ctrl Notes
 vault stays in step with the others.
 
-**Not in Obsidian's community directory yet.** Once it is listed, install it from
+**Not in Obsidian's community directory yet.** Until it is, install it with
+[BRAT](https://github.com/TfTHacker/obsidian42-brat), which installs plugins from their GitHub
+releases and keeps them updated:
+
+1. In **Settings → Community plugins**, install and enable **BRAT**.
+2. Run **BRAT: Plugins: Add a beta plugin for testing** from the command palette.
+3. Enter `ctrlnotes/obsidian-cloud-mcp`, choose **Latest version**, and press **Add plugin**.
+
+It needs Obsidian 1.13.4 or later. Once it is listed, install it from
 **Settings → Community plugins** by searching for "Ctrl Notes".
 
 ## Before you install
