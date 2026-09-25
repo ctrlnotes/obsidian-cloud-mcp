@@ -14,18 +14,18 @@
     "lint": "biome check . && eslint --max-warnings 0 src package.json manifest.json && eslint --quiet -c eslint.tests.config.mjs src vitest.config.ts"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.9",
-    "@types/node": "24.13.3",
-    "esbuild": "0.28.1",
-    "eslint": "9.39.5",
+    "@biomejs/biome": "2.5.14",
+    "@types/node": "26.6.1",
+    "esbuild": "0.28.2",
+    "eslint": "10.10.0",
     "eslint-plugin-obsidianmd": "0.4.2",
     "fast-check": "4.10.2",
     "obsidian": "1.13.1",
-    "typescript": "6.0.3",
+    "typescript": "7.0.2",
     "typescript-eslint": "8.70.1",
-    "vitest": "4.1.11"
+    "vitest": "5.0.1"
   },
   "dependencies": {
-    "@noble/ed25519": "3.1.0"
+    "@noble/ed25519": "3.2.0"
   }
 }
