@@ -903,6 +903,15 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         deviceId: this.cfg.deviceId ?? "",
         identity: this.identity,
         createSocket: (url) => new WebSocket(url) as unknown as SocketLike,
+        // BI4: while any of these holds, a reconnect waits at most `WORK_RETRY_MAX_MS`, so the
+        // vault never sits quiet long enough to suspend in the middle of an upload. `syncing`
+        // is a settle deriving or pushing; the pump's queue is what that push left in flight;
+        // `touched` is an edit not yet derived. Much what `onIdle` reads, for the same reason:
+        // each is work only a connection can finish.
+        hasWork: () =>
+          this.syncing ||
+          (this.pump?.hasOutstanding() ?? false) ||
+          hasSomethingToSend(this.touched, this.attachments),
         // The bytes following a `blob` header. They mean nothing on their own —
         // the fetcher owns the header that gives them a destination.
         onBytes: (bytes) => {
@@ -949,10 +958,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // documented as "cleared by the next exchange that succeeds", and until
             // 2026-09-22 nothing cleared it, so a resumable closing that had already
             // reconnected kept the pane reading "Sync was refused" until a reload.
+            // It ends the reconnect a retried closing started (BI1): `retrying` clears here.
             // And it ends a vault restart (staged rollout §5): `updating` clears here.
             this.setStatus({
               syncedCursor: this.syncState.cursor,
               refusal: null,
+              retrying: null,
               updating: false,
               parked: false,
             });
@@ -964,13 +975,22 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           void pump.handleDown(down);
         },
         onClosing: (message, willRetry) => {
-          new Notice(`Disconnected from the Ctrl Notes vault: ${message}`);
-          this.setStatus({ refusal: message, updating: false });
           // A resumable closing (`socket.ts`'s own header) is already retrying
           // itself with backoff, on the SAME `SyncSocket`/`Pump` pair — tearing those down
           // here would abandon the very push or queue that retry is meant to resume, and
           // `startSyncing`'s only other entry point is a fresh pairing, not what this needs.
-          if (!willRetry) this.disconnectSyncing();
+          //
+          // **No `Notice` for it** (bulk-ingest design BI1). A busy vault closes every few
+          // seconds during an import and nothing is wrong: a popup each time would teach a
+          // user to ignore the one that matters. The status line says so instead, as a clause
+          // that leaves the pending count on screen (`status.ts`'s `retrying`).
+          if (willRetry) {
+            this.setStatus({ retrying: message, updating: false });
+            return;
+          }
+          new Notice(`Disconnected from the Ctrl Notes vault: ${message}`);
+          this.setStatus({ refusal: message, updating: false });
+          this.disconnectSyncing();
         },
         // The vault is restarting for an update (close 1012). No `Notice`: this is routine
         // and self-healing, and a popup on every rollout would teach users to ignore the

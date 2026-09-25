@@ -16,7 +16,7 @@ import { contentHash } from "./sync/hash.ts";
 import { MAX_IDLE_WAKES, SIGNAL_POLL_MS, SIGNAL_TIMEOUT_MS } from "./sync/park.ts";
 import type { Pump } from "./sync/pump.ts";
 import { QUIET_MS } from "./sync/settle.ts";
-import { IDLE_REASON } from "./sync/socket.ts";
+import { IDLE_REASON, WORK_RETRY_MAX_MS } from "./sync/socket.ts";
 import { describeStatus, UPDATING_TEXT } from "./sync/status.ts";
 import {
   FakeWebSocket,
@@ -44,6 +44,7 @@ import {
   requestUrlHeld,
   requestUrlQueue,
 } from "./testing/fake-obsidian.ts";
+import { WIRE_VERSION } from "./wire.ts";
 
 afterEach(() => {
   unloadAll();
@@ -104,7 +105,7 @@ const untilRealClock = async (check: () => void): Promise<void> => {
 /** Answer the handshake on a freshly opened socket up through `ready` — everything Task
  * 9's `SyncSocket` needs before `main.ts` will send anything on it. */
 const bringUp = async (ws: FakeWebSocket, seq = 0): Promise<void> => {
-  ws.emit({ type: "challenge", wire_version: 3, challenge: "AAAA" });
+  ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
   // `identity.signChallenge` is a real async ed25519 call: wait for the `hello` it signs,
   // not for a guess at how long signing takes.
   await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
@@ -382,7 +383,7 @@ describe("a terminal closing during an outstanding push does not stop syncing fo
     expect(putsBefore).toHaveLength(1);
     expect(putsBefore[0]?.path).toBe("a.md");
 
-    ws0.emit({ type: "closing", reason: "this device's trust has been withdrawn" });
+    ws0.emit({ type: "closing", reason: "this device's trust has been withdrawn", retry: "never" });
     await settleMicrotasks();
 
     // Re-pairing is the only path back to `startSyncing` after a terminal closing
@@ -1043,7 +1044,7 @@ describe("nothing is adopted until a human on this device says so", () => {
     const ws = FakeWebSocket.instances[0];
     expect(ws).toBeDefined();
     if (ws === undefined) return;
-    ws.emit({ type: "challenge", wire_version: 3, challenge: "AAAA" });
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
     await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
 
     const hello = ws.upFrames().find((f) => f.type === "hello");
@@ -1100,7 +1101,7 @@ describe("re-connecting to a different vault replaces the connection", () => {
     const second = FakeWebSocket.instances[1];
     expect(second).toBeDefined();
     if (second === undefined) return;
-    second.emit({ type: "challenge", wire_version: 3, challenge: "AAAA" });
+    second.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
     await vi.waitFor(
       () => expect(second.upFrames().some((f) => f.type === "hello")).toBe(true),
       UNTIL,
@@ -1607,7 +1608,12 @@ describe("a refusal ends where its cause ends", () => {
     expect(describeStatus(plugin.syncStatus())).toContain("refused by the server");
   });
 
-  it("clears a refused session once a resumable closing has reconnected", async () => {
+  /**
+   * A closing this device reconnects after is not a refusal at all (bulk-ingest design BI1):
+   * it says `retrying`, never `refusal`, and the next `ready` clears it. Until BI1 it set
+   * `refusal`, and until 2026-09-22 nothing cleared that either.
+   */
+  it("reports a retried closing as reconnecting, and clears it once reconnected", async () => {
     stubWebSocket();
     const plugin = await load(
       { "note.md": "hi" },
@@ -1619,8 +1625,13 @@ describe("a refusal ends where its cause ends", () => {
     if (ws0 === undefined) return;
     await bringUp(ws0);
 
-    ws0.emit({ type: "closing", reason: "too many connections open for this device" });
-    await vi.waitFor(() => expect(plugin.syncStatus().refusal).not.toBeNull(), UNTIL);
+    ws0.emit({
+      type: "closing",
+      reason: "too many connections open for this device",
+      retry: "later",
+    });
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).not.toBeNull(), UNTIL);
+    expect(plugin.syncStatus().refusal).toBeNull();
 
     // The first retry waits at most FIRST_RETRY_MS (1 s, jittered down from there).
     await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
@@ -1629,7 +1640,125 @@ describe("a refusal ends where its cause ends", () => {
     if (ws1 === undefined) return;
     await bringUp(ws1);
 
-    await vi.waitFor(() => expect(plugin.syncStatus().refusal).toBeNull(), UNTIL);
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).toBeNull(), UNTIL);
+  });
+});
+
+/**
+ * Bulk-ingest design BI1 and BI4, end to end through the shell: a closing the vault says to
+ * retry after never ends an upload, and a device with work in flight reconnects by itself,
+ * soon enough that the vault never sits quiet long enough to suspend.
+ *
+ * This is the 2026-09-25 failure. A busy vault answered `handshake timed out`, the plugin read
+ * the text as terminal and disconnected, and with no socket open Fly suspended the vault in the
+ * middle of a 20,000-file first sync that nothing then resumed.
+ */
+describe("a closing the vault says to retry after", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  /** A paired plugin whose ledger matches its files, up and quiet, then one edit put in flight
+   * and never answered. */
+  const putInFlight = async (): Promise<{ plugin: CtrlNotesPlugin; first: FakeWebSocket }> => {
+    stubWebSocket();
+    const files: Record<string, string> = { "note.md": "hi" };
+    const hashes = { "note.md": await contentHash("hi") };
+    const plugin = await load(files, {
+      ...PAIRED,
+      appOptions: {
+        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
+      },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const first = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    files["note.md"] = "edited";
+    fireVaultEvent("modify", "note.md");
+    await vi.waitFor(
+      () => expect(first.upFrames().some((f) => f.type === "put")).toBe(true),
+      UNTIL,
+    );
+    return { plugin, first };
+  };
+
+  const putsOn = (ws: FakeWebSocket) =>
+    ws.upFrames().filter((f) => f.type === "put" && f.path === "note.md");
+
+  /** A few microtask turns — `settleMicrotasks` sleeps on `setTimeout`, which these cases fake. */
+  const microtasks = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  /**
+   * **Proven able to fail** two ways: with `hasWork` left out of `SyncSocket`'s deps the
+   * sixth reconnect waits 32 s and the wait for its socket runs out; with the `Notice` put
+   * back on a retried closing the notice count moves.
+   */
+  it("a put in flight survives a later closing: the plugin reconnects by itself within 30 s, re-sends the put after ready, shows no Notice and never disconnects", async () => {
+    const { plugin, first } = await putInFlight();
+    const noticesBefore = notices.length;
+
+    // The top of every jitter window, so an uncapped wait is the whole rung.
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    first.emit({ type: "closing", reason: "busy", retry: "later" });
+    await microtasks();
+
+    const status = describeStatus(plugin.syncStatus());
+    expect(status).toContain("still to send"); // the import's progress stays on screen
+    expect(status).toContain('Reconnecting: the vault said "busy".');
+    expect(plugin.syncStatus().refusal).toBeNull();
+
+    // Six more failures after the closing push the uncapped rung to 64 s. Each reconnect must
+    // still land inside `WORK_RETRY_MAX_MS`: the put is outstanding the whole time.
+    for (let attempt = 1; attempt <= 7; attempt++) {
+      vi.advanceTimersByTime(WORK_RETRY_MAX_MS);
+      await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(attempt + 1));
+      if (attempt < 7) (FakeWebSocket.instances[attempt] as FakeWebSocket).close();
+    }
+    vi.useRealTimers();
+
+    const last = FakeWebSocket.instances[7] as FakeWebSocket;
+    await bringUp(last);
+    await vi.waitFor(() => expect(putsOn(last)).toHaveLength(1), UNTIL);
+    expect(notices.length).toBe(noticesBefore);
+    expect(plugin.syncStatus().retrying).toBeNull();
+    expect(plugin.syncStatus().refusal).toBeNull();
+  });
+
+  /** A vault older than BI1 sends no `retry`, and that is `later`. **Proven able to fail** by
+   * decoding an absent field as `never`: no second socket, and a Notice. */
+  it("a closing with no retry field is retried the same way", async () => {
+    const { plugin, first } = await putInFlight();
+    const noticesBefore = notices.length;
+
+    first.emit({ type: "closing", reason: "handshake timed out" });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
+    const next = FakeWebSocket.instances[1] as FakeWebSocket;
+    await bringUp(next);
+
+    await vi.waitFor(() => expect(putsOn(next)).toHaveLength(1), UNTIL);
+    expect(notices.length).toBe(noticesBefore);
+    expect(plugin.syncStatus().refusal).toBeNull();
+  });
+
+  it("a never closing is terminal and shows a Notice", async () => {
+    const { plugin, first } = await putInFlight();
+    const noticesBefore = notices.length;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    first.emit({ type: "closing", reason: "not authorised", retry: "never" });
+    await microtasks();
+
+    expect(notices.slice(noticesBefore).map(noticeText)).toEqual([
+      "Disconnected from the Ctrl Notes vault: not authorised",
+    ]);
+    expect(plugin.syncStatus().refusal).toBe("not authorised");
+    vi.advanceTimersByTime(10 * 60_000); // past every backoff step there is
+    vi.useRealTimers();
+    await settleMicrotasks(300); // quiet window: nothing reconnects
+    expect(FakeWebSocket.instances).toHaveLength(1);
   });
 });
 

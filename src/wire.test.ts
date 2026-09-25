@@ -9,6 +9,7 @@ import { fixture } from "./testing/wire-fixture.ts";
 import {
   decodeDown,
   encodeUp,
+  MIN_WIRE_VERSION,
   readDownFrame,
   UnknownDownFrameError,
   WIRE_VERSION,
@@ -28,6 +29,7 @@ describe("every documented down fixture decodes", () => {
     "down.snapshot.json",
     "down.snapshot_page.json",
     "down.closing.json",
+    "down.closing_never.json",
   ])("%s", (name) => {
     expect(() => decodeDown(fixture(`vault-sync/${name}`))).not.toThrow();
   });
@@ -84,6 +86,58 @@ describe("a wire_version mismatch refuses and names the version", () => {
     // fix the fixture (with the vault side, per `wire/vault-sync/README.md`), not this test.
     const challenge = fixture("vault-sync/down.challenge.json") as { wire_version: number };
     expect(challenge.wire_version).toBe(WIRE_VERSION);
+  });
+});
+
+/**
+ * Bulk-ingest design BI1: 4 is this build's version, and 3 is still spoken so that a vault not
+ * yet moved to a v4 release can be reached (`MIN_WIRE_VERSION`'s doc comment).
+ */
+describe("the wire versions this build speaks", () => {
+  const challenge = (wire_version: number) => ({
+    type: "challenge",
+    wire_version,
+    challenge: "Y2hhbA",
+  });
+
+  it("is 3 to 4", () => {
+    expect([MIN_WIRE_VERSION, WIRE_VERSION]).toEqual([3, 4]);
+  });
+
+  it.each([3, 4])("accepts a challenge of %i", (v) => {
+    expect(decodeDown(challenge(v))).toMatchObject({ type: "challenge", wire_version: v });
+  });
+
+  it.each([2, 5])("refuses a challenge of %i", (v) => {
+    expect(() => decodeDown(challenge(v))).toThrow(WireVersionMismatchError);
+  });
+});
+
+/**
+ * BI1's `retry`, decoded leniently: only an explicit `never` stops this device. Anything else —
+ * absent (a v3 vault), a value from some future vault, the wrong type — is `later`, and none of
+ * them may throw, because a decode error on a frame after the handshake is terminal.
+ *
+ * **Proven able to fail** by decoding with `str(v.retry, …)`: the absent, 7 and null rows throw.
+ */
+describe("a closing's retry field", () => {
+  const retry = (extra: Record<string, unknown>) => {
+    const d = decodeDown({ type: "closing", reason: "r", ...extra });
+    return d.type === "closing" ? d.retry : null;
+  };
+
+  it("never decodes as never", () => {
+    expect(retry({ retry: "never" })).toBe("never");
+  });
+
+  it.each([
+    ["later", { retry: "later" }],
+    ["absent", {}],
+    ["an unknown value", { retry: "park" }],
+    ["a number", { retry: 7 }],
+    ["null", { retry: null }],
+  ])("%s decodes as later, without throwing", (_label, extra) => {
+    expect(retry(extra)).toBe("later");
   });
 });
 

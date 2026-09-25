@@ -39,8 +39,27 @@
  * string treats it as terminal: it stops syncing until Obsidian restarts. No frame changed
  * shape; the bump exists so that such a build is refused at the handshake with a sentence
  * telling its user to update, instead.
+ *
+ * **4: every closing says whether to retry** (bulk-ingest design BI1). `DownClosing` gained
+ * `retry`, and this build decides from that field alone whether a closing is worth
+ * reconnecting after — never from the reason's text. A v3 build reads any reason it does not
+ * know as terminal, and a v4 vault sends new ones (`busy`), which is the whole bump: a build
+ * that would stop syncing on them is refused at the handshake instead.
  */
-export const WIRE_VERSION = 3;
+export const WIRE_VERSION = 4;
+
+/**
+ * The oldest version this build still speaks, and it answers `hello` in whichever version the
+ * vault's `challenge` named.
+ *
+ * **3 is still spoken because release-11 vaults speak it.** The vault compares exactly
+ * (`vault::sync::pure::admit`), so a plugin that spoke only 4 could not connect to a vault
+ * that has not been moved to a v4 release yet, and every vault would have to move in lockstep
+ * with this plugin's release. Nothing a v3 vault sends is misread here: its closings carry no
+ * `retry`, which decodes as `later` (see `DownClosing`), and its `ready` carries no batch
+ * limits, which reads as "no batching".
+ */
+export const MIN_WIRE_VERSION = 3;
 
 /**
  * The largest single upload this vault will accept — pinned to
@@ -180,9 +199,21 @@ export interface DownSnapshot {
   readonly more: boolean;
 }
 
+/**
+ * Whether a `closing` is worth reconnecting after (bulk-ingest design BI1).
+ *
+ * `later` is back off and reconnect: a handshake that timed out, a busy vault, a restart, an
+ * idle close. `never` is stop until a person acts: an unknown or revoked device, a version
+ * mismatch, a protocol bug. The decision is the vault's, made from its own typed reason, so
+ * this build never has to parse a sentence to make it.
+ */
+export type ClosingRetry = "later" | "never";
+
 export interface DownClosing {
   readonly type: "closing";
+  /** Free text for a human. Nothing here decides whether to retry from it. */
   readonly reason: string;
+  readonly retry: ClosingRetry;
 }
 
 /**
@@ -249,7 +280,7 @@ export class WireVersionMismatchError extends Error {
   constructor(readonly serverWireVersion: number) {
     super(
       `the vault wants to speak wire version ${serverWireVersion}; this plugin build only ` +
-        `speaks version ${WIRE_VERSION}; update the plugin`,
+        `speaks versions ${MIN_WIRE_VERSION} to ${WIRE_VERSION}; update the plugin`,
     );
   }
 }
@@ -308,7 +339,9 @@ export function decodeDown(raw: unknown): Down {
   switch (type) {
     case "challenge": {
       const wireVersion = num(v.wire_version, "wire_version");
-      if (wireVersion !== WIRE_VERSION) throw new WireVersionMismatchError(wireVersion);
+      if (wireVersion < MIN_WIRE_VERSION || wireVersion > WIRE_VERSION) {
+        throw new WireVersionMismatchError(wireVersion);
+      }
       return {
         type: "challenge",
         wire_version: wireVersion,
@@ -362,7 +395,16 @@ export function decodeDown(raw: unknown): Down {
     case "no_blob":
       return { type: "no_blob", sha: str(v.sha, "sha"), reason: str(v.reason, "reason") };
     case "closing":
-      return { type: "closing", reason: str(v.reason, "reason") };
+      return {
+        type: "closing",
+        reason: str(v.reason, "reason"),
+        // **Lenient, and it must never throw.** Absent (a v3 vault), a value this build has
+        // never heard of, or not a string at all: every one reads as `later`. A decode error
+        // on a frame after the handshake is terminal (`socket.ts`'s `onMessage`), so a strict
+        // decode here would turn a malformed retry hint into exactly the stop BI1 exists to
+        // prevent. Only an explicit `never` stops this device.
+        retry: v.retry === "never" ? "never" : "later",
+      };
     default:
       throw new UnknownDownFrameError(type);
   }

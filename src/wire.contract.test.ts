@@ -23,7 +23,7 @@ describe("up frames: the plugin's encoder matches the fixture's shape", () => {
       fixture("vault-sync/up.hello.json"),
       encodedShape({
         type: "hello",
-        wire_version: 3,
+        wire_version: 4,
         device_id: "dev-a1b2c3",
         signature: "c2ln",
         since_seq: 41,
@@ -82,6 +82,7 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     const f = fixture("vault-sync/down.challenge.json");
     const d = decodeDown(f);
     expect(d.type).toBe("challenge");
+    expect(d.type === "challenge" && d.wire_version).toBe(4);
     assertShape(f, d as unknown as JsonValue);
   });
 
@@ -146,10 +147,24 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     assertShape(f, d as unknown as JsonValue);
   });
 
-  test("closing", () => {
+  // `retry` is asserted by VALUE as well as by shape (bulk-ingest design BI1): it is the one
+  // field on this wire whose value decides whether this device keeps syncing, and a shape
+  // check alone would pass a decoder that read every closing as `later`.
+  test("closing (retry later)", () => {
     const f = fixture("vault-sync/down.closing.json");
     const d = decodeDown(f);
     expect(d.type).toBe("closing");
+    expect(d.type === "closing" && d.retry).toBe("later");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  // A second fixture for the same variant, like `event_rename` and `snapshot_page`: `never`
+  // is the value that stops sync, so it is the one that must not go untested on either side.
+  test("closing (retry never)", () => {
+    const f = fixture("vault-sync/down.closing_never.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("closing");
+    expect(d.type === "closing" && d.retry).toBe("never");
     assertShape(f, d as unknown as JsonValue);
   });
 });

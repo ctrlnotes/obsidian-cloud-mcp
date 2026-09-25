@@ -12,18 +12,29 @@
 // vault id on purpose (design §8.5): a server that told a client what to sign could get it
 // to sign for a vault it never chose. See `answerChallenge` and `terminal`.
 //
-// **A `closing` frame and a dropped socket are different failures, and get different
-// treatment — but not EVERY `closing` is the same failure either.** A version mismatch, a
-// bad or revoked device key: the vault has looked at what we sent and refused it for a
-// reason a human, not a retry, has to fix. Those get `terminal`: reported once through
-// `onClosing`, no retry scheduled — `connect()` must be called again deliberately (`main.ts`,
-// once the human has acted) to resume. But `apps/vault/src/http/routes/sync.rs` also sends
-// `closing` for two conditions it documents as self-healing — a per-device connection cap,
-// and falling too far behind acknowledging (its own reason literally says "reconnect and
-// resume from your last seq") — and those are not credential failures at all; they get the
-// SAME backoff-and-retry treatment as an ordinary dropped connection (`isResumableClosing`).
-// An ordinary dropped connection — the network died, the vault process crashed — gets that
-// same treatment for the obvious reason: no frame told us anything.
+// **A `closing` frame says whether to retry, in a field, and only the field decides**
+// (bulk-ingest design BI1). `retry: "never"` — an unknown or revoked device, a version
+// mismatch, a protocol bug — is a reason a human, not a retry, has to fix: `terminal`,
+// reported once through `onClosing`, no retry scheduled, and `connect()` must be called again
+// deliberately (`main.ts`, once the human has acted) to resume. Anything else — `later`, an
+// absent field (a v3 vault that predates it), a value this build has never heard of — gets
+// the SAME backoff-and-retry an ordinary dropped connection gets (`resumable`), because
+// retrying against a vault that will refuse again costs one request per backoff step, and
+// giving up against one that would have recovered costs the whole sync. That trade is the
+// lesson of 2026-09-25: a busy vault answered `handshake timed out`, this module read the
+// unrecognised text as terminal, the socket closed, and with no traffic Fly suspended the
+// vault in the middle of a first sync that then never finished.
+//
+// Until BI1 the decision was an exact match on the reason's text against a set of two
+// "resumable" sentences, and every other sentence — including ones the vault added later —
+// was terminal. The text still chooses HOW to retry for two reasons below (a restart waits a
+// fixed delay, an idle close parks), both of which are `later` on the wire; it never again
+// chooses WHETHER to.
+//
+// **While this device has work in flight, a retry waits at most `WORK_RETRY_MAX_MS`** (BI4),
+// however far the backoff has climbed: see that constant for why. An ordinary dropped
+// connection — the network died, the vault process crashed — takes the same path for the
+// obvious reason: no frame told us anything.
 //
 // **A vault restarting for an update is neither, and gets a third treatment** (staged
 // rollout design §5). On SIGTERM the vault sends `closing` with `VAULT_RESTART_REASON`, then
@@ -51,7 +62,7 @@
 // names the vault id it signed for — the one piece of diagnosis only this side can do.
 
 import type { DeviceIdentity } from "../device.ts";
-import { type Down, decodeDown, encodeUp, readDownFrame, type Up, WIRE_VERSION } from "../wire.ts";
+import { type Down, decodeDown, encodeUp, readDownFrame, type Up } from "../wire.ts";
 
 /**
  * The minimal transport this module drives — deliberately not the DOM `WebSocket` type
@@ -73,7 +84,38 @@ export interface SocketLike {
 export type SocketFactory = (url: string) => SocketLike;
 
 const FIRST_RETRY_MS = 1_000;
-const MAX_RETRY_MS = 5 * 60_000;
+/** The backoff's ceiling — and so, by BI1, the most often a device retries a vault that keeps
+ * refusing it without saying `never`. */
+export const MAX_RETRY_MS = 5 * 60_000;
+
+/**
+ * The longest a reconnect waits while this device has work outstanding (bulk-ingest design
+ * BI4: a socket with work in flight is not idle).
+ *
+ * **Far below Fly's autostop, on purpose.** An open WebSocket is what Fly's proxy counts as
+ * load; a vault with none for ~5–8 minutes suspends (measured:
+ * `docs/measurements/2026-09-23-fly-autostop-and-wake` in the service repository). The
+ * ordinary backoff climbs to five minutes, so a device mid-upload that took two busy closes
+ * in a row could leave its vault quiet long enough to be put to sleep with the upload
+ * unfinished — which is how the 2026-09-25 first sync ended. 30 s keeps the vault seeing a
+ * connection attempt well inside that window, and a vault answering `busy` is about to have
+ * a free write permit, so waiting longer buys nothing.
+ */
+export const WORK_RETRY_MAX_MS = 30_000;
+
+/**
+ * How long the next reconnect waits: full jitter over `[retryMs/2, retryMs)`, capped at
+ * {@link WORK_RETRY_MAX_MS} while this device has work outstanding.
+ *
+ * Pure, so the cap can be tested as a property rather than through a clock. `retryMs` itself
+ * keeps its exact doubling to {@link MAX_RETRY_MS} (see `scheduleRetry`); the cap shortens the
+ * wait, never the ladder, so a device whose queue empties is back on the ordinary backoff at
+ * once.
+ */
+export function retryWait(retryMs: number, r: number, hasWork: boolean): number {
+  const w = retryMs / 2 + r * (retryMs / 2);
+  return hasWork ? Math.min(w, WORK_RETRY_MAX_MS) : w;
+}
 
 /** RFC 6455 §7.4.1 close code 1012, "Service Restart" — what the vault closes a sync socket
  * with on SIGTERM (staged rollout plan §1.3). */
@@ -88,12 +130,13 @@ export const RESTART_RECONNECT_MS = 3_000;
 
 /**
  * The `closing` reason the vault sends immediately BEFORE its 1012 close (plan §1.3). Matched
- * by exact text for the reason `RESUMABLE_CLOSING_REASONS` is: free text is all
- * `Down::Closing` carries.
+ * by exact text, and pinned in `vault-reasons.test.ts`.
  *
- * **Recognising it is not optional.** It arrives before the close code, and an unrecognised
- * `closing` is `terminal` — which detaches the socket, so the 1012 that follows is never seen
- * and a routine update stops sync until Obsidian restarts.
+ * **Text chooses how to retry here, never whether.** The frame says `retry: "later"` like any
+ * other temporary close, and unrecognised it would be retried on the ordinary backoff; what
+ * the text buys is the short FIXED delay a restart deserves (`RESTART_RECONNECT_MS`) and a
+ * backoff left where it was. Before BI1 an unrecognised `closing` was `terminal`, which made
+ * matching this text the only thing standing between a routine update and a stopped sync.
  */
 export const VAULT_RESTART_REASON =
   "the vault is restarting for an update; reconnect in a few seconds";
@@ -107,36 +150,16 @@ export function isRestartClosing(reason: string): boolean {
  * (vault-sleep design VS1), immediately before closing with 1000. Matched by exact text and
  * pinned in `vault-reasons.test.ts`, for the reason {@link VAULT_RESTART_REASON} is.
  *
- * **Recognising it is what stops parking being an outage.** Unrecognised, it would be
- * `terminal`: a Notice every 90 s of quiet, and no sync until Obsidian restarted. That is
- * why `WIRE_VERSION` went to 3 with it (VS2) — a build that does not know this string cannot
- * connect to a vault that sends it.
+ * **Recognising it is what makes an idle close a park rather than a reconnect loop.** The
+ * frame says `retry: "later"`; unrecognised, this device would reconnect on the backoff and
+ * keep the vault awake for nothing, which is the one thing parking exists to stop. It was
+ * worse before BI1: unrecognised meant `terminal`, a Notice every 90 s of quiet and no sync
+ * until Obsidian restarted — which is why `WIRE_VERSION` went to 3 with it (VS2).
  */
 export const IDLE_REASON = "idle; reconnect when there is something to sync";
 
 export function isIdleClosing(reason: string): boolean {
   return reason === IDLE_REASON;
-}
-
-/**
- * `closing` reasons the vault documents as self-healing rather than a credential or version
- * failure — worth reconnecting for with the ordinary backoff instead of surfacing as
- * `terminal`. (Before this set existed, EVERY `closing` stopped syncing until Obsidian
- * restarted, including the one whose own text says to reconnect.)
- *
- * Matched by EXACT text: free text is all `Down::Closing` carries, so there is no
- * structured field to switch on instead. `vault-reasons.test.ts` pins the set and each
- * string by value. The vault's source is not in this repository, so **nothing here can
- * notice the vault rewording one**; a changed reason falls through to `terminal`. Treat
- * these strings as protocol.
- */
-export const RESUMABLE_CLOSING_REASONS: ReadonlySet<string> = new Set([
-  "too many connections open for this device",
-  "too far behind acknowledging; reconnect and resume from your last seq",
-]);
-
-export function isResumableClosing(reason: string): boolean {
-  return RESUMABLE_CLOSING_REASONS.has(reason);
 }
 
 /**
@@ -196,12 +219,12 @@ export interface SyncSocketDeps {
   readonly onBytes?: (bytes: Uint8Array) => void;
   /**
    * A `closing` frame arrived. `willRetry` says which treatment this one got (this
-   * module's header): `false` is the old terminal behaviour — reported once, no retry
-   * follows, `connect()` must be called again deliberately. `true` means this module is
-   * already retrying on its own with the ordinary backoff, exactly like a dropped
-   * connection; a caller must NOT tear down anything it wants kept for that retry to use
-   * (`main.ts`'s `onClosing` skips `disconnectSyncing()` for this case, or the `Pump` this
-   * class hands frames to next would be gone).
+   * module's header): `false` is `retry: "never"` — reported once, no retry follows,
+   * `connect()` must be called again deliberately. `true` means this module is already
+   * retrying on its own with the ordinary backoff, exactly like a dropped connection; a
+   * caller must NOT tear down anything it wants kept for that retry to use (`main.ts`'s
+   * `onClosing` skips `disconnectSyncing()` for this case, or the `Pump` this class hands
+   * frames to next would be gone).
    */
   readonly onClosing: (message: string, willRetry: boolean) => void;
   /**
@@ -218,6 +241,13 @@ export interface SyncSocketDeps {
    * `onRestarting`: a caller without it simply stays disconnected until it next connects.
    */
   readonly onIdle?: () => void;
+  /**
+   * Whether this device has work outstanding — an upload queued or in flight, a settle
+   * deriving one, a change not yet derived (bulk-ingest design BI4). Read each time a retry
+   * is scheduled; while it answers `true` a reconnect waits at most
+   * {@link WORK_RETRY_MAX_MS}. Optional: without it every retry takes the ordinary backoff.
+   */
+  readonly hasWork?: () => boolean;
   /** Jitter source for the backoff. Injectable so a test is deterministic; defaults to the
    * real `Math.random` in production, the same reasoning as an earlier prototype's `random`. */
   readonly random?: () => number;
@@ -250,6 +280,12 @@ export class SyncSocket {
    * header). */
   private awaitingReadyAfterHello = false;
   private ackedSeq: number;
+  /**
+   * The version this connection's `hello` answered in: whatever the vault's `challenge`
+   * named, within the range `decodeDown` accepts. Not a constant, because a v3 vault admits
+   * only a v3 hello (`MIN_WIRE_VERSION`'s doc comment says why 3 is still spoken).
+   */
+  private wireVersion = 0;
 
   constructor(
     private readonly deps: SyncSocketDeps,
@@ -447,14 +483,16 @@ export class SyncSocket {
       this.armStable();
     } else if (down.type === "closing") {
       this.deps.onFrame(down);
+      // The two texts first, because they choose HOW to retry and both are `later` on the
+      // wire; then the field alone decides WHETHER to (this module's header).
       if (isRestartClosing(down.reason)) {
         this.restarting(socket);
       } else if (isIdleClosing(down.reason)) {
         this.parked(socket);
-      } else if (isResumableClosing(down.reason)) {
-        this.resumable(socket, down.reason);
-      } else {
+      } else if (down.retry === "never") {
         this.terminal(socket, this.closingMessage(down.reason));
+      } else {
+        this.resumable(socket, this.closingMessage(down.reason));
       }
       return;
     }
@@ -484,6 +522,7 @@ export class SyncSocket {
     // first" branch, which would replace the vault's own reason with a confusing one and
     // skip `closingMessage`'s vault-id diagnosis entirely.
     this.awaitingReadyAfterHello = true;
+    this.wireVersion = down.wire_version;
     await this.answerChallenge(socket, down.challenge);
   }
 
@@ -494,7 +533,8 @@ export class SyncSocket {
     const signature = await this.deps.identity.signChallenge(this.deps.vaultId, challenge);
     const hello: Up = {
       type: "hello",
-      wire_version: WIRE_VERSION,
+      // The challenge's own version, not this build's newest: see `wireVersion`.
+      wire_version: this.wireVersion,
       device_id: this.deps.deviceId,
       signature,
       since_seq: this.ackedSeq > 0 ? this.ackedSeq : null,
@@ -534,14 +574,14 @@ export class SyncSocket {
   }
 
   /**
-   * The vault closed this connection for a condition it documents as temporary — a
-   * per-device connection cap, or falling too far behind acknowledging (`isResumableClosing`
-   * / this module's header). Unlike `terminal`, `wanted` stays true and a retry is scheduled
-   * with the SAME backoff an ordinary dropped connection gets — `handleClose` is not called
-   * directly because this path already knows why it closed and has its own message to
-   * report, but the retry itself is `handleClose`'s own `scheduleRetry`.
+   * The vault closed this connection without saying `never` — `retry: "later"`, or no `retry`
+   * at all from a vault older than the field (this module's header). Unlike `terminal`,
+   * `wanted` stays true and a retry is scheduled with the SAME backoff an ordinary dropped
+   * connection gets — `handleClose` is not called directly because this path already knows
+   * why it closed and has its own message to report, but the retry itself is `handleClose`'s
+   * own `scheduleRetry`.
    */
-  private resumable(socket: SocketLike, reason: string): void {
+  private resumable(socket: SocketLike, message: string): void {
     this.clearTimers();
     if (this.socket === socket) {
       this.detach(socket);
@@ -549,7 +589,7 @@ export class SyncSocket {
       this.ready = false;
     }
     socket.close();
-    this.deps.onClosing(reason, true);
+    this.deps.onClosing(message, true);
     this.scheduleRetry();
   }
 
@@ -614,8 +654,8 @@ export class SyncSocket {
     // that dropped in the same second (a deploy, a network blip) must not retry in
     // lockstep. `retryMs` itself keeps its exact doubling; jittering the stored value
     // would make the ladder drift and `STABLE_MS`'s reset lose a value worth reasoning
-    // about.
-    const wait = this.retryMs / 2 + random() * (this.retryMs / 2);
+    // about. Capped while work is outstanding (BI4, `retryWait`).
+    const wait = retryWait(this.retryMs, random(), this.deps.hasWork?.() ?? false);
     this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS);
     this.timer = window.setTimeout(() => {
       this.timer = null;
