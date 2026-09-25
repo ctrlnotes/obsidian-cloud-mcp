@@ -4,7 +4,7 @@
  *
  * Local only: everything here is already in the plugin's hands, so the settings tab needs
  * no request to render it. There is no per-device server view of what OTHER devices are
- * doing on this wire (`link_status` is a glass-1 concept; this protocol has nothing
+ * doing on this wire (`link_status` is an earlier prototype's concept; this protocol has nothing
  * equivalent), so this is the whole story this device can tell about itself.
  *
  * There is no timestamp in this shape, and that is deliberate rather than an omission: the
@@ -171,12 +171,12 @@ export const UPDATING_TEXT = "Vault updating, reconnecting.";
  * `code` is never actually a code on THIS wire — `Down::Refused.reason` and
  * `Down::Closing.reason` are both free text for a human (`retry.ts`'s and `socket.ts`'s own
  * doc comments), so `main.ts` sets `refusal` straight from whichever sentence the vault
- * sent. `unauthenticated`/`subscription_inactive` were glass-1 concepts this wire never
+ * sent. `unauthenticated`/`subscription_inactive` were an earlier prototype's concepts this wire never
  * produces — checked: no code path here can ever set `refusal` to either string — so
  * special-casing them here rendered every REAL refusal through the fallback below anyway,
  * pasting the vault's raw sentence into a parenthetical never designed to hold one. This
  * renders that sentence directly instead of pretending there is a closed vocabulary to
- * translate it from (minor fix).
+ * translate it from.
  */
 function refusalText(reason: string): string {
   const said = `Sync was refused: ${reason}.`;

@@ -1,4 +1,4 @@
-# Typecheck, lint (Biome and Obsidian's own review rules) and build, on every push to
+# Typecheck, lint (Biome and Obsidian's own review rules), test and build, on every push to
 # `main` and every pull request. Actions are pinned by commit, not tag: a moved tag would
 # run someone else's code here.
 name: CI
@@ -25,6 +25,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # Node runs the build (`node esbuild.config.mjs`) and the test runner, so it is pinned
+      # too, not left to the runner's default: the current 24 LTS, matching `@types/node`.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           # `packageManager`, so the workflow and the manifest cannot name two versions.
@@ -32,4 +37,5 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run lint
+      - run: bun run test
       - run: bun run build

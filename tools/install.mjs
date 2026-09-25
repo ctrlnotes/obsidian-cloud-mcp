@@ -67,9 +67,9 @@ export async function install({
   // A vault is a directory that holds `.obsidian`. Refuse anything else: an install into a
   // mistyped path creates the directory tree and then looks like it worked.
   if (!existsSync(join(vaultRoot, ".obsidian"))) {
-    // Name the resolved path AND the given one when they differ. Under moon the cwd is
-    // `plugin/`, not the shell's, so a relative path resolves somewhere the user never
-    // typed and a message naming only one of the two reads as a lie.
+    // Name the resolved path AND the given one when they differ. A task runner may set the
+    // cwd to this repository rather than the shell's, so a relative path resolves somewhere
+    // the user never typed and a message naming only one of the two reads as a lie.
     const given = vaultRoot === vault ? "" : ` (from ${vault})`;
     throw new Error(`${vaultRoot}${given} is not an Obsidian vault (no .obsidian directory)`);
   }

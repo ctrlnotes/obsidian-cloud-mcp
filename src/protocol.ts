@@ -4,7 +4,7 @@
 //   browser  --obsidian://ctrlnotes/paired?vault=<obsidian vault name>-->  this plugin
 //
 // The browser sends one of these after a signed-in human has bound a pairing to the intent
-// this device registered (Task 19). It is the smoother experience on mobile, which is why
+// this device registered It is the smoother experience on mobile, which is why
 // D4 keeps it — but it is a *hint that the browser step finished*, and nothing more.
 //
 // **Nothing in a claimable channel is a credential.** `obsidian://` is a namespace any
@@ -25,9 +25,9 @@
 // **So the whole module decides one thing: nudge, or do nothing.** It reads one parameter,
 // carries no credential, makes no network call and touches no state.
 //
-// **This is informed by glass-1's `protocol.ts`, not a port of it.** The shape is the same
+// **This is informed by an earlier prototype's `protocol.ts`, not a port of it.** The shape is the same
 // — a pure decision function over the parameter bag, with registration left to `main.ts` —
-// but the arms are not the same arms. glass-1's `wrong-vault` is about Obsidian having
+// but the arms are not the same arms. An earlier prototype's `wrong-vault` is about Obsidian having
 // switched to a vault that does not hold the link id in the URI, and it is a real refusal
 // of a real request. Here there is no request: `ignore` is housekeeping over a message that
 // grants nothing either way. Reading the two as equivalent is how a "check" that defends
@@ -64,7 +64,7 @@ export const PAIRED_ACTIONS: readonly string[] = ["ctrlnotes/paired", "ctrlnotes
  * uploads on a nudge has moved the pairing decision into a channel a stranger can write to,
  * which is the failure D15 exists to prevent. The answer to "is there a result yet" comes
  * from `retrieveWhenBound`, and the answer to "may we adopt it" comes from D19's local
- * confirmation (Task 22).
+ * confirmation.
  */
 export type ProtocolAction = "nudge" | "ignore";
 

@@ -10,7 +10,7 @@
  * `hash.test.ts` pins agreement against the vault's real output for a fixed input (not
  * merely against Node's own `createHash`, which would only prove two JavaScript runtimes
  * agree with each other) — see that file's header for how the pinned value was produced.
- * Async rather than glass-1's synchronous `node:crypto` original, because Obsidian's mobile
+ * Async rather than an earlier prototype's synchronous `node:crypto` original, because Obsidian's mobile
  * WebView has no `node:crypto` and this file has no write-segment interleaving hazard to
  * avoid by staying synchronous.
  */

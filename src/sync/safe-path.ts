@@ -47,7 +47,7 @@ import { CODE_EXTENSIONS } from "./code-path.ts";
  * **`base` is back, and the history of that word is worth stating exactly, because an
  * earlier revision of this comment told it wrong.** This list once carried `csv`, `json`
  * and `base`, and they were removed on the reasoning that "the server enforces no
- * extension rule at all" had been falsified. That reasoning was about **glass-1's**
+ * extension rule at all" had been falsified. That reasoning was about **an earlier prototype's**
  * server, which really did have a `TEXT_EXTENSIONS` constant and really did answer
  * `binary_as_content` for a path outside it — and this file's own header is the record
  * that none of it is part of THIS repository. Here the sentence that was falsified there
@@ -107,9 +107,9 @@ const RESERVED_STEM = /^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
  *
  * Obsidian hides dot-prefixed paths from the vault anyway, so nothing a user can see or
  * edit is lost; that includes Obsidian's own `.trash`. A top-level dot-FILE goes with
- * them. The vault's export rule (export design EX16, `exportable` in
- * `apps/vault/src/export/pure.rs`) is this classifier ported and makes the same cut;
- * `wire/export-paths/cases.json` holds both to it.
+ * them. The vault's export rule (export design EX16, `exportable`) is this classifier
+ * ported and makes the same cut; each side tests its rule against its own copy of
+ * `export-paths/cases.json` (here, under `test-fixtures/wire/`).
  */
 
 /**

@@ -34,8 +34,7 @@ export const SECRET_ID = "ctrlrouter-device-private-key";
  * **Byte-identical to `share::device::SYNC_CONTEXT_PREFIX`** (`crates/share/src/device.rs`).
  * Not covered by the wire contract (`wire/vault-sync/`) because it is not a frame — it never
  * appears in any JSON frame, only inside the bytes a signature is computed over — so it is
- * matched here by hand, and only a real connection would catch a mismatch (plan Task 3
- * self-review note).
+ * matched here by hand, and only a real connection would catch a mismatch.
  */
 const SYNC_CONTEXT_PREFIX = "ctrlrouter-sync-v1";
 

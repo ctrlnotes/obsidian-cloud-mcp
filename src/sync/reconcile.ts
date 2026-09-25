@@ -2,7 +2,7 @@ import type { SnapshotEntry } from "../wire.ts";
 import { type DeriveOptions, syncablePath } from "./derive.ts";
 
 /**
- * What a snapshot means for this device — **ours, not glass-1's four-way `Split`.**
+ * What a snapshot means for this device — **ours, not an earlier prototype's four-way `Split`.**
  *
  * Glass-1's `ManifestResponse` was the SERVER comparing a manifest the device had just
  * uploaded against its own live set, and handing back `pull`/`push`/`deleted`/`differ`
@@ -30,7 +30,7 @@ export interface SnapshotSplit {
    * **Rule 2, and the reason this function exists.** A snapshot is authoritative: anything
    * held locally and absent from it was deleted while this device was away (design §8.4).
    * `apply.ts`'s `applySnapshot` is what actually removes them — this function only names
-   * them, the same division of labour glass-1's `planReconcile` kept between deciding and
+   * them, the same division of labour an earlier prototype's `planReconcile` kept between deciding and
    * doing.
    */
   readonly trash: readonly string[];

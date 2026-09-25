@@ -1,0 +1,5 @@
+{
+  "type": "rename",
+  "from": "projects/alpha.md",
+  "to": "projects/alpha-renamed.md"
+}

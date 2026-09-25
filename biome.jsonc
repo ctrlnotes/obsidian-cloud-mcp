@@ -1,11 +1,11 @@
-// The plugin's own Biome config. There is no root `biome.jsonc` in this repository to
-// inherit from — `apps/client` carries its own for the same reason (its own
-// `@biomejs/biome` devDependency, its own `includes`) — so this restates rather than
-// overrides anything. No `linter` block: Biome enables its recommended rules by default.
+// Biome formats and lints everything here except the build output and the fixtures. No
+// `linter` block: Biome enables its recommended rules by default.
+// `test-fixtures/` is excluded: its JSON is the Ctrl Notes service's wire examples, kept
+// byte-for-byte as the service has them, not formatted to this repository's style.
 {
   "$schema": "https://biomejs.dev/schemas/2.5.9/schema.json",
   "files": {
-    "includes": ["**", "!main.js"]
+    "includes": ["**", "!main.js", "!test-fixtures"]
   },
   "formatter": {
     "indentStyle": "space",

@@ -1,4 +1,4 @@
-// Obsidian's own review rules, run on every `moonx plugin:lint`.
+// Obsidian's own review rules, run on every `bun run lint`.
 //
 // **Why this exists beside Biome.** Biome formats and lints the TypeScript as
 // TypeScript. The community directory's automatic review runs
@@ -16,8 +16,8 @@
 // user; none of them is in `main.js`.
 //
 // The rules read `manifest.json` from the working directory (to know
-// `isDesktopOnly` and `minAppVersion`), so this must run from `apps/plugin` —
-// which is where moon runs the task.
+// `isDesktopOnly` and `minAppVersion`), so this must run from the repository
+// root, which is where `bun run lint` runs it.
 import obsidianmd from "eslint-plugin-obsidianmd";
 import tseslint from "typescript-eslint";
 

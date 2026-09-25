@@ -1,6 +1,6 @@
 // The plugin's one duplex connection to its vault (write-surface design §8.1, §8.5).
 //
-// **Ours, not a port.** glass-1's `stream.ts` is a hint-only channel: a poke that tells the
+// **Ours, not a port.** an earlier prototype's `stream.ts` is a hint-only channel: a poke that tells the
 // caller to run an ordinary HTTP exchange, with no credential proof beyond a subprotocol
 // string. This socket IS the sync channel — events flow down it, content flows up it — and
 // admission is a signed challenge, not a bearer credential (design §8.5). Only the
@@ -58,7 +58,7 @@ import { type Down, decodeDown, encodeUp, readDownFrame, type Up, WIRE_VERSION }
  * itself, so a test can hand it a fake with no real socket underneath, the same reasoning
  * as `device.ts`'s `SecretStorageHost`. Obsidian's own runtime (desktop Electron, and the
  * mobile WebView) provides a real `WebSocket` global that already satisfies this shape;
- * `main.ts` (Task 13) is what actually passes `(url) => new WebSocket(url)` as the factory.
+ * `main.ts` is what actually passes `(url) => new WebSocket(url)` as the factory.
  */
 export interface SocketLike {
   send(data: string | Uint8Array): void;
@@ -119,24 +119,18 @@ export function isIdleClosing(reason: string): boolean {
 }
 
 /**
- * `closing` reasons the vault itself documents as self-healing (`apps/vault/src/http/
- * routes/sync.rs`) rather than a credential or version failure — worth reconnecting for
- * with the ordinary backoff instead of surfacing as `terminal` (major fix: before this,
- * EVERY `closing` stopped syncing until Obsidian restarted, including the one whose own
- * text says to reconnect).
+ * `closing` reasons the vault documents as self-healing rather than a credential or version
+ * failure — worth reconnecting for with the ordinary backoff instead of surfacing as
+ * `terminal`. (Before this set existed, EVERY `closing` stopped syncing until Obsidian
+ * restarted, including the one whose own text says to reconnect.)
  *
- * Matched by EXACT text against that file's two reasons — free text is all `Down::Closing`
- * carries, so there is no structured field to switch on instead. `vault-reasons.test.ts`
- * pins both strings against the vault's own source so a changed or renamed reason there does
- * not silently start falling through to `terminal` here.
- *
- * **That sentence named `socket.resumable.test.ts` for a while, and no such file has ever
- * existed** — the claim was written and the check was not, so both strings went unpinned
- * from the day the comment was added. `vault-reasons.test.ts` is that check, and it also
- * covers the third reason design §6.3 gave a decision to (`status.ts`'s
- * `REVOKED_ELSEWHERE_REASON`).
+ * Matched by EXACT text: free text is all `Down::Closing` carries, so there is no
+ * structured field to switch on instead. `vault-reasons.test.ts` pins the set and each
+ * string by value. The vault's source is not in this repository, so **nothing here can
+ * notice the vault rewording one**; a changed reason falls through to `terminal`. Treat
+ * these strings as protocol.
  */
-const RESUMABLE_CLOSING_REASONS: ReadonlySet<string> = new Set([
+export const RESUMABLE_CLOSING_REASONS: ReadonlySet<string> = new Set([
   "too many connections open for this device",
   "too far behind acknowledging; reconnect and resume from your last seq",
 ]);
@@ -225,7 +219,7 @@ export interface SyncSocketDeps {
    */
   readonly onIdle?: () => void;
   /** Jitter source for the backoff. Injectable so a test is deterministic; defaults to the
-   * real `Math.random` in production, the same reasoning as glass-1's own `random`. */
+   * real `Math.random` in production, the same reasoning as an earlier prototype's `random`. */
   readonly random?: () => number;
   /** Passed through to {@link readDownFrame} for an unrecognised frame type; defaults to
    * that function's own `console.warn`. */
@@ -267,7 +261,7 @@ export class SyncSocket {
     this.ackedSeq = Math.max(0, sinceSeq);
   }
 
-  /** Idempotent, matching glass-1's own reasoning: a second call while a socket or a retry
+  /** Idempotent, matching an earlier prototype's reasoning: a second call while a socket or a retry
    * timer is already live must not leave the first one running and unreachable.
    *
    * **`opening` is part of that guard and cannot be dropped.** Since the URL carries a
@@ -297,7 +291,7 @@ export class SyncSocket {
     return true;
   }
 
-  /** Deliberate close: no reconnect follows. Called on unload (Task 13). */
+  /** Deliberate close: no reconnect follows. Called on unload. */
   disconnect(): void {
     this.wanted = false;
     this.clearTimers();
@@ -616,7 +610,7 @@ export class SyncSocket {
   private scheduleRetry(): void {
     if (this.timer !== null) return;
     const random = this.deps.random ?? Math.random;
-    // Full jitter over [retryMs/2, retryMs) — glass-1's own reasoning: every connection
+    // Full jitter over [retryMs/2, retryMs) — an earlier prototype's reasoning: every connection
     // that dropped in the same second (a deploy, a network blip) must not retry in
     // lockstep. `retryMs` itself keeps its exact doubling; jittering the stored value
     // would make the ladder drift and `STABLE_MS`'s reset lose a value worth reasoning

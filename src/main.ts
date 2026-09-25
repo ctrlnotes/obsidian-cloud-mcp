@@ -4,7 +4,7 @@
 //   Obsidian events ──▶ settle ──▶ derive ──▶ the outbound queue (Pump/SyncSocket)
 //   socket events ──▶ Pump.handleDown ──▶ apply ────────────────────────────────▶ ack
 //
-// **This is a rewrite, not an adaptation of the ported file.** glass-1's `main.ts` (1,601
+// **This is a rewrite, not an adaptation of the ported file.** an earlier prototype's `main.ts` (1,601
 // lines) wires a completely different shape: device-code + `obsidian://` redirect pairing,
 // a hint-only socket plus a batched HTTP exchange, and a bidirectional manifest compare
 // with its own `push`/`pull`/`differ` lists. None of that exists on this protocol — pairing
@@ -13,10 +13,10 @@
 // (D15), and `SyncSocket`/`Pump` already own the whole duplex transport and its outbound
 // queue. What
 // is carried across deliberately, because it is the part hardest to rediscover, is
-// glass-1's LIFECYCLE care: a pairing poll or redemption can resolve after `onunload` —
+// An earlier prototype's LIFECYCLE care: a pairing poll or redemption can resolve after `onunload` —
 // `requestUrl` has no abort, so a response already on the wire still lands — and every
 // place that response reaches plugin state checks `this.active` first, exactly as
-// glass-1's own `finishPairing` did.
+// An earlier prototype's `finishPairing` did.
 //
 // **Rule 2 lives one layer down, in `sync/apply.ts`** (`applyReplay` never deletes what it
 // was not told to; `applySnapshot` is the only entry point allowed to). This file's job is
@@ -294,7 +294,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /**
    * Resolves once load-time setup — the device identity, and a resumed connection if this
-   * device was already paired — has finished. A seam for tests, exactly like glass-1's own
+   * device was already paired — has finished. A seam for tests, exactly like an earlier prototype's
    * `ready`: nothing in the plugin reads it.
    */
   ready: Promise<void> = Promise.resolve();
@@ -369,7 +369,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     for (const listener of snapshot(this.pairingListeners)) listener();
   }
 
-  /** All three fields configured. The honest default (Task 13's own test) is that an
+  /** All three fields configured. The honest default (its own test) is that an
    * unpaired plugin does nothing at all — no connection, no retry, no repeated warning. */
   private isPaired(): boolean {
     return (
@@ -799,7 +799,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /**
    * Diff a full local scan against this device's own ledger and seed `touched` from the
-   * difference (major fix). `manifest-scan.ts` was written, tested, and never called — its
+   * difference. `manifest-scan.ts` was written, tested, and never called — its
    * own sibling `reconcile.ts` named the exact gap this closes: an edit made while this
    * device was not running at all, or a relink. The ordinary settle → derive pipeline
    * (unaffected by any of this) does everything else once a path is dirty; this function
@@ -915,7 +915,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // and flush anything the user edited while disconnected.
             pump.resume();
             this.settler?.touch();
-            // Major fix: a reconnect is also a relink's most likely moment — re-scan the
+            // A reconnect is also a relink's most likely moment — re-scan the
             // manifest so anything the watcher missed while this device was disconnected
             // (or plain not running) gets picked up too, not only what a live event caught.
             //
@@ -966,7 +966,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         onClosing: (message, willRetry) => {
           new Notice(`Disconnected from the Ctrl Notes vault: ${message}`);
           this.setStatus({ refusal: message, updating: false });
-          // A resumable closing (major fix, `socket.ts`'s own header) is already retrying
+          // A resumable closing (`socket.ts`'s own header) is already retrying
           // itself with backoff, on the SAME `SyncSocket`/`Pump` pair — tearing those down
           // here would abandon the very push or queue that retry is meant to resume, and
           // `startSyncing`'s only other entry point is a fresh pairing, not what this needs.
@@ -1328,10 +1328,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
     // Inside `onLayoutReady`, not here: Obsidian fires `create` for every existing file
     // WHILE THE VAULT LOADS, and registering in `onload` would mark an entire vault dirty
-    // on every single launch (glass-1's own finding, unchanged by the transport rewrite).
+    // on every single launch (an earlier prototype's finding, unchanged by the transport rewrite).
     this.app.workspace.onLayoutReady(() => {
       this.reindexSpellings();
-      // Major fix: catches an edit the watcher could never have seen — one made while this
+      // Catches an edit the watcher could never have seen — one made while this
       // device was not running at all, or a relink (`reconcile.ts`'s own doc comment named
       // this gap and left it for "a later task's job"). Vault listing is stable and complete
       // by `onLayoutReady`, which is also why the live listeners below wait for it.
@@ -1426,7 +1426,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             undecodable.slice(0, 5).join(", "),
         );
       }
-      // **The withheld files reach the pane, not just the console (minor fix).** Both
+      // **The withheld files reach the pane, not just the console.** Both
       // warnings above are `console.warn` and nothing else, while `status.ts` documents
       // `unsyncable` as "Files this device will not carry" and `describeStatus` renders
       // exactly the sentence these belong in. A user whose `notes.txt` was re-saved as
@@ -1475,7 +1475,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       }
       this.setStatus({ pending: 0 });
     } catch (e) {
-      // **Major fix.** `deriveChanges` itself can reject (a stat/read/readBinary rejection
+      // `deriveChanges` itself can reject (a stat/read/readBinary rejection
       // it could not itself catch and skip, or a bug) — this used to escape `pushTouched`
       // uncaught, with `touched` already replaced by an empty one above, so every path in
       // this settle's window was lost for good rather than only whichever one caused it.
@@ -1661,7 +1661,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /**
    * `Vault` behind the narrow interfaces `apply.ts` (`VaultFiles`) and `derive.ts`
-   * (`ReadableFiles`) need — ported in shape from glass-1's own `vaultFiles()`, which
+   * (`ReadableFiles`) need — ported in shape from an earlier prototype's `vaultFiles()`, which
    * already solved "write does not create parent folders" (`mkdirp`) and "an inbound path
    * may not match this filesystem's Unicode normalisation" (`toDiskPath`). Neither concern
    * is protocol-specific, so neither needed rewriting, only retargeting at our own

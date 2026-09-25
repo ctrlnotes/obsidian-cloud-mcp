@@ -38,9 +38,9 @@ export interface ReadableFiles {
 }
 
 /**
- * A change ready to leave this device — **ours, not glass-1's `Change` union.**
+ * A change ready to leave this device — **ours, not an earlier prototype's `Change` union.**
  *
- * One write op, not four: glass-1's wire distinguished `create`/`replace` (text, inline
+ * One write op, not four: an earlier prototype's wire distinguished `create`/`replace` (text, inline
  * content) from `create_binary`/`replace_binary` (an attachment, content addressed by hash
  * alone, fetched separately). Ours has no such split — `Up::Put` names a path, a `base_sha`
  * and a `sha`, and the bytes follow as binary frames regardless of what kind of file they
@@ -49,7 +49,7 @@ export interface ReadableFiles {
  * and never asks a client to apply a diff.
  *
  * `base: null` is a create; `base: <hash>` is a replace against that ancestor — the same
- * distinction glass-1 made with an absent field, spelled the way our wire already spells
+ * distinction an earlier prototype made with an absent field, spelled the way our wire already spells
  * `base_sha` everywhere else (`wire.ts`'s `UpPut`).
  */
 export type Change =
@@ -174,7 +174,7 @@ export const deriveChanges = async (
   /** Touched paths we found on disk — a deletion of one of these was undone. */
   const alive = new Set<string>();
 
-  // Sequential on purpose, and bounded by the fix in Task 6: reads and hashes run one at
+  // Sequential on purpose, and bounded on purpose: reads and hashes run one at
   // a time, which is fine for a handful of edited notes and would not be for a whole
   // vault. Registering the listeners inside `onLayoutReady` is what keeps the whole vault
   // out of `dirty` in the first place — without it this loop is the startup cost.
@@ -192,7 +192,7 @@ export const deriveChanges = async (
     try {
       // **Stat before read, for every path — text and attachment alike.** `MAX_FRAME_BYTES`
       // is a memory bound on the vault's own connection handler (`Upload::begin` refuses a
-      // declared size past it before allocating), and unlike glass-1's wire it applies to
+      // declared size past it before allocating), and unlike an earlier prototype's wire it applies to
       // everything a `put` can carry, not to attachments alone. Reading first means a large
       // file is fully buffered and hashed before anyone asks whether it can be sent at all.
       const stat = await files.stat(path);
