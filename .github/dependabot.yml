@@ -28,6 +28,17 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
+    ignore:
+      # `typescript` is the 6.x that typescript-eslint loads: it supports TypeScript below 6.1
+      # only (peer `>=4.8.4 <6.1.0` in 8.70.1), because 7.0 ships no compiler API
+      # (typescript-eslint#10940, expected with 7.1). TypeScript 7 type-checks the code as
+      # `@typescript/native` (see tsconfig.json). Remove this once typescript-eslint supports 7.
+      - dependency-name: typescript
+        versions: [">=6.1.0"]
+      # The types describe the Node that runs the build and tests: `.node-version`, 24 LTS.
+      # Move them to a new major together with `.node-version`, never alone.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     groups:
       # Everything but Obsidian's review rules, together.
       dependencies:

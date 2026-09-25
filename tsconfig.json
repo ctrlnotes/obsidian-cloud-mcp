@@ -1,5 +1,10 @@
-// One plain `typescript` devDependency, pinned at 6.0.3. Do not move to 7.x yet: the
-// Obsidian and lint tooling here have not been checked against it.
+// Two TypeScripts, side by side, as the TypeScript 7 announcement recommends:
+// - `@typescript/native` (an alias of `typescript@7`) type-checks: `bun run typecheck` calls
+//   its `tsc` by path, because both packages install a `tsc` binary and which one
+//   `node_modules/.bin/tsc` names is not something to rely on.
+// - `typescript` stays on 6.x for typescript-eslint, which runs Obsidian's review rules and
+//   needs the compiler API that 7.0 does not ship (typescript-eslint#10940; expected with
+//   TypeScript 7.1). Drop it, and the alias, once typescript-eslint supports 7.
 {
   "compilerOptions": {
     "target": "es2018",
