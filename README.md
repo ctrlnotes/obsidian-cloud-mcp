@@ -91,8 +91,9 @@ claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp
 ```
 
 Then run `/mcp` in Claude Code and authenticate. Your browser opens at ctrlnotes.app:
-sign in, pick the vault if you have more than one, and choose read only (the default) or
-read and write. Ready-made agent plugins, with a skill that teaches the agent to edit
+sign in, choose the vault (or tick several, if you have more than one: one connection
+reaches every vault you tick), and choose read only (the default) or read and write for
+each. Ready-made agent plugins, with a skill that teaches the agent to edit
 safely, are at [ctrlnotes/agent-plugins](https://github.com/ctrlnotes/agent-plugins).
 
 The server speaks MCP over Streamable HTTP and signs you in with OAuth. Claude Code is the
