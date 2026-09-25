@@ -166,7 +166,9 @@ describe("isSafeInboundPath — invariants", () => {
         ),
         // Reserved stems excluded: they are legitimately refused now, and leaving them
         // in would make this generator produce a counterexample to its own claim.
-        fc.stringMatching(/^[A-Za-z0-9_-]{1,10}$/).filter((n) => !RESERVED.test(n.split(".")[0]!)),
+        fc
+          .stringMatching(/^[A-Za-z0-9_-]{1,10}$/)
+          .filter((n) => !RESERVED.test(n.split(".")[0] ?? "")),
         fc.constantFrom("md", "canvas", "txt"),
       )
       .map(([dirs, name, ext]) => [...dirs, `${name}.${ext}`].join("/"));

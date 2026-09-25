@@ -1,10 +1,9 @@
 // The plugin's half of `GET /v1/sync/signal`'s wire contract (vault-sleep VS8, PL7).
 //
-// The control plane builds `{"seq": n}` or `{"seq": null}` and
-// `apps/controlplane/tests/wire_contract.rs` asserts its real response body EQUALS each
-// fixture below; this file asserts `readSignal` reads the same bytes as the number and as
-// "unknown". A fixture only one side rereads is not a contract, so both read these files
-// (`wire/controlplane/README.md`).
+// The control plane answers `{"seq": n}` or `{"seq": null}`, and asserts its real response
+// body equals its own copy of each fixture below. This file asserts `readSignal` reads
+// these bytes as the number and as "unknown". The service keeps its own copy of these fixtures, and nothing connects the two: a
+// change to the response is made in both repositories by hand.
 
 import { describe, expect, test } from "vitest";
 import { fixture } from "../testing/wire-fixture.ts";

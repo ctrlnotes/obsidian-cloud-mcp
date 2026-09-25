@@ -1,7 +1,7 @@
 import type { DownRefused } from "../wire.ts";
 
 /**
- * What a refusal costs — **ours, not glass-1's.**
+ * What a refusal costs — **ours, not an earlier prototype's.**
  *
  * Glass-1 classified retries against a CLOSED, sixteen-member `RejectCode` enum
  * (`unknown_base`, `stale_base`, `binary_as_content`, …) because its wire's `reason`
@@ -12,7 +12,7 @@ import type { DownRefused } from "../wire.ts";
  * carries, and reading that same file shows exactly what it means: present, there is a
  * concrete version to reconcile against; absent, there is not.
  *
- * **This also means our retry story is far smaller than glass-1's**, and that is not a
+ * **This also means our retry story is far smaller than an earlier prototype's**, and that is not a
  * simplification made here — it falls out of the protocol. Their `unknown_base` needed
  * `planRetry` to rebuild a `create` from the SENT change, because the batch was the only
  * surviving copy of a rejected edit's content: an inbound change riding in on the SAME

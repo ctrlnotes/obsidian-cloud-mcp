@@ -1,4 +1,4 @@
-// The frames this vault speaks — write-surface design §8.1, §8.2. Ours, not glass-1's:
+// The frames this vault speaks — write-surface design §8.1, §8.2. Ours, not an earlier prototype's:
 // their wire described a hint-only socket with an HTTP content path and a `patch` op; this
 // vault sends whole content over one duplex WebSocket and never asks a client to apply a
 // diff (design §3.2).
@@ -8,7 +8,7 @@
 // sides assert against (`wire/vault-sync/README.md`); `wire.contract.test.ts` is what
 // exercises `encodeUp`/`decodeDown` here against those fixtures.
 //
-// **Two forward-compatibility rules, and they are opposite on purpose (plan Task 6):**
+// **Two forward-compatibility rules, and they are opposite on purpose:**
 //
 // - **An unknown `Down` frame TYPE is tolerated, not fatal.** A vault newer than this
 //   plugin build may add a frame type this build has never heard of; closing the socket
@@ -21,7 +21,7 @@
 //   (`WireVersionMismatchError`, left to propagate out of both `decodeDown` and
 //   `readDownFrame`) rather than being logged and continued past.
 //
-// The socket that drives these (Task 9) is still to come; this module is where the two
+// `SyncSocket` drives these; this module is where the two
 // rules live so that module has only to call the right function.
 
 /**
@@ -50,7 +50,7 @@ export const WIRE_VERSION = 3;
  * (`apps/vault/src/sync/upload.rs`) refuses any `Up::Put` whose declared `bytes`
  * exceeds this *before allocating anything* — unconditionally, for text and
  * attachments alike, since our wire has no separate byte channel with its own cap
- * the way glass-1's `MAX_ATTACHMENT_BYTES` did. `derive.ts` uses this to refuse a
+ * the way an earlier prototype's `MAX_ATTACHMENT_BYTES` did. `derive.ts` uses this to refuse a
  * change client-side rather than let the vault refuse it after a full read+hash.
  *
  * Read the doc comment on the Rust constant before assuming this can be raised: it

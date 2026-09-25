@@ -2,9 +2,9 @@
 // for `obsidian` at test time (`vitest.config.ts`) — the real `obsidian` package is
 // types-only and importing it at runtime throws.
 //
-// **Adapted from glass-1's `testing/fake-obsidian.ts`, not ported whole.** That file also
+// **Adapted from an earlier prototype's `testing/fake-obsidian.ts`, not ported whole.** That file also
 // carried a `FakeWebSocket` with subprotocol capture, which does not apply here:
-// `SyncSocket` (Task 9) drives the `WebSocket` global directly rather than through anything
+// `SyncSocket` drives the `WebSocket` global directly rather than through anything
 // `obsidian` exports, so its own tests fake that global themselves.
 //
 // It also carried `obsidian://` protocol-handler recording, which this file dropped on the
@@ -13,7 +13,7 @@
 // (D4), so the recording is back below. What the callback may carry — nothing (D15) — is
 // `../protocol.ts`'s subject; what the fake owes is only a way to deliver one.
 //
-// **A named gap, same as glass-1's:** this fake ships with no contract test run against a
+// **A named gap, same as an earlier prototype's:** this fake ships with no contract test run against a
 // real Obsidian, because the real `obsidian` npm package is types-only and Obsidian's API
 // exists only inside Obsidian. It is checked by the type checker (every member `main.ts`
 // or `settings-tab.ts` actually calls is typed against the real `obsidian.d.ts`) and by
@@ -276,7 +276,7 @@ interface FakeSettingDefinition {
   desc?: string;
   visible?: boolean | (() => boolean);
   control?: { type: "text"; key: string; placeholder?: string };
-  render?: (setting: Setting, group: unknown) => void | (() => void);
+  render?: (setting: Setting, group: unknown) => undefined | (() => void);
 }
 
 /**
@@ -340,7 +340,7 @@ export class PluginSettingTab {
       setting.addText((text) =>
         text
           .setPlaceholder(control.placeholder ?? "")
-          .setValue(String(this.getControlValue(control.key) ?? ""))
+          .setValue(textValue(this.getControlValue(control.key)))
           .onChange((value) => this.setControlValue(control.key, value)),
       );
     }
@@ -515,3 +515,8 @@ export const registerTab = <T extends { update(): void }>(tab: T): T => {
   tab.update();
   return tab;
 };
+
+/** A text control's value as Obsidian would show it: the string, or empty for anything else. */
+function textValue(value: unknown): string {
+  return typeof value === "string" ? value : "";
+}

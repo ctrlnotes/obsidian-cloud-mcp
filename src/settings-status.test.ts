@@ -6,7 +6,7 @@ import { IDLE_STATUS, type SyncStatus } from "./sync/status.ts";
 import { registerTab } from "./testing/fake-obsidian.ts";
 
 /** The slice of the plugin the tab reads, plus a visible listener set — adapted from
- * glass-1's own `settings-status.test.ts`: same lifecycle claim, our fields. */
+ * An earlier prototype's `settings-status.test.ts`: same lifecycle claim, our fields. */
 const fakeHost = (): { host: Plugin & SettingsHost; listeners: Set<(s: SyncStatus) => void> } => {
   const listeners = new Set<(s: SyncStatus) => void>();
   const host = {

@@ -1,14 +1,13 @@
-// The plugin's half of the cross-service wire contract (`wire/vault-sync/README.md`).
+// The plugin's half of the sync wire contract, against `test-fixtures/wire/vault-sync/`.
 //
-// The vault reads `Up` fixtures straight into `vault::sync::wire::Up`
-// (`apps/vault/tests/wire_contract_sync.rs`) and serialises a representative `Down` value
-// against each `down.*.json` fixture. This is the mirror image: it encodes a representative
-// `Up` value and checks it against the fixture's shape, and it decodes each `down.*.json`
-// fixture with this plugin's own decoder and checks that succeeds.
+// It encodes a representative `Up` value and checks it against each `up.*.json` fixture's
+// shape, and decodes each `down.*.json` fixture with this plugin's own decoder and checks
+// that succeeds. The vault tests its side against its own copy of the same fixtures.
 //
 // Adding or renaming a field on either side is a breaking change to a deployed interface.
-// This test fails until the matching fixture is updated, which is the point: the fixture is
-// where the two services agree, so it has to change first.
+// This test fails until the matching fixture here is updated. The service's copy is not in
+// this repository and nothing connects the two, so a protocol change is made in both by
+// hand, deliberately.
 
 import { describe, expect, test } from "vitest";
 import { assertShape, fixture, type JsonValue } from "./testing/wire-fixture.ts";

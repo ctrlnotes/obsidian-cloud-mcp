@@ -154,7 +154,7 @@ likely means.
 Issues and pull requests are welcome; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ```bash
-bun install
+bun install --frozen-lockfile   # every dependency is pinned exactly
 bun run typecheck
 bun run lint               # Biome, then Obsidian's own review rules at zero warnings
 bun run test

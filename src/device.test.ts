@@ -88,7 +88,7 @@ test("the private key never passes through saveData", async () => {
 test("the key is not an enumerable own property of the identity object", async () => {
   const f = fakeApp();
   const d = await DeviceIdentity.load(f.app);
-  const storedKeyBase64 = await f.app.secretStorage.getSecret(SECRET_ID);
+  const storedKeyBase64 = f.app.secretStorage.getSecret(SECRET_ID);
 
   expect(typeof storedKeyBase64).toBe("string");
   expect(JSON.stringify(d)).not.toContain(storedKeyBase64);
@@ -175,11 +175,10 @@ describe("publicKeyStandardBase64", () => {
   });
 });
 
-describe("interop with the vault's own context_message", () => {
-  // share::device::context_message hard-codes `vault_id: &str` -- "" in Dev/most tests
-  // (crates/share/src/device.rs's own doc comment) -- and folds it in with no separator
-  // bytes between the prefix, the vault id, and the challenge. This does not verify against
-  // a real vault (that needs a live connection -- plan Task 3's self-review note).
+describe("the sync challenge message the vault verifies", () => {
+  // The vault builds the same message independently: the prefix, then the vault id, then
+  // the challenge, with no separator bytes. These tests pin this side's layout by value;
+  // nothing here can verify against a real vault, which needs a live connection.
   test("signChallenge is deterministic for the same key, vault id and challenge", async () => {
     const f = fakeApp();
     const d = await DeviceIdentity.load(f.app);
@@ -190,7 +189,7 @@ describe("interop with the vault's own context_message", () => {
   });
 
   /**
-   * **Major fix.** Determinism above is a property of ed25519, not of THIS message's
+   * Determinism above is a property of ed25519, not of THIS message's
    * layout — a build that concatenated `vault_id || prefix || challenge` instead is exactly
    * as deterministic. This pins the layout itself: prefix, order, and the absence of any
    * separator, by comparing bytes directly against a message built by hand rather than
@@ -261,10 +260,11 @@ describe("intentContextMessage", () => {
   });
 
   /**
-   * **PL7: the cross-language pin.** `wire/pairing-intent/README.md` says why this fixture
-   * is checked by VALUE where every other one in `wire/` is checked by shape. The Rust side
-   * asserts the same file in `crates/share/src/device.rs`; if the two ever disagree, one of
-   * them fails here rather than in production against an opaque 404.
+   * **The cross-language pin.** This fixture is checked by VALUE where every other wire
+   * fixture is checked by shape: the message never appears on the wire, so the two sides
+   * rebuild the signed bytes alone. The control plane asserts its own copy of the same
+   * fixture; nothing connects the copies, so a disagreement shows up in production as an
+   * opaque 404. Change this file only in step with the service.
    */
   test("matches the cross-language wire fixture byte for byte", () => {
     const f = fixture("pairing-intent/intent-context-message.json") as {
@@ -336,7 +336,7 @@ describe("decodeBase64Url", () => {
 
 describe("the sync routing message", () => {
   /**
-   * Pinned by VALUE against the same file `crates/share/src/device.rs` asserts,
+   * Pinned by VALUE against a fixture the control plane asserts its own copy of,
    * because nothing type-checks across that boundary and the message never
    * appears on the wire — the query string carries a device id, a key, a
    * timestamp and a signature, and each side rebuilds the signed bytes alone.

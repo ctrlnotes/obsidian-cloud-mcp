@@ -3,9 +3,8 @@
 // languages agree about what "matches the fixture" means.
 
 import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 
-/** JSON, structurally — the same shape `serde_json::Value` gives the Rust side. */
+/** JSON, structurally. */
 export type JsonValue =
   | null
   | boolean
@@ -24,9 +23,12 @@ export type JsonValue =
  * test run from any directory finds it.
  */
 export function fixture(relative: string): JsonValue {
-  const here = fileURLToPath(new URL(".", import.meta.url));
-  const path = new URL(`../../test-fixtures/wire/${relative}`, `file://${here}`);
-  const raw = readFileSync(path, "utf8");
+  // A URL relative to this module's own URL: joining a decoded filesystem path into a
+  // `file://` string would break on a checkout path containing `#` or `%`.
+  const raw = readFileSync(
+    new URL(`../../test-fixtures/wire/${relative}`, import.meta.url),
+    "utf8",
+  );
   return JSON.parse(raw) as JsonValue;
 }
 
@@ -49,8 +51,8 @@ function kind(v: JsonValue): string {
  * Assert that `actual` has the same SHAPE as `fixture` — field names and JSON types,
  * recursively. Values are ignored: a fixture carries example data, and demanding equality
  * would make this a golden-file test of the data rather than a contract test of the
- * interface. A byte-for-byte port of `share_testkit::wire::assert_shape`'s rules; see that
- * module's doc comment for the reasoning behind each one.
+ * interface. The rules are a port of the service's own checker, so both languages agree
+ * about what "matches the fixture" means.
  *
  * Null is always acceptable in `actual`, and a null in the fixture means "any type here" —
  * every optional field on this wire is `T | null`, and which fields are null depends on the
@@ -73,8 +75,8 @@ function compare(expected: JsonValue, actual: JsonValue, at: string, out: string
     typeof actual === "object" &&
     !Array.isArray(actual);
   if (bothObjects) {
-    const e = expected as { [key: string]: JsonValue };
-    const a = actual as { [key: string]: JsonValue };
+    const e = expected;
+    const a = actual;
     // Sets of OWN keys, built from `Object.keys` rather than `in`/`hasOwnProperty` — a
     // JSON-decoded object's keys are arbitrary strings, and either of those would answer
     // `true` for an inherited name like `"constructor"` that was never actually present.
@@ -99,7 +101,7 @@ function compare(expected: JsonValue, actual: JsonValue, at: string, out: string
     const shape = expected[0];
     if (shape === undefined) return;
     for (const [i, item] of actual.entries()) {
-      compare(shape as JsonValue, item, `${at}[${i}]`, out);
+      compare(shape, item, `${at}[${i}]`, out);
     }
     return;
   }

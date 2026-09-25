@@ -4,6 +4,7 @@ import {
   isIdleClosing,
   isRestartClosing,
   isResumableClosing,
+  RESUMABLE_CLOSING_REASONS,
   SERVICE_RESTART_CLOSE_CODE,
   VAULT_RESTART_REASON,
 } from "./socket.ts";
@@ -15,17 +16,26 @@ import { REVOKED_ELSEWHERE_REASON } from "./status.ts";
  *
  * **Why a pin and not a comment.** `reason` is free text: there is no code, no enum and no
  * structured field on this wire (`socket.ts` and `status.ts` both say so). Every decision
- * here is an exact string match against text the Ctrl Notes vault sends. Reword one on
- * either side and nothing fails to compile or warns: a resumable closing quietly becomes
- * terminal and stops syncing until Obsidian restarts, or a revoked device silently loses the
- * one sentence that tells its owner what happened.
+ * here is an exact string match against text the Ctrl Notes vault sends. A rewording on
+ * either side fails to compile nowhere and warns nowhere: a resumable closing quietly
+ * becomes terminal and stops syncing until Obsidian restarts, or a revoked device silently
+ * loses the one sentence that tells its owner what happened.
  *
- * **These are the vault's exact words, as of the service's protocol when this was written.**
- * The vault's source is not in this repository, so nothing here can check that it still sends
- * them; the service pins its side of the same strings in its own tests. What this file does
- * pin is that the plugin keeps recognising exactly these, so a change here is deliberate.
+ * **Nothing detects the vault changing one of these.** The vault's source is not in this
+ * repository, and no test anywhere connects the two. What this file pins is the plugin's
+ * side: exactly these strings, recognised exactly this way, so a change here is deliberate
+ * and a change there has to be matched here by hand.
  */
 describe("the closing reasons this plugin decides on", () => {
+  // The set, not only its members: a third reason added to it would otherwise pass every
+  // case below while changing which closings the plugin retries.
+  it("treats exactly two reasons as resumable", () => {
+    expect([...RESUMABLE_CLOSING_REASONS].sort()).toEqual([
+      "too far behind acknowledging; reconnect and resume from your last seq",
+      "too many connections open for this device",
+    ]);
+  });
+
   it("treats the per-device connection cap as RESUMABLE", () => {
     const reason = "too many connections open for this device";
     expect(isResumableClosing(reason)).toBe(true);

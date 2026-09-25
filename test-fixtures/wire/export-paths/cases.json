@@ -1,5 +1,5 @@
 {
-  "about": "Which vault paths an export includes (export design EX16): exactly the paths the Obsidian plugin would write to disk. Read by apps/plugin's classifyPath test (a path is exportable iff it is not 'refused') and by apps/vault's export::pure::exportable test, so the two rules cannot drift apart.",
+  "about": "Which vault paths an export includes (export design EX16): exactly the paths the Obsidian plugin would write to disk. Read by apps/vault's export::pure::exportable test. The Obsidian plugin (ctrlnotes/obsidian-cloud-mcp) tests its classifyPath against its own copy (a path is exportable iff it is not 'refused'); nothing connects the two copies, so change a case in both.",
   "cases": [
     { "path": "Daily/2026-09-22.md", "exportable": true, "why": "a note" },
     { "path": "Board.canvas", "exportable": true, "why": "a canvas" },

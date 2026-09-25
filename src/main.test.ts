@@ -1,6 +1,6 @@
-// Task 13's own tests, against the rewritten shell — not glass-1's `main.test.ts`, which
+// The plugin shell's own tests — not an earlier prototype's `main.test.ts`, which
 // drove a device-code pairing flow and a batched HTTP exchange this plugin does not have.
-// Socket handshake mechanics (Task 9) and the outbound queue (Task 10) already have their
+// Socket handshake mechanics and the outbound queue already have their
 // own thorough suites; this file only exercises what belongs to the SHELL: lifecycle
 // safety around `onunload`, the settle → derive → push wiring, and the honest "unpaired
 // means untouched" default.
@@ -448,7 +448,7 @@ describe("a terminal closing during an outstanding push does not stop syncing fo
 
 describe("an inbound delete goes through trashLocal, never a permanent remove", () => {
   /**
-   * **Major fix.** `main.ts`'s own comment on this wiring calls it load-bearing: "a delete
+   * `main.ts`'s own comment on this wiring calls it load-bearing: "a delete
    * this device should not have applied stays recoverable by the user." Nothing drove an
    * inbound `delete` down through `main.ts`'s real adapter wiring before this — the unit
    * tests exercise `VaultFiles.trash` directly, where the interface has no `remove` to
@@ -496,7 +496,7 @@ describe("an inbound delete goes through trashLocal, never a permanent remove", 
 
 describe("a manifest scan catches an edit the watcher never saw", () => {
   /**
-   * **Major fix.** `manifest-scan.ts` was written, tested, and never wired in
+   * `manifest-scan.ts` was written, tested, and never wired in
    * (`reconcile.ts`'s own doc comment named this exact gap: "a device that wants to catch
    * edits the watcher missed entirely ... is a later task's job"). The live vault listeners
    * only fire for an edit made WHILE this plugin instance is running — a file changed before
@@ -971,7 +971,7 @@ describe("nothing is adopted until a human on this device says so", () => {
     expect(await plugin.loadData()).toMatchObject({ vaultId: "vault-1", deviceId: "dev-1" });
     expect(redeemCalls()).toHaveLength(1);
 
-    // **The upload half, asserted HERE and not after a `ready` frame** (minor fix). This is
+    // **The upload half, asserted HERE and not after a `ready` frame**. This is
     // the instant `seedInitialUpload` has run and nothing else has dirtied anything:
     // Obsidian's own `create` replay fired long before this device was paired, and
     // `onLayoutReady`'s `reconcileManifest` is gated on `isPaired()`, which was false all
@@ -1247,12 +1247,12 @@ describe("disconnecting this device", () => {
       {},
       { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
     );
-    const before = await plugin.app.secretStorage.getSecret(SECRET_ID);
+    const before = plugin.app.secretStorage.getSecret(SECRET_ID);
     expect(before).toBeTruthy();
 
     await plugin.disconnect();
 
-    const after = await plugin.app.secretStorage.getSecret(SECRET_ID);
+    const after = plugin.app.secretStorage.getSecret(SECRET_ID);
     expect(after).not.toBe(before);
   });
 
@@ -1512,7 +1512,7 @@ describe("an unpushed edit, end to end through the shell", () => {
     // uploaded is the inbound path reporting it kept.
     await plugin.app.vault.adapter.writeBinary(
       "note.md",
-      new TextEncoder().encode("local edit\n").buffer as ArrayBuffer,
+      new TextEncoder().encode("local edit\n").buffer,
     );
     ws.sent.length = 0;
 
@@ -1550,7 +1550,7 @@ describe("an unpushed edit, end to end through the shell", () => {
 
     await plugin.app.vault.adapter.writeBinary(
       "note.md",
-      new TextEncoder().encode("mine\n").buffer as ArrayBuffer,
+      new TextEncoder().encode("mine\n").buffer,
     );
     fireVaultEvent("modify", "note.md");
     await vi.waitFor(

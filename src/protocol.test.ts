@@ -64,7 +64,7 @@ describe("the obsidian:// callback", () => {
    * pick the window, which is why it is on the URL at all (design §5.2).
    *
    * **This is housekeeping, not a control**, and the comment says so because the file it
-   * is adapted from means something else by the same word: glass-1's `wrong-vault` arm is
+   * is adapted from means something else by the same word: an earlier prototype's `wrong-vault` arm is
    * about Obsidian having switched vaults under a link id it holds. A nudge carries
    * nothing, so ignoring one denies an attacker nothing either.
    */
@@ -128,7 +128,7 @@ describe("the actions this plugin claims", () => {
 });
 
 /**
- * The delivery mechanism Task 22 wires `main.ts` into. Registration is not this module's
+ * The delivery mechanism `main.ts` is wired into. Registration is not this module's
  * job, but a handler that never arrives and a handler that outlives its plugin are both
  * failures of this file's contract, and neither is visible from `handleProtocol` alone.
  */

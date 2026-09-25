@@ -29,7 +29,7 @@ describe("the licence banner main.js opens with", () => {
 describe("what the build checks against the bundle", () => {
   const inputs = [
     "src/main.ts",
-    "../../node_modules/.bun/@noble+ed25519@3.1.0/node_modules/@noble/ed25519/index.js",
+    "node_modules/.bun/@noble+ed25519@3.1.0/node_modules/@noble/ed25519/index.js",
     "node_modules/left-pad/index.js",
   ];
 

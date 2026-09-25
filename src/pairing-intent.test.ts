@@ -1,4 +1,4 @@
-// Task 19's tests (spec D2, D13, D15, PL1), against the real server contract read from
+// Pairing-intent tests (spec D2, D13, D15, PL1), against the real server contract read from
 // `apps/controlplane/src/http/routes/pairing_intents.rs` — `POST /v1/pairing-intents` takes
 // `{public_key, vault_name_suggestion}` and answers `201 {intent_id, expires_at}`.
 //
@@ -339,7 +339,7 @@ describe("loadPairingState refuses anything that is not exactly what we wrote", 
 });
 
 // ---------------------------------------------------------------------------------------
-// Task 20: D14 — retrieve the result by signing.
+// D14 — retrieve the result by signing.
 //
 // Two hops per attempt: `GET …/challenge` issues 32 single-use bytes, `POST …/result`
 // spends them together with a signature over
@@ -651,7 +651,7 @@ describe("retrieveWhenBound polls until the human has confirmed in the browser",
   });
 
   /**
-   * The reason `expiresAt` is persisted at all (Task 19). After a cold launch the plugin
+   * The reason `expiresAt` is persisted at all. After a cold launch the plugin
    * gets the REMAINING window, not a fresh ten minutes — and an intent whose window has
    * already closed costs no request at all, rather than 300 doomed round trips.
    */
@@ -707,7 +707,7 @@ describe("retrieveWhenBound polls until the human has confirmed in the browser",
   });
 
   /**
-   * D19 lives in Task 22, and this loop must leave room for it: retrieving a result is not
+   * D19 lives in the adoption step, and this loop must leave room for it: retrieving a result is not
    * adopting one. The state the loop READS is untouched when it returns — no clear, no
    * rewrite — so the intent is still there for the confirm step, or for a second attempt
    * after a cold launch.

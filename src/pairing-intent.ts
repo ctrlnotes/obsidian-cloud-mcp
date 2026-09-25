@@ -16,7 +16,7 @@
 // **Creating an intent confers nothing.** It is unauthenticated because the plugin has no
 // account and cannot get one. An intent grants access only once a signed-in session binds a
 // pairing to it (D16), and its result is released only to whoever can sign with the private
-// half of the key the intent names (D14, Task 20).
+// half of the key the intent names (D14).
 //
 // **PL1 — the intent id goes to `saveLocalStorage`, never `saveData`.** `saveData` writes
 // `.obsidian/plugins/<id>/data.json` INSIDE the vault, which Obsidian Sync replicates to
@@ -34,7 +34,7 @@
 // **The deep link is not part of this hop.** `obsidian://` carries no secret (D15) and the
 // plugin retrieves its result by proving possession of the device key regardless of whether
 // a callback ever arrives — so a lost or hijacked callback costs time and nothing else. That
-// retrieval is Task 20; `startPairing` never waits for anything a callback would deliver.
+// retrieval is separate; `startPairing` never waits for anything a callback would deliver.
 
 import type { App, Vault } from "obsidian";
 import { reasonFrom, request } from "./controlplane-http.ts";
@@ -212,7 +212,7 @@ export type StartPairingResult =
  *
  * **This returns as soon as the browser has been asked.** It never waits on an `obsidian://`
  * callback — the callback carries no secret and may never arrive at all (D15), so the flow
- * continues from the persisted intent id alone (Task 20).
+ * continues from the persisted intent id alone.
  */
 export async function startPairing(
   app: PairingHost,
@@ -269,7 +269,7 @@ export async function startPairing(
 // sentence that killed two drafts). An attacker who wins D16's race binds a pairing to this
 // intent first, and this device then legitimately reads a result naming the attacker's
 // vault. Nothing in this file may therefore adopt anything: D19's local confirmation is
-// Task 22, and it is the only thing standing between that race and the user's notes.
+// the adoption step, and it is the only thing standing between that race and the user's notes.
 //
 // **A poll, not a callback.** `obsidian://` carries no secret and may never arrive at all
 // (D15), so the loop below runs regardless and a lost deep link costs time only.
@@ -536,7 +536,7 @@ export type Settled =
  *
  * **Nothing is persisted or adopted here.** This function is handed a `PairingState` value
  * and never a `PairingStore`: retrieving a result is not acting on one, and D19's
- * confirmation (Task 22) is what turns one into the other.
+ * confirmation is what turns one into the other.
  *
  * `now` is injected, defaulted to the wall clock. This is the plugin's only clock read, and
  * it is injected for the reason `clippy.toml` forbids `Instant::now()` on the Rust side: a

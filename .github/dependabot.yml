@@ -29,7 +29,12 @@ updates:
     cooldown:
       default-days: 7
     groups:
+      # Everything but Obsidian's review rules, together.
       dependencies:
         patterns: ["*"]
+        exclude-patterns: ["eslint-plugin-obsidianmd"]
+      # Alone, so a new rule that CI flags holds back only itself.
+      obsidian-review-rules:
+        patterns: ["eslint-plugin-obsidianmd"]
     commit-message:
       prefix: "Deps"

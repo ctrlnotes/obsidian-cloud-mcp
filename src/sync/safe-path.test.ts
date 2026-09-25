@@ -43,7 +43,7 @@ describe("isSafeInboundPath", () => {
   it.each(["data.csv", "notes/x.json"])("refuses %s, a format Obsidian does not write", (path) => {
     // These sat beside `base` on the allow-list and were removed with it, justified by
     // "the server enforces no extension rule at all" having been falsified. That was
-    // glass-1's server (a `TEXT_EXTENSIONS` constant, a `binary_as_content` refusal); THIS
+    // An earlier prototype's server (a `TEXT_EXTENSIONS` constant, a `binary_as_content` refusal); THIS
     // vault has no extension rule at all, so the justification does not carry here — see
     // `ALLOWED_EXTENSIONS`' own comment for the whole retraction. They stay off the list on
     // the remaining, narrower reason: this is an allow-list of the formats Obsidian itself
@@ -226,8 +226,9 @@ describe("decodesAsText", () => {
 
 // The export's path rule (export design EX16) is exactly this classifier: a vault path
 // is exported iff this plugin would write it to disk. The vault ports the rule
-// (`apps/vault/src/export/pure.rs`, `exportable`) and reads this same table, so a
-// rule changed on one side and not the other fails a test on the side that moved.
+// (`exportable`) and tests it against its own copy of this table. Nothing connects the two
+// copies, so a rule changed on one side only fails neither: change the table deliberately,
+// in both repositories.
 describe("the shared export-path cases", () => {
   const cases = (
     fixture("export-paths/cases.json") as {

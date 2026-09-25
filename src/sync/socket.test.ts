@@ -1,4 +1,4 @@
-// Task 9's tests. A fake socket, never a real one — these run in vitest with no vault, per
+// SyncSocket's tests. A fake socket, never a real one — these run in vitest with no vault, per
 // the plan's own instruction.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -58,7 +58,9 @@ class FakeSocket implements SocketLike {
 
   /** The `Up` frames sent so far, decoded — every send in these tests is JSON text. */
   upFrames(): Up[] {
-    return this.sent.filter((s): s is string => typeof s === "string").map((s) => JSON.parse(s));
+    return this.sent
+      .filter((s): s is string => typeof s === "string")
+      .map((s) => JSON.parse(s) as Up);
   }
 }
 
@@ -210,7 +212,7 @@ describe("SyncSocket", () => {
   });
 
   it("a terminal closing frame is surfaced to the user, not retried forever", async () => {
-    // **Major fix, test-robustness half.** `vi.useFakeTimers()` replaces the global
+    // **Test robustness.** `vi.useFakeTimers()` replaces the global
     // `setTimeout` only for timers created AFTER it runs — a real 500-1000ms retry timer
     // scheduled by a regressed `terminal()` BEFORE this line would be a real timer no fake
     // clock can reach, so the assertion below would pass whether or not a retry was
@@ -231,7 +233,7 @@ describe("SyncSocket", () => {
   });
 
   /**
-   * **Major fix.** Before this, EVERY `closing` was terminal — including the two the vault
+   * Before this, EVERY `closing` was terminal — including the two the vault
    * itself documents as self-healing (this module's header). A device revoked mid-session
    * would never reconnect; a device merely over the per-device connection cap, or too far
    * behind acknowledging, was stuck exactly the same way until Obsidian restarted.
@@ -433,7 +435,7 @@ describe("SyncSocket", () => {
   });
 
   /**
-   * **Major fix.** `wire.test.ts` already covers `readDownFrame` returning `null` for an
+   * `wire.test.ts` already covers `readDownFrame` returning `null` for an
    * unrecognised frame TYPE, forward-compatibly — but nothing at THIS layer checked that the
    * connection actually survives one. `onMessage`'s `if (down === null) return;` is the line
    * that matters, and a regression turning that into `this.terminal(...)` would pass every

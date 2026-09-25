@@ -1,5 +1,5 @@
 // A whole fake Obsidian `App`, for the tests that exercise the SHELL (`main.ts`) rather
-// than one pure module underneath it. Adapted from glass-1's own `testing/fake-host.ts`:
+// than one pure module underneath it. Adapted from an earlier prototype's `testing/fake-host.ts`:
 // same reasoning (the shell is where a late defect actually lives — nothing reachable from
 // a unit test of the module underneath), a much smaller surface, because this plugin has
 // no manifest exchange, no attachment HTTP channel and no `obsidian://` redirect to fake.

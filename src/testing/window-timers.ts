@@ -11,9 +11,13 @@
  * REAL timer, and every fake-timer test would silently stop controlling the code it tests.
  */
 export const timerWindow = {
-  setTimeout: (...args: Parameters<typeof setTimeout>) => globalThis.setTimeout(...args),
+  // A function handler only: the string form is an `eval` (`no-implied-eval`), and nothing
+  // the plugin ships passes one.
+  setTimeout: (handler: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) =>
+    globalThis.setTimeout(handler, ms, ...rest),
   clearTimeout: (id: Parameters<typeof clearTimeout>[0]) => globalThis.clearTimeout(id),
-  setInterval: (...args: Parameters<typeof setInterval>) => globalThis.setInterval(...args),
+  setInterval: (handler: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) =>
+    globalThis.setInterval(handler, ms, ...rest),
   clearInterval: (id: Parameters<typeof clearInterval>[0]) => globalThis.clearInterval(id),
 };
 

@@ -1,0 +1,5 @@
+# `bun test` is bun's own test runner, which ignores `vitest.config.ts` and fails here in
+# confusing ways. The tests run under vitest: `bun run test`. This preload stops the
+# wrong runner before it starts and says so.
+[test]
+preload = ["./tools/bun-test-guard.ts"]

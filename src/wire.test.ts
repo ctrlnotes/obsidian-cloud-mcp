@@ -16,7 +16,7 @@ import {
 } from "./wire.ts";
 
 describe("every documented down fixture decodes", () => {
-  // Drives Task 2's contract from this side too: if a fixture and this decoder disagree,
+  // Drives the wire contract from this side too: if a fixture and this decoder disagree,
   // this fails alongside `wire.contract.test.ts`.
   it.each([
     "down.challenge.json",
@@ -97,7 +97,7 @@ describe("a put's byte count and sha are carried exactly", () => {
         sha: "1a2b3c4d5e6f",
         bytes: 1_048_576,
       }),
-    );
+    ) as { sha: string; bytes: number };
     expect(encoded.sha).toBe("1a2b3c4d5e6f");
     expect(encoded.bytes).toBe(1_048_576);
     expect(Number.isInteger(encoded.bytes)).toBe(true);
@@ -106,7 +106,7 @@ describe("a put's byte count and sha are carried exactly", () => {
   it("a base_sha of null (a brand-new path) survives, rather than being dropped", () => {
     const encoded = JSON.parse(
       encodeUp({ type: "put", path: "new.md", base_sha: null, sha: "abc", bytes: 3 }),
-    );
+    ) as Record<string, unknown>;
     expect(encoded.base_sha).toBeNull();
     expect("base_sha" in encoded).toBe(true);
   });

@@ -6,7 +6,7 @@ import { planRetry } from "./retry.ts";
 /**
  * P7, on the one property that matters now that the classification is a two-way split:
  * **nothing is dropped**. A refusal that lands in neither bucket is an edit that stops
- * syncing with nothing said to the user — the same failure glass-1's much larger version
+ * syncing with nothing said to the user — the same failure an earlier prototype's much larger version
  * of this property was guarding against, on a much smaller function.
  */
 const refusal: fc.Arbitrary<DownRefused> = fc.record({
@@ -48,7 +48,7 @@ describe("planRetry, as a property", () => {
         const plan = planRetry(refusals);
         // Positionally, not by a path-keyed map: two refusals CAN name the same path (a
         // rename and a replace both refused at one path), and `planRetry` preserves input
-        // order the same way glass-1's did — the nth redirty answers the nth redirtyable
+        // order the same way an earlier prototype's did — the nth redirty answers the nth redirtyable
         // refusal, never "whichever one this path last saw".
         const sources = refusals.filter((r) => r.current_sha !== null);
         expect(plan.redirty).toHaveLength(sources.length);

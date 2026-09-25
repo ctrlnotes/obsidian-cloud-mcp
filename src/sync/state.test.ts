@@ -159,11 +159,11 @@ describe("the sync state store", () => {
 });
 
 /**
- * The cursor's own tripwire, in the shape of Task 3's key one (`device.test.ts`'s "the
+ * The cursor's own tripwire, in the shape of the key's one (`device.test.ts`'s "the
  * private key never passes through saveData"). Plugin design §4.1 makes the point about
  * the private key, but the reasoning is not special to keys: `saveData` writes
  * `.obsidian/plugins/<id>/data.json` INSIDE the vault, so anything written through it is
- * replicated by Obsidian Sync to every other device. glass-1 found this for the cursor
+ * replicated by Obsidian Sync to every other device. An earlier prototype found this for the cursor
  * FIRST and wrote why in this file's own header comment — a shared cursor is two devices
  * overwriting each other's position in one log. The key moved to `secretStorage`
  * (`device.ts`); the cursor already used `saveLocalStorage` and has no reason to move
@@ -176,7 +176,7 @@ describe("the cursor never reaches saveData", () => {
     const vaultFiles = new Map<string, string>();
     // One object offering both surfaces, the way a real `App` does — so a regression that
     // reached for the wrong one would still have it in hand.
-    const app: LocalStore & { saveData(data: unknown): Promise<void> } = {
+    const app: LocalStore & { saveData: (data: unknown) => Promise<void> } = {
       loadLocalStorage: (key: string) => raw.get(key) ?? null,
       saveLocalStorage: (key: string, data: unknown) => {
         if (data === null) raw.delete(key);

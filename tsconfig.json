@@ -1,8 +1,5 @@
-// Ported from glass-1's plugin/tsconfig.json, with one change: that repo type-checked this
-// package with a second compiler (`@typescript/native`, an alias for a 7.x prerelease) kept
-// in step with a sibling `contract/` package. Neither exists here — this repository pins
-// TypeScript to 6.0.3 everywhere (root CLAUDE.md) — so this project uses the one plain
-// `typescript` devDependency, the same as `apps/client`.
+// One plain `typescript` devDependency, pinned at 6.0.3. Do not move to 7.x yet: the
+// Obsidian and lint tooling here have not been checked against it.
 {
   "compilerOptions": {
     "target": "es2018",

@@ -62,10 +62,10 @@ export interface Applied {
 /**
  * How the bytes a `sha` names are obtained.
  *
- * **Ours, not glass-1's.** Their `fetchBytes` served one purpose — an attachment, because
+ * **Ours, not an earlier prototype's.** Their `fetchBytes` served one purpose — an attachment, because
  * text rode inline on the `Change` itself. Ours serves every inbound write: design §8.1 is
  * explicit that an event carries a sha and never content, so text and attachments are
- * fetched identically here. The actual transport (Task 9/10) is not this module's concern.
+ * fetched identically here. The actual transport is not this module's concern.
  */
 export interface ApplyDeps {
   /**
@@ -607,7 +607,7 @@ export interface ReplayResult {
  * it may simply be a note Obsidian Sync has not brought down yet.
  *
  * One unapplicable event must not strand the rest: `try`/`catch` per event, matching
- * glass-1's own reasoning for `applyChanges` — `applyEvent` returns `"skipped"` only for
+ * An earlier prototype's reasoning for `applyChanges` — `applyEvent` returns `"skipped"` only for
  * what it can SEE (an unsafe path, an unknown kind); the filesystem refuses for reasons it
  * cannot (a folder gone mid-batch, a permission error), and those arrive as throws, handled
  * exactly like an `"unavailable"` outcome for the purpose of `ackThrough`.

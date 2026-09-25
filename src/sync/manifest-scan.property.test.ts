@@ -7,7 +7,7 @@ import { classifyPath } from "./safe-path.ts";
 /**
  * P7, on the local computation a snapshot reconcile (§8.4) rests on.
  *
- * glass-1's version of this file was about pagination — chunk boundaries an uploaded
+ * An earlier prototype's version of this file was about pagination — chunk boundaries an uploaded
  * manifest had to respect. Ours has nothing to paginate (`manifest-scan.ts`'s header
  * explains why), so what survives is the half that was never about chunking at all:
  * every syncable path reported exactly once, in the vault's own order, and nothing the
@@ -75,8 +75,8 @@ describe("scanManifest, as a property", () => {
     await fc.assert(
       fc.asyncProperty(vaultArb, async ({ vault }) => {
         const entries = await scanManifest(vault, { attachments: true });
-        for (let i = 1; i < entries.length; i++) {
-          expect(comparePaths(entries[i - 1]!.path, entries[i]!.path)).toBeLessThan(0);
+        for (const [prev, next] of entries.slice(1).map((e, i) => [entries[i], e] as const)) {
+          expect(comparePaths(prev?.path ?? "", next.path)).toBeLessThan(0);
         }
       }),
       { numRuns: 300 },

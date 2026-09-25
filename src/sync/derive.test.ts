@@ -211,7 +211,7 @@ describe("deriveChanges", () => {
   });
 
   /**
-   * **Major fix.** The check-then-use race between `stat`/`read`/`readBinary` and the
+   * The check-then-use race between `stat`/`read`/`readBinary` and the
    * filesystem changing underneath them does not always come back as `null` — it can throw
    * (ENOENT, a permission error). The case above already covers `null`; this covers the
    * other half, which used to escape `deriveChanges` entirely and, with `main.ts`'s own

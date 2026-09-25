@@ -1,11 +1,7 @@
-// PL5 and PL6 (`docs/architecture-invariants.md`) are recorded as invariants but had no
-// automated check — both hold today, but only because the plan's Task 14 Step 4 grepped for
-// them by hand once. Adapted from `pairing.test.ts`'s own technique ("the code is never
-// written anywhere persistent"): read the source, don't trust memory of what it does.
-//
-// Minor fix: this file is the mechanical check. `moon.yml` already lists `src/**/*` as a
-// `test` input, so a file reappearing under a forbidden name, or a `fetch(` call creeping
-// back in, invalidates the cache the same way any other source change does.
+// Two rules the plugin must keep, checked by reading the source rather than trusting
+// memory of what it does: the merge machinery stays absent (the vault merges; this plugin
+// sends whole content), and network calls go through Obsidian's `requestUrl`, never
+// `fetch`, which meets CORS preflight from `app://obsidian.md` and `capacitor://localhost`.
 
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";

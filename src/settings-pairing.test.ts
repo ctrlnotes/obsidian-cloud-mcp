@@ -1,5 +1,5 @@
 import type { App, Plugin } from "obsidian";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, type Mock, vi } from "vitest";
 import type { SettingsHost } from "./settings-tab.ts";
 import { CtrlNotesSettingsTab } from "./settings-tab.ts";
 import { IDLE_STATUS } from "./sync/status.ts";
@@ -14,7 +14,13 @@ import { buttons, registerTab, settingRows, settingsText } from "./testing/fake-
  * (rule 5), the browser is where a pairing is confirmed, and the vault is CHOSEN there
  * rather than typed here (D9/D11). Every case below is about the flow that replaced it.
  */
-const fakeHost = (overrides: Partial<SettingsHost> = {}): Plugin & SettingsHost => {
+/** The two spies as plain properties, so an assertion reads a function value rather than
+ * detaching a method (`@typescript-eslint/unbound-method`). */
+type Spies = { readonly spies: { startPairing: Mock; disconnect: Mock } };
+
+const fakeHost = (overrides: Partial<SettingsHost> = {}): Plugin & SettingsHost & Spies => {
+  const startPairing = vi.fn(async () => {});
+  const disconnect = vi.fn(async () => {});
   const host = {
     controlplaneOrigin: "https://sync.ctrlrouter.test",
     webAppOrigin: "https://app.ctrlrouter.test",
@@ -24,16 +30,17 @@ const fakeHost = (overrides: Partial<SettingsHost> = {}): Plugin & SettingsHost 
     vaultName: "My Vault",
     setControlplaneOrigin: async () => {},
     setWebAppOrigin: async () => {},
-    startPairing: vi.fn(async () => {}),
-    disconnect: vi.fn(async () => {}),
+    startPairing,
+    disconnect,
     syncStatus: () => IDLE_STATUS,
     onStatusChange: () => () => {},
     onPairingChange: () => () => {},
     // `Plugin.register` — the tab hands it the pairing subscription to own.
     register: () => {},
     ...overrides,
+    spies: { startPairing, disconnect },
   };
-  return host as unknown as Plugin & SettingsHost;
+  return host as unknown as Plugin & SettingsHost & Spies;
 };
 
 afterEach(() => {
@@ -49,11 +56,11 @@ describe("pairing this device", () => {
     const pair = buttons.find((b) => b.text === "Pair");
     expect(pair).toBeDefined();
     pair?.click();
-    expect(host.startPairing).not.toHaveBeenCalled();
+    expect(host.spies.startPairing).not.toHaveBeenCalled();
   });
 
   /**
-   * **The condition that actually changed, and it was a bug** (Task 22's own handoff).
+   * **The condition that actually changed, and it was a bug**.
    * The old gate was `controlplaneOrigin && vaultId`, and under this flow the plugin does
    * not know a vault id before pairing and must not — the browser picks the vault from the
    * ones its own session owns (D9/D11). Left as it was, the Pair button was disabled
@@ -64,7 +71,7 @@ describe("pairing this device", () => {
     registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
 
     buttons.find((b) => b.text === "Pair")?.click();
-    expect(host.startPairing).not.toHaveBeenCalled();
+    expect(host.spies.startPairing).not.toHaveBeenCalled();
   });
 
   it("enables Pair with both origins set, and never asks for a vault id first", () => {
@@ -72,7 +79,7 @@ describe("pairing this device", () => {
     registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
 
     buttons.find((b) => b.text === "Pair")?.click();
-    expect(host.startPairing).toHaveBeenCalledWith("My Vault");
+    expect(host.spies.startPairing).toHaveBeenCalledWith("My Vault");
   });
 
   /** Rule 5, in the one place a user could still have seen a code. */
@@ -187,6 +194,6 @@ describe("a connected device", () => {
     buttons.find((b) => b.text === "Disconnect this device")?.click();
     await Promise.resolve();
     await Promise.resolve();
-    expect(host.disconnect).toHaveBeenCalled();
+    expect(host.spies.disconnect).toHaveBeenCalled();
   });
 });

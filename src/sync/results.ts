@@ -13,7 +13,7 @@ import type { Change } from "./derive.ts";
  * the only one it is waiting on.
  *
  * **There is no `merged` or `conflicted` status on our wire, and that is not a gap.**
- * glass-1's server handed a resolved conflict back as a distinct `ChangeResult` carrying
+ * An earlier prototype's server handed a resolved conflict back as a distinct `ChangeResult` carrying
  * bytes the device did not have. Ours resolves a conflict server-side too
  * (`ReconcileUploadCommand`, design §9) but hands the LOSING side back as an ordinary
  * `put` event on the normal replay — design §5's "a conflict file arrives as an ordinary
@@ -45,7 +45,7 @@ export interface ResultOutcome {
 /**
  * `sent` is required to interpret `Applied` for a `rename`: the frame itself only names
  * the destination `path`, so the source has to come from the change that was actually
- * sent, exactly like glass-1's own reasoning for why `applyResults` took the batch.
+ * sent, exactly like an earlier prototype's reasoning for why `applyResults` took the batch.
  */
 export const applyResult = (sent: Change, down: DownApplied | DownRefused): ResultOutcome => {
   if (down.type === "refused") {

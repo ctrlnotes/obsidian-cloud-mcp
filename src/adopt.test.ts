@@ -161,7 +161,7 @@ describe("declining leaves nothing behind", () => {
 });
 
 // ---------------------------------------------------------------------------------------
-// The re-read between the tap and the redemption (minor fix).
+// The re-read between the tap and the redemption.
 //
 // `ASSERTION_TTL_MS` is two minutes and its stated reason is "a poll every few seconds" —
 // which stopped being true the moment D19 put a human in the middle. A user who leaves the

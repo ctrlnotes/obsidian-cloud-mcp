@@ -1,6 +1,6 @@
-// Task 10's tests.
+// SyncPump's tests.
 
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it, type Mock, vi } from "vitest";
 import type { DownApplied, DownEvent, DownRefused, DownSnapshot, Up } from "../wire.ts";
 import { MAX_FRAME_BYTES } from "../wire.ts";
 import type { ApplyDeps, VaultFiles } from "./apply.ts";
@@ -64,15 +64,22 @@ const fetcherFor = (content: Record<string, Uint8Array>): ApplyDeps["fetchBytes"
 };
 
 /** A transport that just records what it was asked to do — no socket, no vault. */
-function fakeTransport(): SyncTransport & { readonly sent: Up[]; readonly binary: Uint8Array[] } {
+function fakeTransport(): SyncTransport & {
+  readonly sent: Up[];
+  readonly binary: Uint8Array[];
+  /** `noteAck`'s spy as a plain property, so an assertion does not detach a method. */
+  readonly acks: Mock;
+} {
   const sent: Up[] = [];
   const binary: Uint8Array[] = [];
+  const acks = vi.fn();
   return {
     sent,
     binary,
+    acks,
     send: (up) => sent.push(up),
     sendBinary: (bytes) => binary.push(bytes),
-    noteAck: vi.fn(),
+    noteAck: acks,
   };
 }
 
@@ -126,7 +133,7 @@ describe("Pump — inbound", () => {
 
     expect(h.vault.text("a.md")).toBe("hello\n");
     expect(h.transport.sent).toEqual([{ type: "ack", seq: 5 }]);
-    expect(h.transport.noteAck).toHaveBeenCalledWith(5);
+    expect(h.transport.acks).toHaveBeenCalledWith(5);
     expect(h.cursors).toEqual([5]);
     // Flattened, not per call. A write now reports the moment it lands AND is
     // included in the batch summary, so the ledger hears about it twice — which
@@ -221,8 +228,8 @@ describe("Pump — inbound", () => {
     // frames processed inside one socket read would. None of these three calls is
     // individually awaited — awaiting between them would leave only one event in the
     // queue each time and defeat the very batching under test.
-    h.pump.handleDown(event({ path: "a.md", sha: shaA, seq: 1 }));
-    h.pump.handleDown(event({ path: "b.md", sha: shaB, seq: 2 }));
+    void h.pump.handleDown(event({ path: "a.md", sha: shaA, seq: 1 }));
+    void h.pump.handleDown(event({ path: "b.md", sha: shaB, seq: 2 }));
     await h.pump.handleDown(event({ path: "c.md", sha: shaC, seq: 7 }));
 
     const acks = h.transport.sent.filter((u) => u.type === "ack");
@@ -288,7 +295,7 @@ describe("Pump — outbound", () => {
       { type: "put", path: "a.md", base_sha: "oldsha", sha: hash, bytes: content.byteLength },
     ]);
 
-    h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: hash });
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: hash });
     await donePromise;
   });
 
@@ -308,7 +315,7 @@ describe("Pump — outbound", () => {
     }
     expect(reassembled).toEqual(content);
 
-    h.pump.handleDown({ type: "applied", path: "big.bin", seq: 1, sha: hash });
+    void h.pump.handleDown({ type: "applied", path: "big.bin", seq: 1, sha: hash });
     await donePromise;
   });
 
@@ -330,7 +337,7 @@ describe("Pump — outbound", () => {
       reason: "we both changed this",
       current_sha: "cccc".repeat(16),
     };
-    h.pump.handleDown(refusal);
+    void h.pump.handleDown(refusal);
     const outcome = await outcomePromise;
 
     expect(outcome.refused).toEqual(refusal);
@@ -338,7 +345,7 @@ describe("Pump — outbound", () => {
   });
 
   /**
-   * **Minor fix.** An `applied` reply must NOT advance the persisted cursor by itself — the
+   * An `applied` reply must NOT advance the persisted cursor by itself — the
    * vault echoes this device's own write back as an ordinary `Down::Event` to the very
    * connection that authored it (`run`'s `cursor` in `apps/vault/src/http/routes/sync.rs`
    * only ever advances inside `drain`, which every connection's `sync_notify` subscription
@@ -354,7 +361,7 @@ describe("Pump — outbound", () => {
     const donePromise = h.pump.push(put("a.md", content, hash));
 
     const applied: DownApplied = { type: "applied", path: "a.md", seq: 4821, sha: hash };
-    h.pump.handleDown(applied);
+    void h.pump.handleDown(applied);
     await donePromise;
 
     expect(h.cursors).toEqual([]);
@@ -365,7 +372,7 @@ describe("Pump — outbound", () => {
     const hash = await contentHash("x\n");
     const h = harness({ fetchBytes: fetcherFor({ [hash]: content }) });
     const donePromise = h.pump.push(put("a.md", content, hash));
-    h.pump.handleDown({ type: "applied", path: "a.md", seq: 4821, sha: hash });
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 4821, sha: hash });
     await donePromise;
     expect(h.cursors).toEqual([]); // still nothing, per the case above
 
@@ -388,12 +395,12 @@ describe("Pump — outbound", () => {
     expect(h.transport.sent).toHaveLength(1);
     expect((h.transport.sent[0] as { path: string }).path).toBe("a.md");
 
-    h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: hashA });
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: hashA });
     await doneA;
     expect(h.transport.sent).toHaveLength(2);
     expect((h.transport.sent[1] as { path: string }).path).toBe("b.md");
 
-    h.pump.handleDown({ type: "applied", path: "b.md", seq: 2, sha: hashB });
+    void h.pump.handleDown({ type: "applied", path: "b.md", seq: 2, sha: hashB });
     await doneB;
   });
 
@@ -418,7 +425,7 @@ describe("Pump — outbound", () => {
     expect(putFrames()).toHaveLength(2); // sent again, same change — not a new one queued
     expect(putFrames()[0]).toEqual(putFrames()[1]); // byte-identical: the retry IS the original
 
-    h.pump.handleDown({ type: "applied", path: "a.md", seq: 9, sha: hash });
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 9, sha: hash });
     const outcome = await donePromise;
     expect(outcome.hashes).toEqual({ "a.md": hash });
   });
@@ -434,7 +441,7 @@ describe("Pump — outbound", () => {
    */
   it("a send that throws rejects the push and leaves nothing for resume() to re-send", async () => {
     const h = harness();
-    const send = h.transport.send;
+    const send = h.transport.send.bind(h.transport);
     let ready = false;
     h.transport.send = (up) => {
       if (!ready) throw new Error("cannot send before the sync handshake completes");

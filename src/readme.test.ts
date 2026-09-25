@@ -7,7 +7,7 @@ const ROOT = new URL("../", import.meta.url);
  * `README.md` is read by a stranger deciding whether to install this, and by nobody who
  * will cross-check it against the code first — the same reason `manifest.test.ts`-shaped
  * checks exist elsewhere. A string comparison is not a human's job, so this file does it
- * mechanically. Adapted from glass-1's own `readme.test.ts`: same method (pin the two ways
+ * mechanically. Adapted from an earlier prototype's `readme.test.ts`: same method (pin the two ways
  * this file has actually gone wrong — claiming less than the plugin does, and claiming
  * more), our own claims.
  *
@@ -34,7 +34,7 @@ describe("README.md", () => {
     expect(readme).not.toMatch(/no sync|no pairing|no plugin shell|status\W*scaffold/i);
   });
 
-  // Anchored on the verb forms actually used, the same reasoning glass-1's own comment
+  // Anchored on the verb forms actually used, the same reasoning an earlier prototype's comment
   // gives for its `pairs?`/`syncs` pair: a loose `/\bpair(s|ing)?\b/` or `/\bsync\b/` is
   // satisfied by a sentence saying pairing DOES NOT exist yet, which is the wrong polarity
   // to be testing for. Do not loosen these.

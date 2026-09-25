@@ -1,6 +1,6 @@
 // Events down, content up (write-surface design §8.1–§8.3, §8.4) — the layer that turns a
-// connected `SyncSocket` (Task 9) into applied files and acknowledged, retried pushes.
-// Greenfield, like Task 9: nothing in glass-1 ports here, because its wire had a batch
+// connected `SyncSocket` into applied files and acknowledged, retried pushes.
+// Greenfield, like `SyncSocket`: nothing from an earlier prototype ports here, because its wire had a batch
 // (`applyResults` correlating `results[i]` to `sent[i]` by index) and a separate HTTP
 // content channel that this protocol does not have.
 //
@@ -61,7 +61,7 @@ export interface SyncTransport {
   send(up: Up): void;
   sendBinary(bytes: Uint8Array): void;
   /** Told once a batch of inbound events (or a snapshot) has been fully applied, so the
-   * NEXT reconnect resumes from here rather than from a seq merely seen (Task 9's header). */
+   * NEXT reconnect resumes from here rather than from a seq merely seen (`socket.ts`'s header). */
   noteAck(seq: number): void;
 }
 
@@ -113,7 +113,7 @@ interface QueuedPush {
 /**
  * The outbound queue and the inbound apply-and-ack loop for one connected socket.
  *
- * **Owns no socket.** `main.ts` (Task 13) is what feeds this class's `handleDown` every
+ * **Owns no socket.** `main.ts` is what feeds this class's `handleDown` every
  * `Down` frame `SyncSocket.onFrame` delivers, and calls `push` for every `Change`
  * `derive.ts` produces. Splitting it this way is what makes it testable with a bare object
  * standing in for the transport, the same shape as every other module in `sync/`.
@@ -165,7 +165,7 @@ export class Pump {
 
   /**
    * Route one `Down` frame that arrived after the handshake. `challenge`/`ready`/`closing`
-   * never reach here — those are `SyncSocket`'s own business (Task 9).
+   * never reach here — those are `SyncSocket`'s own business.
    *
    * The returned promise resolves once this frame's own effect — the batch it joined, or
    * the snapshot it was — has actually been applied and acked. `main.ts` need not await it
@@ -325,7 +325,7 @@ export class Pump {
     if (down.type !== "applied") {
       this.deps.onRefused?.(down);
     }
-    // No `onCursor` call here (minor fix): the vault DOES echo this device's own write back
+    // No `onCursor` call here: the vault DOES echo this device's own write back
     // as an ordinary `Down::Event` to the very connection that authored it — `run`'s
     // `cursor` in `apps/vault/src/http/routes/sync.rs` only advances inside `drain`, and
     // every connection (including the author's) subscribes to the same `sync_notify` that

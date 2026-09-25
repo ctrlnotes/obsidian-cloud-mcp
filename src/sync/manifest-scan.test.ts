@@ -77,8 +77,8 @@ describe("scanManifest", () => {
     for (let i = 0; i < 50; i++) files[`n${i}.md`] = `${i}\n`;
     const entries = await scanManifest(vault(files), { attachments: true });
     expect(entries.length).toBe(50);
-    for (let i = 1; i < entries.length; i++) {
-      expect(comparePaths(entries[i - 1]!.path, entries[i]!.path)).toBeLessThan(0);
+    for (const [prev, next] of entries.slice(1).map((e, i) => [entries[i], e] as const)) {
+      expect(comparePaths(prev?.path ?? "", next.path)).toBeLessThan(0);
     }
   });
 

@@ -26,7 +26,7 @@ export interface ScanOptions {
 /**
  * This device's whole local manifest — every syncable path and the hash of its bytes.
  *
- * **Not chunked, unlike glass-1's `scanManifest`.** Theirs paginated an OUTBOUND upload:
+ * **Not chunked, unlike an earlier prototype's `scanManifest`.** Theirs paginated an OUTBOUND upload:
  * the device submitted its manifest to the server over `ManifestRequest`, capped by
  * `MAX_MANIFEST_ENTRIES`/`MAX_MANIFEST_BYTES` because that request rode an ordinary HTTP
  * body. Our vault never receives a manifest at all — `Up::Snapshot` is a bare request with
@@ -35,7 +35,7 @@ export interface ScanOptions {
  * a snapshot entirely on this device, and its result never crosses the wire.
  *
  * **Sorted with the vendored `comparePaths`, never JavaScript `<`.** Not load-bearing the
- * way it was for glass-1's chunk boundaries — nothing here chunks — but a deterministic
+ * way it was for an earlier prototype's chunk boundaries — nothing here chunks — but a deterministic
  * order is worth keeping for a function whose whole job is a byte-for-byte comparison, and
  * an emoji filename sorting differently than expected has already shipped once as a bug.
  *
