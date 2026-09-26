@@ -10,6 +10,7 @@ import {
   decodeDown,
   encodeUp,
   MIN_WIRE_VERSION,
+  NO_REASON_GIVEN,
   readDownFrame,
   UnknownDownFrameError,
   WIRE_VERSION,
@@ -140,6 +141,16 @@ describe("a closing's retry field", () => {
   ])("%s decodes as later, without throwing", (_label, extra) => {
     expect(retry(extra)).toBe("later");
   });
+
+  /** A closing with no usable reason is still a closing, not a decode error — which would be
+   * terminal. **Proven able to fail** by decoding `reason` with `str` again: both rows throw. */
+  it.each([
+    ["absent", {}],
+    ["not a string", { reason: 7 }],
+  ])("a reason that is %s reads as a stand-in, and keeps its retry", (_label, extra) => {
+    const d = decodeDown({ type: "closing", retry: "later", ...extra });
+    expect(d).toEqual({ type: "closing", reason: NO_REASON_GIVEN, retry: "later" });
+  });
 });
 
 /**
@@ -155,6 +166,13 @@ describe("the batch limits a ready frame carries", () => {
       max_batch_ops: 0,
       max_batch_bytes: 0,
     });
+  });
+
+  /** **Proven able to fail** by treating only `undefined` as absent: `null` throws. */
+  it("read as 0 when null", () => {
+    expect(
+      decodeDown({ type: "ready", seq: 7, max_batch_ops: null, max_batch_bytes: null }),
+    ).toMatchObject({ max_batch_ops: 0, max_batch_bytes: 0 });
   });
 
   it("are read when present", () => {

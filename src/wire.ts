@@ -52,12 +52,14 @@ export const WIRE_VERSION = 4;
  * The oldest version this build still speaks, and it answers `hello` in whichever version the
  * vault's `challenge` named.
  *
- * **3 is still spoken because release-11 vaults speak it.** The vault compares exactly
- * (`vault::sync::pure::admit`), so a plugin that spoke only 4 could not connect to a vault
- * that has not been moved to a v4 release yet, and every vault would have to move in lockstep
- * with this plugin's release. Nothing a v3 vault sends is misread here: its closings carry no
- * `retry`, which decodes as `later` (see `DownClosing`), and its `ready` carries no batch
- * limits, which reads as "no batching".
+ * **3 is still spoken because release-11 vaults speak it**, and the vault compares exactly
+ * (`vault::sync::pure::admit`): speaking only 4 would lock this plugin out of every vault not
+ * yet moved to a v4 release. A v3 closing carries no `retry` (decoded as `later`), and a v3
+ * `ready` no batch limits ("no batching").
+ *
+ * TODO(v3): once no v3 vault remains, delete this, the per-connection `wireVersion` in
+ * `socket.ts` (and its v3 pre-ready exemption), `optionalNum` and the v3 revoked-device advice
+ * on `status.ts`'s retrying clause.
  */
 export const MIN_WIRE_VERSION = 3;
 
@@ -269,6 +271,9 @@ export interface DownSnapshot {
  */
 export type ClosingRetry = "later" | "never";
 
+/** What a `closing` without a usable `reason` reads as. */
+export const NO_REASON_GIVEN = "no reason given";
+
 export interface DownClosing {
   readonly type: "closing";
   /** Free text for a human. Nothing here decides whether to retry from it. */
@@ -382,11 +387,11 @@ function numOrNull(v: unknown, field: string): number | null {
 }
 
 /**
- * A count a vault older than the field does not send: absent is 0, which every caller reads as
- * "not offered". Present and not a number is still an error, like {@link optionalStrOrNull}.
+ * A count a vault older than the field does not send: absent (or `null`) is 0, which every
+ * caller reads as "not offered". Present and not a number is still an error.
  */
 function optionalNum(v: unknown, field: string): number {
-  return v === undefined ? 0 : num(v, field);
+  return v === undefined || v === null ? 0 : num(v, field);
 }
 
 function array(v: unknown, field: string): unknown[] {
@@ -494,14 +499,13 @@ export function decodeDown(raw: unknown): Down {
     case "no_blob":
       return { type: "no_blob", sha: str(v.sha, "sha"), reason: str(v.reason, "reason") };
     case "closing":
+      // **Lenient, and it must never throw.** A decode error after the handshake is terminal
+      // (`socket.ts`), so a strict decode here would turn a malformed closing into exactly the
+      // stop BI1 exists to prevent. Only an explicit `never` stops this device; a missing
+      // reason gets a stand-in.
       return {
         type: "closing",
-        reason: str(v.reason, "reason"),
-        // **Lenient, and it must never throw.** Absent (a v3 vault), a value this build has
-        // never heard of, or not a string at all: every one reads as `later`. A decode error
-        // on a frame after the handshake is terminal (`socket.ts`'s `onMessage`), so a strict
-        // decode here would turn a malformed retry hint into exactly the stop BI1 exists to
-        // prevent. Only an explicit `never` stops this device.
+        reason: typeof v.reason === "string" ? v.reason : NO_REASON_GIVEN,
         retry: v.retry === "never" ? "never" : "later",
       };
     default:
