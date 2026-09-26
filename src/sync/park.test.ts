@@ -130,4 +130,20 @@ describe("an idle close with work outstanding re-wakes, a bounded number of time
     const run = [...Array<boolean>(MAX_IDLE_WAKES + 1).fill(true), false, true];
     expect(closes(run).slice(-1)).toEqual([true]);
   });
+
+  /**
+   * A first sync's derive can outlast several idle closes; parked mid-derive, the vault could
+   * suspend in the middle of it (BI4). **Proven able to fail** by ignoring `deriving`: the
+   * fourth close parks.
+   */
+  it("never parks while a derive is running, however many closes it outlasts", () => {
+    let idleWakes = 0;
+    for (let close = 0; close < MAX_IDLE_WAKES * 3; close++) {
+      const decided = decideIdleWake(true, idleWakes, true);
+      expect(decided).toMatchObject({ wake: true, gaveUp: false });
+      idleWakes = decided.idleWakes;
+    }
+    // …and does not spend the bound, so a push the vault never answers is still bounded after.
+    expect(idleWakes).toBe(0);
+  });
 });

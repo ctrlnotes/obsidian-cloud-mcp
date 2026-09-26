@@ -7,14 +7,16 @@ Each release's section becomes its release notes. Newest first.
 - **A busy vault no longer stops a sync.** When the vault closes the connection it now says
   whether to come back, and the plugin reconnects by itself unless the vault says not to
   (for example, a device that was removed). A vault that has not been updated yet is
-  always reconnected to, at most every five minutes. Reconnecting pops no notice; the
-  settings pane says so beside the number of changes still to send, in the vault's own
-  words. Reconnecting this way does not re-read every file in the vault, and a full re-read
-  never runs twice at once.
+  always reconnected to, and one that refuses this device is retried at most every five
+  minutes. Reconnecting pops no notice; the settings pane says so beside the number of
+  changes still to send, in the vault's own words, and stops saying so once sync stops.
+  Reconnecting this way does not re-read every file in the vault, and a full re-read never
+  runs twice at once.
 - **An upload in progress keeps its vault awake.** While changes are waiting to be sent, a
-  reconnect waits at most 30 seconds, so a large first sync is never left half-finished
-  while its vault goes to sleep. An edit made while the plugin is waiting out a longer
-  retry brings that retry forward to within 30 seconds too.
+  reconnect waits at most 30 seconds, and a vault that is accepting uploads is reconnected
+  to quickly however often it closes, so a large first sync is never left half-finished
+  while its vault goes to sleep — including while the plugin is still reading the files
+  it will send.
 - **A first sync uploads notes in batches.** Against a vault that supports it, up to 100
   small files (or 4 MiB) go up in one round trip instead of one each, so a large vault's
   first sync takes minutes rather than hours. Larger files, deletes and renames go one at

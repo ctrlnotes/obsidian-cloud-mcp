@@ -1331,6 +1331,27 @@ describe("disconnecting this device", () => {
 
     expect(ws?.closed).toBe(true);
   });
+
+  /** Nothing reconnects after a disconnect, so the pane must stop saying it does. **Proven
+   * able to fail** by leaving `retrying` out of `disconnectSyncing`: it still reads
+   * "Reconnecting…". */
+  it("stops saying it is reconnecting after a retried closing", async () => {
+    stubWebSocket();
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws);
+    ws.emit({ type: "closing", reason: "busy", retry: "later" });
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).toBe("busy"), UNTIL);
+
+    await plugin.disconnect();
+
+    expect(plugin.syncStatus().retrying).toBeNull();
+    expect(describeStatus(plugin.syncStatus())).not.toContain("Reconnecting");
+  });
 });
 
 describe("an open settings pane and a pairing that moves", () => {
@@ -1799,8 +1820,8 @@ describe("a reconnect after a retried closing, and the manifest scan", () => {
    * The file changed WITHOUT an event is how the test sees whether a rescan ran, as in the
    * park case: only a rescan could find it. The unplanned drop afterwards is the control.
    *
-   * **Proven able to fail** by leaving `resumingFromRetry` out of the `ready` handler's test:
-   * the reconnect after the busy close pushes `note.md`.
+   * **Proven able to fail** by not setting `watchersRan` in `onClosing`: the reconnect after
+   * the busy close pushes `note.md`.
    */
   it("does not rescan on the reconnect after a busy closing, and does after a drop", async () => {
     const files: Record<string, string> = { "note.md": "one\n" };
@@ -1825,8 +1846,8 @@ describe("a reconnect after a retried closing, and the manifest scan", () => {
    * A closing before this pair's first `ready` skips nothing: no `ready` has rescanned yet.
    * A fresh pairing whose first hello met a busy vault is the case — the §1 case itself.
    *
-   * **Proven able to fail** by setting `resumingFromRetry` without the `readiedThisPair`
-   * check: the change is never found.
+   * **Proven able to fail** by setting `watchersRan` without the `readiedThisPair` check: the
+   * change is never found.
    */
   it("still rescans on the first ready when the first handshake was closed to retry", async () => {
     const files: Record<string, string> = { "note.md": "one\n" };

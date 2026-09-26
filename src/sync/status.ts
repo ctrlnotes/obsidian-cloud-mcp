@@ -67,14 +67,9 @@ export interface SyncStatus {
    */
   readonly refusal: string | null;
   /**
-   * The reason of the last closing this device is reconnecting after on its own (bulk-ingest
-   * design BI1: `retry: "later"`, or a vault too old to say). Cleared by the next `ready`.
-   *
-   * **Not a refusal, and deliberately not rendered as one.** A busy vault closes with this
-   * every few seconds during an import, and nothing is wrong: the device is on its way back
-   * and every queued change is still queued. So it is a clause after the head, never in place
-   * of it — "N change(s) still to send" stays on screen for the whole import — and it pops no
-   * `Notice` (`main.ts`'s `onClosing`).
+   * The reason of the last closing this device is reconnecting after on its own (BI1).
+   * Cleared by the next `ready`, or when sync stops. **Not a refusal**: rendered as a clause
+   * after the head, so "N change(s) still to send" stays on screen through an import.
    */
   readonly retrying: string | null;
   /**
@@ -139,8 +134,7 @@ export function describeStatus(status: SyncStatus): string {
         : `Up to date at change ${status.syncedCursor}${status.parked ? " (idle)" : ""}.`;
 
   const clauses: string[] = [];
-  // First, because it is the newest fact and the one that explains why the head has not
-  // moved; after the head, because the head is still true (BI1 — see `retrying`).
+  // First: it explains why the head has not moved, and the head is still true.
   if (status.retrying !== null) clauses.push(retryingText(status.retrying));
   // Names exactly what `unsyncable` COUNTS (`main.ts`: `shadowed` plus `withheld`, which
   // is oversize plus undecodable) and nothing else. Until 2026-09-22 this also listed
@@ -202,15 +196,11 @@ function refusalText(reason: string): string {
 }
 
 /**
- * The retrying clause. `reason` is the vault's sentence verbatim — `socket.ts` reports a
- * retried closing without its own vault-id prefix — so quoting it as what the vault said is
- * true. Until that was so, a closing during the handshake rendered as `the vault said "could
- * not connect to vault "…": handshake timed out"`, the plugin's words inside the vault's.
- *
- * It carries the revoked-elsewhere advice too, and that is not a
- * contradiction: a vault older than BI1 sends no `retry`, so its "not authorised" is retried
- * like anything else (on the backoff, at most every five minutes) and this clause is the only
- * place its owner can learn why nothing is syncing.
+ * The retrying clause, quoting the vault's sentence verbatim (`socket.ts` reports a retried
+ * closing without its own prefix). It carries the revoked-elsewhere advice too: a v3 vault
+ * sends no `retry`, so its "not authorised" is retried (at most every five minutes) and this
+ * clause is the only place its owner can learn why nothing is syncing.
+ * TODO(v3): drop the advice here once no v3 vault remains.
  */
 function retryingText(reason: string): string {
   const said = `Reconnecting: the vault said "${reason}".`;

@@ -202,6 +202,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private touched: Touched = emptyTouched();
   /** Guards a settle's own derive-and-push pass; re-armed rather than interleaved. */
   private syncing = false;
+  /** The derive half of that pass is running: local work that ends on its own, so an idle
+   * close during it never parks (`decideIdleWake`). */
+  private deriving = false;
 
   private odd: ReadonlyMap<string, string> = new Map();
   /** Paths the last scan skipped because another file folds onto the same wire path. */
@@ -229,12 +232,15 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    */
   private parked = false;
   /**
-   * The next `ready` ends a park, so it skips the full rescan (VS5). Set by `onIdle`, cleared
-   * by that `ready`, and deliberately NOT cleared by `wake`: a reconnect that fails and
-   * retries on the backoff is still the end of the same park, and the watchers saw every
-   * edit made during it.
+   * The next `ready` reconnects a pair whose watchers kept running, so it skips the full
+   * rescan (VS5): it ends a park (set by `onIdle`) or a closing the vault said to retry after
+   * (set by `onClosing`, BI1 — a busy vault closes every few seconds during an import, and
+   * each rescan reads and hashes every file). Cleared by that `ready` and by
+   * `disconnectSyncing`, NOT by `wake` or a failed reconnect: those are still the same gap.
+   * An ordinary drop does not set it, so it rescans; nor does a closing before this pair's
+   * first `ready` (`readiedThisPair`), which has had no rescan yet.
    */
-  private resumingFromPark = false;
+  private watchersRan = false;
   /**
    * A mobile device went to the background since the last `ready` (VS5's exception). A
    * backgrounded mobile app's JavaScript is suspended, so an edit made by something else in
@@ -243,23 +249,6 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * `ready` does it.
    */
   private backgroundedOnMobile = false;
-  /**
-   * The next `ready` ends a reconnect after a closing the vault said to retry (BI1), so it
-   * skips the full rescan, for VS5's reason: this device was running throughout and its
-   * watchers saw every edit. Set by `onClosing(willRetry)`, cleared by that `ready` and by
-   * `disconnectSyncing`, and yielding to `backgroundedOnMobile` exactly as a park does.
-   *
-   * **Why it matters more than a park does.** A busy vault closes every few seconds during an
-   * import, and a rescan reads and hashes every file: on a 20,000-file first sync each busy
-   * close would start another full read of the vault, and each one would mark every path not
-   * yet in the ledger dirty again, so the next settle re-derived the whole remainder only to
-   * find nothing new.
-   *
-   * Only after this pair has had a `ready` (`readiedThisPair`): a closing before the first
-   * one — a fresh pairing whose first hello timed out — has had no rescan at a `ready` yet,
-   * and must still get it.
-   */
-  private resumingFromRetry = false;
   /** This `SyncSocket`/`Pump` pair has completed a handshake at least once. Cleared by
    * `disconnectSyncing`, with the pair. */
   private readiedThisPair = false;
@@ -812,10 +801,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * marked real paths dirty, and nothing else is ever going to look at them.
    *
    * **One at a time.** A scan reads and hashes every file, so on a large vault it can outlast
-   * the gap between two reconnects, and two scans running at once read the vault twice for
-   * nothing. A request while one runs is remembered and served by ONE more scan when it ends
-   * — not dropped, because the running scan may already have listed the vault before the
-   * edit the new request exists to catch.
+   * the gap between two reconnects. A request while one runs is served by ONE more scan when
+   * it ends — not dropped, because the running scan may have listed the vault before the edit
+   * the request exists to catch.
    */
   private startReconcile(): void {
     if (this.reconciling) {
@@ -947,11 +935,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         deviceId: this.cfg.deviceId ?? "",
         identity: this.identity,
         createSocket: (url) => new WebSocket(url) as unknown as SocketLike,
-        // BI4: while any of these holds, a reconnect waits at most `WORK_RETRY_MAX_MS`, so the
-        // vault never sits quiet long enough to suspend in the middle of an upload. `syncing`
-        // is a settle deriving or pushing; the pump's queue is what that push left in flight;
-        // `touched` is an edit not yet derived. Much what `onIdle` reads, for the same reason:
-        // each is work only a connection can finish.
+        // BI4: a settle deriving or pushing, a push in flight, or an edit not yet derived —
+        // work only a connection can finish, so the vault must not sit quiet long enough to
+        // suspend in the middle of it.
         hasWork: () =>
           this.syncing ||
           (this.pump?.hasOutstanding() ?? false) ||
@@ -968,8 +954,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // and flush anything the user edited while disconnected.
             //
             // The batch limits first (BI5): they belong to THIS connection's vault, and the
-            // re-send `resume` makes is planned against them. A vault that advertises none
-            // gets every put singly, exactly as before batching existed.
+            // re-send `resume` makes is planned against them.
             pump.setBatchLimits(batchLimitsFrom(down));
             pump.resume();
             this.settler?.touch();
@@ -983,14 +968,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // phone came back to the foreground.
             //
             // **Nor the reconnect after a closing the vault said to retry** (BI1), for the same
-            // reason: see `resumingFromRetry`, and why a busy import makes it matter.
+            // reason: see `watchersRan`.
             //
             // A mobile device that went to the background meanwhile rescans anyway: its
             // watchers were suspended with the rest of its JavaScript.
-            const watched =
-              (this.resumingFromPark || this.resumingFromRetry) && !this.backgroundedOnMobile;
-            this.resumingFromPark = false;
-            this.resumingFromRetry = false;
+            const watched = this.watchersRan && !this.backgroundedOnMobile;
+            this.watchersRan = false;
             this.backgroundedOnMobile = false;
             this.readiedThisPair = true;
             if (!watched) this.startReconcile();
@@ -1035,12 +1018,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           // here would abandon the very push or queue that retry is meant to resume, and
           // `startSyncing`'s only other entry point is a fresh pairing, not what this needs.
           //
-          // **No `Notice` for it** (bulk-ingest design BI1). A busy vault closes every few
-          // seconds during an import and nothing is wrong: a popup each time would teach a
-          // user to ignore the one that matters. The status line says so instead, as a clause
-          // that leaves the pending count on screen (`status.ts`'s `retrying`).
+          // **No `Notice` for it** (BI1): a busy vault closes every few seconds during an
+          // import and nothing is wrong. The status line says so (`status.ts`'s `retrying`).
           if (willRetry) {
-            if (this.readiedThisPair) this.resumingFromRetry = true;
+            if (this.readiedThisPair) this.watchersRan = true;
             this.setStatus({ retrying: message, updating: false });
             return;
           }
@@ -1068,7 +1049,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           const outstanding = this.syncing || pump.hasOutstanding() || fetcher.hasOutstanding();
           fetcher.reset("parked");
           this.parked = true;
-          this.resumingFromPark = true;
+          this.watchersRan = true;
           this.setStatus({ parked: true, updating: false });
           // **Not parked with work outstanding.** Nothing else would wake the device for it:
           // `touched` was drained into that push, the vault never committed it so no signal
@@ -1076,7 +1057,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           // which re-sends the head (content addressing makes that safe), and
           // `retryPendingPulls`, which asks for a failed want again. Bounded: a vault that
           // never answers would otherwise be resumed every 90 s for good (`decideIdleWake`).
-          const decided = decideIdleWake(outstanding, this.idleWakes);
+          const decided = decideIdleWake(outstanding, this.idleWakes, this.deriving);
           this.idleWakes = decided.idleWakes;
           if (decided.gaveUp) {
             console.warn(
@@ -1099,9 +1080,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     // A park belongs to the pair being torn down. The next connection is a fresh one — a
     // relink, or a reconnect after a refusal — and gets the rescan (VS5).
     this.unpark();
-    this.resumingFromPark = false;
-    this.resumingFromRetry = false;
+    this.watchersRan = false;
     this.readiedThisPair = false;
+    // Nothing is reconnecting any more.
+    this.setStatus({ retrying: null });
     this.backgroundedOnMobile = false;
     this.idleWakes = 0;
     // Before the pump, and unconditionally: an outstanding fetch holds a promise
@@ -1273,7 +1255,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   }
 
   /** Leave the parked state. Says nothing about the rescan: `wake` keeps
-   * `resumingFromPark` for the `ready` it is waiting on, `disconnectSyncing` clears it. */
+   * `watchersRan` for the `ready` it is waiting on, `disconnectSyncing` clears it. */
   private unpark(): void {
     this.cancelWakeTimer();
     if (!this.parked) return;
@@ -1478,6 +1460,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     const touched = this.touched;
     this.touched = emptyTouched();
     this.syncing = true;
+    this.deriving = true;
     try {
       const { changes, oversize, undecodable } = await deriveChanges(
         this.readableFiles(),
@@ -1485,6 +1468,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         touched,
         { attachments: this.attachments },
       );
+      this.deriving = false;
       if (oversize.length > 0) {
         console.warn(
           `Ctrl Notes: not syncing ${oversize.length} file(s) over the size limit: ` +
@@ -1581,6 +1565,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       this.settler?.touch(); // Retry the whole window rather than losing it.
     } finally {
       this.syncing = false;
+      this.deriving = false;
       // A change derived after the idle close parked this device, that then failed to send,
       // is back on `touched` with no trigger left to carry it: wake for it now.
       if (this.parked && hasSomethingToSend(this.touched, this.attachments)) this.wake();
