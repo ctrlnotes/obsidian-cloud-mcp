@@ -317,9 +317,32 @@ describe("SyncSocket", () => {
     t.emit({ type: "closing", reason: "handshake timed out", retry: "later" });
     await flush();
 
-    expect(h.closings).toEqual(['could not connect to vault "vault-abc": handshake timed out']);
+    expect(h.closings).toEqual(["handshake timed out"]);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(h.sockets).toHaveLength(2);
+  });
+
+  /**
+   * A retried closing is reported in the vault's own words, even while this device waits on
+   * its hello. The pane quotes the message as what the vault said (`status.ts`), and until
+   * this was so it read `the vault said "could not connect to vault "…": handshake timed
+   * out"` — this plugin's words inside the vault's. A terminal one keeps the diagnosis: the
+   * mismatched-vault-id case below.
+   *
+   * **Proven able to fail** by passing `closingMessage(down.reason)` to `resumable` again: the
+   * message carries the vault-id prefix.
+   */
+  it("a retried closing during the handshake is reported verbatim", async () => {
+    const h = harness();
+    h.socket.connect();
+    await flush();
+    const t = latest(h);
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
+    await flush();
+    t.emit({ type: "closing", reason: "busy", retry: "later" });
+    await flush();
+
+    expect(h.closings).toEqual(["busy"]);
   });
 
   /**
@@ -363,11 +386,65 @@ describe("SyncSocket", () => {
     await flush();
     expect(h.sockets).toHaveLength(6);
     // And the cap is read when the retry is SCHEDULED, so work arriving later does not
-    // shorten a wait already running: the next socket comes at 32 s.
+    // shorten a wait already running unless someone says so (`workArrived`, below): the next
+    // socket comes at 32 s.
     work = true;
     await vi.advanceTimersByTimeAsync(2_000);
     await flush();
     expect(h.sockets).toHaveLength(7);
+  });
+
+  /**
+   * BI4's other half. A device quiet through a long outage has climbed to a long wait; work
+   * then appears (a folder of notes dropped in), and `workArrived` brings the wait already
+   * running inside `WORK_RETRY_MAX_MS`, rather than leaving the upload behind a five-minute
+   * timer nothing re-reads.
+   *
+   * **Proven able to fail** by making `workArrived` return `false` at once: the socket does
+   * not come within 30 s, and the call reports nothing shortened.
+   */
+  it("work arriving during a long wait brings the reconnect within 30 s", async () => {
+    vi.useFakeTimers();
+    let work = false;
+    const h = harness({ hasWork: () => work, random: () => 1 });
+    h.socket.connect();
+    await flush();
+    // The first six drops wait 1, 2, 4, 8, 16 and 32 s, each inside the advance.
+    for (let failure = 1; failure <= 6; failure++) {
+      latest(h).drop();
+      await vi.advanceTimersByTimeAsync(32_000);
+      await flush();
+    }
+    expect(h.sockets).toHaveLength(7);
+    latest(h).drop(); // retryMs is now 64 s, and nothing is queued
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    work = true;
+    expect(h.socket.workArrived()).toBe(true);
+    await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
+    await flush();
+    expect(h.sockets).toHaveLength(8);
+  });
+
+  /** The controls: nothing to shorten while connected, while a short wait is running, or
+   * while a restart's fixed delay is — none of those is a long backoff. */
+  it("workArrived leaves every other wait alone", async () => {
+    vi.useFakeTimers();
+    const h = harness({ random: () => 1 });
+    await connected(h);
+    expect(h.socket.workArrived()).toBe(false); // connected
+
+    latest(h).drop(); // the first rung: 1 s
+    expect(h.socket.workArrived()).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flush();
+    expect(h.sockets).toHaveLength(2);
+
+    latest(h).closeWith(SERVICE_RESTART_CLOSE_CODE);
+    expect(h.socket.workArrived()).toBe(false);
+    await vi.advanceTimersByTimeAsync(RESTART_RECONNECT_MS);
+    await flush();
+    expect(h.sockets).toHaveLength(3);
   });
 
   it("never signs a vault id the server put on the challenge frame", async () => {
@@ -425,10 +502,12 @@ describe("SyncSocket", () => {
 
     t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
     // Still inside the pending `signChallenge` call — nothing has awaited past it yet.
-    t.emit({ type: "closing", reason: "handshake timed out" });
+    t.emit({ type: "closing", reason: "handshake timed out", retry: "later" });
     await flush();
 
-    expect(h.closings).toEqual(['could not connect to vault "vault-mine": handshake timed out']);
+    // Verbatim, because it is retried (the verbatim case above); what matters here is that
+    // it is the vault's reason at all, not "expected a challenge first".
+    expect(h.closings).toEqual(["handshake timed out"]);
   });
 
   it("a closing frame received well after the handshake carries no vault-id framing", async () => {

@@ -1762,6 +1762,180 @@ describe("a closing the vault says to retry after", () => {
   });
 });
 
+/**
+ * The device-side cost of BI1. A busy vault closes every few seconds during an import, and a
+ * reconnect used to rescan the whole vault on its `ready` — reading and hashing every file,
+ * with nothing to stop the next reconnect starting another scan on top of the last. After a
+ * retried closing the watchers were running throughout, so the scan is skipped for VS5's
+ * reason; and whatever does rescan runs one scan at a time.
+ */
+describe("a reconnect after a retried closing, and the manifest scan", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  /** A paired plugin whose ledger matches its files, so a scan finds nothing unless a test
+   * changes a file behind the watchers' back. */
+  const quietPlugin = async (files: Record<string, string>) => {
+    stubWebSocket();
+    const hashes: Record<string, string> = {};
+    for (const [path, body] of Object.entries(files)) hashes[path] = await contentHash(body);
+    const plugin = await load(files, {
+      ...PAIRED,
+      appOptions: {
+        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
+      },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    return { plugin, first: FakeWebSocket.instances[0] as FakeWebSocket };
+  };
+
+  const socketAt = async (n: number): Promise<FakeWebSocket> => {
+    await vi.waitFor(() => expect(FakeWebSocket.instances[n]).toBeDefined(), UNTIL);
+    return FakeWebSocket.instances[n] as FakeWebSocket;
+  };
+
+  const putsOf = (ws: FakeWebSocket) => ws.upFrames().filter((f) => f.type === "put");
+
+  /**
+   * The file changed WITHOUT an event is how the test sees whether a rescan ran, as in the
+   * park case: only a rescan could find it. The unplanned drop afterwards is the control.
+   *
+   * **Proven able to fail** by leaving `resumingFromRetry` out of the `ready` handler's test:
+   * the reconnect after the busy close pushes `note.md`.
+   */
+  it("does not rescan on the reconnect after a busy closing, and does after a drop", async () => {
+    const files: Record<string, string> = { "note.md": "one\n" };
+    const { first } = await quietPlugin(files);
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+    files["note.md"] = "two\n"; // no vault event: invisible to everything but a rescan
+
+    first.emit({ type: "closing", reason: "busy", retry: "later" });
+    const second = await socketAt(1);
+    await bringUp(second);
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(putsOf(second)).toEqual([]);
+
+    second.close(); // an unplanned drop: this one does rescan
+    const third = await socketAt(2);
+    await bringUp(third);
+    await vi.waitFor(() => expect(putsOf(third)).toHaveLength(1), UNTIL);
+  });
+
+  /**
+   * A closing before this pair's first `ready` skips nothing: no `ready` has rescanned yet.
+   * A fresh pairing whose first hello met a busy vault is the case — the §1 case itself.
+   *
+   * **Proven able to fail** by setting `resumingFromRetry` without the `readiedThisPair`
+   * check: the change is never found.
+   */
+  it("still rescans on the first ready when the first handshake was closed to retry", async () => {
+    const files: Record<string, string> = { "note.md": "one\n" };
+    const { first } = await quietPlugin(files);
+    await settleMicrotasks(QUIET_MS + 500); // the load-time scan has come and gone
+    files["note.md"] = "two\n";
+
+    first.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(
+      () => expect(first.upFrames().some((f) => f.type === "hello")).toBe(true),
+      UNTIL,
+    );
+    first.emit({ type: "closing", reason: "handshake timed out", retry: "later" });
+    const second = await socketAt(1);
+    await bringUp(second);
+    await vi.waitFor(() => expect(putsOf(second)).toHaveLength(1), UNTIL);
+  });
+
+  /**
+   * A scan outlasting the gap between two reconnects no longer runs twice at once: the second
+   * request waits, and is served by one more scan when the first ends. The read of `note.md`
+   * is held open so the first scan cannot finish, and every read of it is counted.
+   *
+   * **Proven able to fail** by removing the `reconciling` guard: two reads are in flight at
+   * once.
+   */
+  it("runs one manifest scan at a time, and one more for a request made during it", async () => {
+    const { plugin, first } = await quietPlugin({ "note.md": "hi" });
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    const adapter = plugin.app.vault.adapter as unknown as {
+      readBinary: (path: string) => Promise<ArrayBuffer>;
+    };
+    const realRead = adapter.readBinary.bind(adapter);
+    let reads = 0;
+    adapter.readBinary = (path: string) => {
+      if (path === "note.md") reads++;
+      return realRead(path);
+    };
+    let release = (): void => {};
+    readGates.set(
+      "note.md",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+
+    first.close(); // a drop: its reconnect rescans, and the scan stalls on the held read
+    const second = await socketAt(1);
+    await bringUp(second);
+    await vi.waitFor(() => expect(reads).toBe(1), UNTIL);
+
+    second.close(); // another reconnect asks for a scan while the first is still running
+    const third = await socketAt(2);
+    await bringUp(third);
+    await settleMicrotasks(300); // quiet window: no second read starts
+    expect(reads).toBe(1);
+
+    release();
+    await vi.waitFor(() => expect(reads).toBe(2), UNTIL); // the one rerun
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(reads).toBe(2);
+  });
+});
+
+/**
+ * BI4, the wait already running. `hasWork` is read when a retry is scheduled, so an edit
+ * made during a long backoff used to sit out the whole of it.
+ */
+describe("an edit during a long backoff", () => {
+  /**
+   * **Proven able to fail** by leaving `workArrived` out of `noteTouched`: the reconnect waits
+   * out the 64 s rung and the wait for its socket runs out.
+   */
+  it("brings the reconnect within 30 s", async () => {
+    stubWebSocket();
+    const files: Record<string, string> = { "note.md": "hi" };
+    const hashes = { "note.md": await contentHash("hi") };
+    await load(files, {
+      controlplaneOrigin: "https://cp.test",
+      vaultId: "vault-1",
+      deviceId: "dev-1",
+      appOptions: {
+        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
+      },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    await bringUp(FakeWebSocket.instances[0] as FakeWebSocket);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    vi.spyOn(Math, "random").mockReturnValue(1); // the top of every jitter window
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // Nothing queued: 1, 2, 4, 8, 16 and 32 s, then a drop that waits the whole 64 s rung.
+    for (let attempt = 0; attempt < 6; attempt++) {
+      (FakeWebSocket.instances[attempt] as FakeWebSocket).close();
+      vi.advanceTimersByTime(32_000);
+      await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(attempt + 2));
+    }
+    (FakeWebSocket.instances[6] as FakeWebSocket).close();
+
+    files["note.md"] = "edited";
+    fireVaultEvent("modify", "note.md");
+    vi.advanceTimersByTime(WORK_RETRY_MAX_MS);
+    await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(8));
+    vi.useRealTimers();
+  });
+});
+
 describe("a top-level dot-folder is never synced, in either direction", () => {
   /**
    * Every config folder starts with a dot (Obsidian refuses any other), and devices sharing
@@ -2647,6 +2821,59 @@ describe("a first sync, batched when the vault takes batches", () => {
     // One binary frame per entry: every note fits one.
     expect(ws.sent.filter((d) => typeof d !== "string")).toHaveLength(250);
     expect(plugin.syncStatus().pending).toBe(0);
+  });
+
+  /**
+   * A push's outcome reaches the ledger when its own answer does, not when the last answer in
+   * its window does. The window here is a batch of two notes and then a note too large to
+   * batch, sent singly after the batch is answered and never answered itself. The batch's
+   * ledger writes must land anyway: held back behind the large put, they would land after
+   * whatever inbound events the vault drained meanwhile, and overwrite them.
+   *
+   * **Proven able to fail** by applying outcomes after `Promise.allSettled` again: the ledger
+   * holds neither note until the large put is answered, which here is never.
+   */
+  it("applies a batch's outcomes before a later put in its window is answered", async () => {
+    stubWebSocket();
+    const files: Record<string, string> = {
+      "a.md": "a\n",
+      "b.md": "b\n",
+      "c.md": "x".repeat(300 * 1024),
+    };
+    const plugin = await load(files, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    // A vault that answers a batch and never answers a single put.
+    const rawSend = ws.send.bind(ws);
+    ws.send = (data: string | Uint8Array) => {
+      rawSend(data);
+      if (typeof data !== "string") return;
+      const frame = JSON.parse(data) as { type?: string; puts?: { path: string; sha: string }[] };
+      if (frame.type !== "put_batch") return;
+      const applied = (frame.puts ?? []).map((p, i) => ({ path: p.path, seq: i + 1, sha: p.sha }));
+      queueMicrotask(() => ws.emit({ type: "applied_batch", applied, refused: [] }));
+    };
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({ type: "ready", seq: 0, max_batch_ops: 100, max_batch_bytes: 4194304 });
+
+    // The large note goes up singly once the batch is answered: the window is still open.
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "c.md")).toBe(true),
+      UNTIL,
+    );
+    const ledger = () =>
+      (plugin.app.loadLocalStorage("ctrlrouter:sync-state") as { hashes?: Record<string, string> })
+        ?.hashes ?? {};
+    await vi.waitFor(() => {
+      expect(ledger()["a.md"]).toBeDefined();
+      expect(ledger()["b.md"]).toBeDefined();
+    }, UNTIL);
+    expect(ledger()["c.md"]).toBeUndefined();
+    const batched = ws.upFrames().filter((f) => f.type === "put_batch");
+    expect(batched.map((f) => (f.puts as { path: string }[]).map((p) => p.path))).toEqual([
+      ["a.md", "b.md"],
+    ]);
   });
 
   /** A vault older than the frame sends a `ready` with no limits: every put goes singly, which

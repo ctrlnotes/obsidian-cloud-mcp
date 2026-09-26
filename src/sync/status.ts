@@ -202,7 +202,12 @@ function refusalText(reason: string): string {
 }
 
 /**
- * The retrying clause. It carries the revoked-elsewhere advice too, and that is not a
+ * The retrying clause. `reason` is the vault's sentence verbatim — `socket.ts` reports a
+ * retried closing without its own vault-id prefix — so quoting it as what the vault said is
+ * true. Until that was so, a closing during the handshake rendered as `the vault said "could
+ * not connect to vault "…": handshake timed out"`, the plugin's words inside the vault's.
+ *
+ * It carries the revoked-elsewhere advice too, and that is not a
  * contradiction: a vault older than BI1 sends no `retry`, so its "not authorised" is retried
  * like anything else (on the backoff, at most every five minutes) and this clause is the only
  * place its owner can learn why nothing is syncing.

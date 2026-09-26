@@ -295,9 +295,9 @@ describe("a device reconnecting by itself", () => {
   it("carries the revoked-elsewhere advice when the reason is the opaque refusal", () => {
     const text = describeStatus({
       ...IDLE_STATUS,
-      retrying: 'could not connect to vault "vault-1": not authorised',
+      retrying: "not authorised",
     });
-    expect(text).toContain("Reconnecting");
+    expect(text).toContain('Reconnecting: the vault said "not authorised".');
     expect(text).toMatch(/device list/i);
     expect(describeStatus({ ...IDLE_STATUS, retrying: "busy" })).not.toMatch(/device list/i);
   });

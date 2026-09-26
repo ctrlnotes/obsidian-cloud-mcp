@@ -57,9 +57,12 @@
 // why.** The vault verifies `context_message(its own vault_id, challenge)`; if this plugin
 // signed for a different id, the signature simply fails to verify, and the vault answers
 // with the same "not authorised" it gives an unknown or revoked device — distinguishing
-// them would tell an attacker whether a device id exists. So when a `closing` arrives while
-// we are still waiting on our own `hello` to be answered, the message this module reports
-// names the vault id it signed for — the one piece of diagnosis only this side can do.
+// them would tell an attacker whether a device id exists. So when a `closing` that stops
+// sync arrives while we are still waiting on our own `hello` to be answered, the message this
+// module reports names the vault id it signed for — the one piece of diagnosis only this side
+// can do. A closing this module retries after is reported in the vault's own words: the pane
+// quotes it as what the vault said (`status.ts`), and a v3 vault's "not authorised", the one
+// retried refusal where the id could matter, carries advice that names it anyway.
 
 import type { DeviceIdentity } from "../device.ts";
 import { type Down, decodeDown, encodeUp, readDownFrame, type Up } from "../wire.ts";
@@ -220,9 +223,10 @@ export interface SyncSocketDeps {
   /**
    * A `closing` frame arrived. `willRetry` says which treatment this one got (this
    * module's header): `false` is `retry: "never"` — reported once, no retry follows,
-   * `connect()` must be called again deliberately. `true` means this module is already
-   * retrying on its own with the ordinary backoff, exactly like a dropped connection; a
-   * caller must NOT tear down anything it wants kept for that retry to use (`main.ts`'s
+   * `connect()` must be called again deliberately, and `message` names the vault id this
+   * device signed for when the refusal answered its hello. `true` means `message` is the
+   * vault's reason verbatim, and this module is already retrying on its own with the
+   * ordinary backoff, exactly like a dropped connection; a caller must NOT tear down anything it wants kept for that retry to use (`main.ts`'s
    * `onClosing` skips `disconnectSyncing()` for this case, or the `Pump` this class hands
    * frames to next would be gone).
    */
@@ -245,7 +249,8 @@ export interface SyncSocketDeps {
    * Whether this device has work outstanding — an upload queued or in flight, a settle
    * deriving one, a change not yet derived (bulk-ingest design BI4). Read each time a retry
    * is scheduled; while it answers `true` a reconnect waits at most
-   * {@link WORK_RETRY_MAX_MS}. Optional: without it every retry takes the ordinary backoff.
+   * {@link WORK_RETRY_MAX_MS}. Work that appears during a wait already running is reported
+   * with `workArrived`. Optional: without it every retry takes the ordinary backoff.
    */
   readonly hasWork?: () => boolean;
   /** Jitter source for the backoff. Injectable so a test is deterministic; defaults to the
@@ -273,6 +278,12 @@ export class SyncSocket {
    * "`this.socket` is set" — see `connect()`. */
   private opening = false;
   private stable: number | null = null;
+  /**
+   * When the pending backoff retry fires, in `Date.now()` time; `null` when `timer` is not
+   * one — none pending, or a restart's fixed delay. What `workArrived` reads to know whether
+   * the wait still running is longer than work may wait.
+   */
+  private retryAt: number | null = null;
   private retryMs = FIRST_RETRY_MS;
   private ready = false;
   /** True from the moment `hello` is sent until `ready` (or `closing`) answers it — the
@@ -323,7 +334,29 @@ export class SyncSocket {
     if (!this.wanted || this.timer === null) return false;
     window.clearTimeout(this.timer);
     this.timer = null;
+    this.retryAt = null;
     this.open();
+    return true;
+  }
+
+  /**
+   * This device has work now (BI4): a backoff retry still more than
+   * {@link WORK_RETRY_MAX_MS} away is brought inside it. Returns whether one was.
+   *
+   * `hasWork` is read when a retry is SCHEDULED, so without this a device that went quiet on a
+   * long outage — its backoff climbed to five minutes with nothing queued — and then had a
+   * folder of notes dropped into it would sit out the whole wait before uploading any. The
+   * rung is untouched, as `retryWait` leaves it: only this one wait is shortened, and it is
+   * jittered over `[WORK_RETRY_MAX_MS/2, WORK_RETRY_MAX_MS)` like any other.
+   */
+  workArrived(): boolean {
+    if (!this.wanted || this.timer === null || this.retryAt === null) return false;
+    if (this.retryAt - Date.now() <= WORK_RETRY_MAX_MS) return false;
+    window.clearTimeout(this.timer);
+    this.timer = null;
+    this.retryAt = null;
+    const random = this.deps.random ?? Math.random;
+    this.armRetry(retryWait(WORK_RETRY_MAX_MS, random(), true));
     return true;
   }
 
@@ -378,6 +411,7 @@ export class SyncSocket {
     if (this.timer !== null) window.clearTimeout(this.timer);
     if (this.stable !== null) window.clearTimeout(this.stable);
     this.timer = null;
+    this.retryAt = null;
     this.stable = null;
   }
 
@@ -492,7 +526,11 @@ export class SyncSocket {
       } else if (down.retry === "never") {
         this.terminal(socket, this.closingMessage(down.reason));
       } else {
-        this.resumable(socket, this.closingMessage(down.reason));
+        // The vault's own words, not `closingMessage`'s: the vault-id diagnosis is for a
+        // refusal a human has to act on, and a device on its way back is not one. Rendered
+        // as `the vault said "…"` (`status.ts`), it would put this plugin's words in the
+        // vault's mouth.
+        this.resumable(socket, down.reason);
       }
       return;
     }
@@ -657,8 +695,14 @@ export class SyncSocket {
     // about. Capped while work is outstanding (BI4, `retryWait`).
     const wait = retryWait(this.retryMs, random(), this.deps.hasWork?.() ?? false);
     this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS);
+    this.armRetry(wait);
+  }
+
+  private armRetry(wait: number): void {
+    this.retryAt = Date.now() + wait;
     this.timer = window.setTimeout(() => {
       this.timer = null;
+      this.retryAt = null;
       if (this.wanted) this.open();
     }, wait);
   }

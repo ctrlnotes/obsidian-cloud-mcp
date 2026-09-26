@@ -243,6 +243,30 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * `ready` does it.
    */
   private backgroundedOnMobile = false;
+  /**
+   * The next `ready` ends a reconnect after a closing the vault said to retry (BI1), so it
+   * skips the full rescan, for VS5's reason: this device was running throughout and its
+   * watchers saw every edit. Set by `onClosing(willRetry)`, cleared by that `ready` and by
+   * `disconnectSyncing`, and yielding to `backgroundedOnMobile` exactly as a park does.
+   *
+   * **Why it matters more than a park does.** A busy vault closes every few seconds during an
+   * import, and a rescan reads and hashes every file: on a 20,000-file first sync each busy
+   * close would start another full read of the vault, and each one would mark every path not
+   * yet in the ledger dirty again, so the next settle re-derived the whole remainder only to
+   * find nothing new.
+   *
+   * Only after this pair has had a `ready` (`readiedThisPair`): a closing before the first
+   * one — a fresh pairing whose first hello timed out — has had no rescan at a `ready` yet,
+   * and must still get it.
+   */
+  private resumingFromRetry = false;
+  /** This `SyncSocket`/`Pump` pair has completed a handshake at least once. Cleared by
+   * `disconnectSyncing`, with the pair. */
+  private readiedThisPair = false;
+  /** A manifest reconcile is running (`startReconcile`). */
+  private reconciling = false;
+  /** Another reconcile was asked for while one was running: run once more when it ends. */
+  private reconcileAgain = false;
   /** Consecutive idle closes answered by reconnecting at once — `park.ts`'s
    * `decideIdleWake`. Reset by a quiet close, and by any sign the vault is answering. */
   private idleWakes = 0;
@@ -786,13 +810,31 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    *
    * **The settle runs either way.** A reconcile that threw part-way through has still
    * marked real paths dirty, and nothing else is ever going to look at them.
+   *
+   * **One at a time.** A scan reads and hashes every file, so on a large vault it can outlast
+   * the gap between two reconnects, and two scans running at once read the vault twice for
+   * nothing. A request while one runs is remembered and served by ONE more scan when it ends
+   * — not dropped, because the running scan may already have listed the vault before the
+   * edit the new request exists to catch.
    */
   private startReconcile(): void {
+    if (this.reconciling) {
+      this.reconcileAgain = true;
+      return;
+    }
+    this.reconciling = true;
     void (async () => {
       try {
-        await this.reconcileManifest();
-      } catch (e) {
-        console.warn("Ctrl Notes: could not reconcile this vault against its own ledger", e);
+        do {
+          this.reconcileAgain = false;
+          try {
+            await this.reconcileManifest();
+          } catch (e) {
+            console.warn("Ctrl Notes: could not reconcile this vault against its own ledger", e);
+          }
+        } while (this.reconcileAgain && this.active);
+      } finally {
+        this.reconciling = false;
       }
       this.settler?.touch();
     })();
@@ -808,7 +850,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    *
    * Called from `onLayoutReady` (vault listing is stable and complete by then) and again on
    * every `ready` — a reconnect is the other moment this device could have missed something —
-   * except the one that ends a park, when the watchers were running throughout (VS5).
+   * except the one that ends a park (VS5) or a retried closing (BI1), when the watchers were
+   * running throughout.
    */
   private async reconcileManifest(): Promise<void> {
     const listed = this.listWirePaths();
@@ -939,12 +982,18 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // — and it reads every file, so a large vault would pay a full scan each time a
             // phone came back to the foreground.
             //
+            // **Nor the reconnect after a closing the vault said to retry** (BI1), for the same
+            // reason: see `resumingFromRetry`, and why a busy import makes it matter.
+            //
             // A mobile device that went to the background meanwhile rescans anyway: its
             // watchers were suspended with the rest of its JavaScript.
-            const endsPark = this.resumingFromPark && !this.backgroundedOnMobile;
+            const watched =
+              (this.resumingFromPark || this.resumingFromRetry) && !this.backgroundedOnMobile;
             this.resumingFromPark = false;
+            this.resumingFromRetry = false;
             this.backgroundedOnMobile = false;
-            if (!endsPark) this.startReconcile();
+            this.readiedThisPair = true;
+            if (!watched) this.startReconcile();
             this.retryPendingPulls();
             // **Not `down.seq`.** That is the VAULT's current position, and
             // setting it here reported a device as caught up at the instant it
@@ -991,6 +1040,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           // user to ignore the one that matters. The status line says so instead, as a clause
           // that leaves the pending count on screen (`status.ts`'s `retrying`).
           if (willRetry) {
+            if (this.readiedThisPair) this.resumingFromRetry = true;
             this.setStatus({ retrying: message, updating: false });
             return;
           }
@@ -1050,6 +1100,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     // relink, or a reconnect after a refusal — and gets the rescan (VS5).
     this.unpark();
     this.resumingFromPark = false;
+    this.resumingFromRetry = false;
+    this.readiedThisPair = false;
     this.backgroundedOnMobile = false;
     this.idleWakes = 0;
     // Before the pump, and unconditionally: an outstanding fetch holds a promise
@@ -1294,10 +1346,13 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /** A vault event added to `touched`. The settle is armed as always; a parked device also
    * reconnects NOW, so the wake overlaps the settle's quiet window instead of following it
-   * (VS4). */
+   * (VS4). A device waiting out a long backoff brings that wait inside `WORK_RETRY_MAX_MS`
+   * (BI4): the socket read `hasWork` when it scheduled the wait, before this edit existed. */
   private noteTouched(): void {
     this.settler?.touch();
-    if (this.parked && hasSomethingToSend(this.touched, this.attachments)) this.wake();
+    if (!hasSomethingToSend(this.touched, this.attachments)) return;
+    if (this.parked) this.wake();
+    else this.socket?.workArrived();
   }
 
   private async fetchBytes(
@@ -1493,17 +1548,29 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           break;
         }
         const slice = changes.slice(start, start + pump.windowSize());
-        const settled = await Promise.allSettled(pump.pushAll(slice));
+        // **Each outcome lands the moment its own answer does, not when the window's last
+        // does.** A window can hold a batch and then a large put sent after it, several round
+        // trips later; the vault meanwhile drains the batch's echoes and other devices'
+        // events. Applied only after `allSettled`, a push's ledger write came AFTER those
+        // inbound events for the same path: an echo of a merge found no ledger entry and was
+        // "kept" as a local edit, and another device's edit, already applied to disk and
+        // ledger, had its ledger hash overwritten by this push's older one — so the next
+        // inbound edit there read as local, was skipped, and re-uploaded against the wrong
+        // base. The pump settles in queue order, so outcomes for one path still apply in the
+        // order the queue sent them, and each in the same macrotask as its answer, as the
+        // one-at-a-time loop this replaced did with `await pump.push(change)`.
+        const tracked = pump.pushAll(slice).map((p) =>
+          p.then((outcome) => {
+            this.applyPushOutcome(outcome);
+          }),
+        );
+        const settled = await Promise.allSettled(tracked);
         const failed: Change[] = [];
         for (const [i, result] of settled.entries()) {
+          if (result.status === "fulfilled") continue;
           const change = slice[i] as Change;
-          if (result.status === "fulfilled") {
-            // In order, so two outcomes for one path apply as the queue sent them.
-            this.applyPushOutcome(result.value);
-          } else {
-            console.warn(`Ctrl Notes: could not send ${change.path}`, result.reason);
-            failed.push(change);
-          }
+          console.warn(`Ctrl Notes: could not send ${change.path}`, result.reason);
+          failed.push(change);
         }
         start += slice.length;
         // Progress an import can see: the count falls a window at a time, not all at once
