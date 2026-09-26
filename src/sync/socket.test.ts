@@ -6,7 +6,9 @@ import type { Down, Up } from "../wire.ts";
 import { encodeUp, MIN_WIRE_VERSION, WIRE_VERSION } from "../wire.ts";
 import {
   IDLE_REASON,
+  MAX_RETRY_MS,
   RESTART_RECONNECT_MS,
+  retryWait,
   SERVICE_RESTART_CLOSE_CODE,
   type SocketLike,
   SyncSocket,
@@ -385,9 +387,8 @@ describe("SyncSocket", () => {
     await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
     await flush();
     expect(h.sockets).toHaveLength(6);
-    // And the cap is read when the retry is SCHEDULED, so work arriving later does not
-    // shorten a wait already running unless someone says so (`workArrived`, below): the next
-    // socket comes at 32 s.
+    // The cap is read when the retry is SCHEDULED, so work arriving later does not shorten a
+    // wait already running: the next socket comes at 32 s.
     work = true;
     await vi.advanceTimersByTimeAsync(2_000);
     await flush();
@@ -395,56 +396,86 @@ describe("SyncSocket", () => {
   });
 
   /**
-   * BI4's other half. A device quiet through a long outage has climbed to a long wait; work
-   * then appears (a folder of notes dropped in), and `workArrived` brings the wait already
-   * running inside `WORK_RETRY_MAX_MS`, rather than leaving the upload behind a five-minute
-   * timer nothing re-reads.
+   * Progress resets the ladder. A busy vault can close within `STABLE_MS` of every `ready`
+   * while applying work each time; without this, an import's retries climb to long waits.
    *
-   * **Proven able to fail** by making `workArrived` return `false` at once: the socket does
-   * not come within 30 s, and the call reports nothing shortened.
+   * **Proven able to fail** by removing the `applied` branch in `onMessage`: the retry waits
+   * the 16 s rung and no socket opens within 1 s.
    */
-  it("work arriving during a long wait brings the reconnect within 30 s", async () => {
-    vi.useFakeTimers();
-    let work = false;
-    const h = harness({ hasWork: () => work, random: () => 1 });
-    h.socket.connect();
-    await flush();
-    // The first six drops wait 1, 2, 4, 8, 16 and 32 s, each inside the advance.
-    for (let failure = 1; failure <= 6; failure++) {
-      latest(h).drop();
-      await vi.advanceTimersByTimeAsync(32_000);
-      await flush();
-    }
-    expect(h.sockets).toHaveLength(7);
-    latest(h).drop(); // retryMs is now 64 s, and nothing is queued
-    await vi.advanceTimersByTimeAsync(1_000);
-
-    work = true;
-    expect(h.socket.workArrived()).toBe(true);
-    await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
-    await flush();
-    expect(h.sockets).toHaveLength(8);
-  });
-
-  /** The controls: nothing to shorten while connected, while a short wait is running, or
-   * while a restart's fixed delay is — none of those is a long backoff. */
-  it("workArrived leaves every other wait alone", async () => {
+  it("an applied answer resets the backoff, so the next busy close retries within 1 s", async () => {
     vi.useFakeTimers();
     const h = harness({ random: () => 1 });
-    await connected(h);
-    expect(h.socket.workArrived()).toBe(false); // connected
+    h.socket.connect();
+    await flush();
+    // Four drops before any handshake: 1, 2, 4 and 8 s, so the rung is now 16 s.
+    for (let failure = 1; failure <= 4; failure++) {
+      latest(h).drop();
+      await vi.advanceTimersByTimeAsync(8_000);
+      await flush();
+    }
+    expect(h.sockets).toHaveLength(5);
+    const t = latest(h);
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
+    await flush();
+    t.emit({ type: "ready", seq: 0 });
+    t.emit({ type: "applied", path: "a.md", seq: 1, sha: "s" });
+    await flush();
+    t.emit({ type: "closing", reason: "busy", retry: "later" }); // well inside STABLE_MS
+    await flush();
 
-    latest(h).drop(); // the first rung: 1 s
-    expect(h.socket.workArrived()).toBe(false);
     await vi.advanceTimersByTimeAsync(1_000);
     await flush();
-    expect(h.sockets).toHaveLength(2);
+    expect(h.sockets).toHaveLength(6);
+  });
 
-    latest(h).closeWith(SERVICE_RESTART_CLOSE_CODE);
-    expect(h.socket.workArrived()).toBe(false);
-    await vi.advanceTimersByTimeAsync(RESTART_RECONNECT_MS);
+  /** Climbs the ladder with a pre-ready closing on each connection, and returns the socket
+   * count after each wait of `WORK_RETRY_MAX_MS`. */
+  const preReadyClosings = async (wireVersion: number, closing: object): Promise<number[]> => {
+    const h = harness({ hasWork: () => true, random: () => 1 });
+    h.socket.connect();
     await flush();
-    expect(h.sockets).toHaveLength(3);
+    const counts: number[] = [];
+    for (let failure = 1; failure <= 8; failure++) {
+      const t = latest(h);
+      t.emit({ type: "challenge", wire_version: wireVersion, challenge: CHALLENGE_B64 });
+      await flush();
+      t.emit(closing);
+      await flush();
+      await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
+      await flush();
+      counts.push(h.sockets.length);
+    }
+    return counts;
+  };
+
+  /**
+   * A v3 vault's refusal of the hello carries no `retry` and may be a revoked device, so it
+   * keeps the ordinary five-minute ceiling even with work queued, rather than BI4's 30 s.
+   *
+   * **Proven able to fail** by passing `true` for `capForWork` unconditionally: every
+   * reconnect lands inside 30 s.
+   */
+  it("a v3 vault's pre-ready refusal is not retried faster for queued work", async () => {
+    vi.useFakeTimers();
+    const counts = await preReadyClosings(MIN_WIRE_VERSION, {
+      type: "closing",
+      reason: "not authorised",
+    });
+    // 1, 2, 4, 8 and 16 s land inside each 30 s wait; the 32 s rung does not.
+    expect(counts.slice(0, 5)).toEqual([2, 3, 4, 5, 6]);
+    expect(counts[5]).toBe(6);
+  });
+
+  /** The control: a v4 vault's pre-ready `later` (a busy vault's `handshake timed out`) keeps
+   * the cap, because a v4 vault says `never` for a device it will not admit. */
+  it("a v4 vault's pre-ready later closing keeps the work cap", async () => {
+    vi.useFakeTimers();
+    const counts = await preReadyClosings(WIRE_VERSION, {
+      type: "closing",
+      reason: "handshake timed out",
+      retry: "later",
+    });
+    expect(counts).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
   it("never signs a vault id the server put on the challenge frame", async () => {
@@ -837,5 +868,22 @@ describe("SyncSocket", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(h.sockets).toHaveLength(3); // the first backoff step
     });
+  });
+});
+
+/** BI4's cap on one rung, at its boundary. */
+describe("retryWait", () => {
+  it("jitters the ordinary rung without work, and caps it at WORK_RETRY_MAX_MS with work", () => {
+    expect(retryWait(MAX_RETRY_MS, 0, false)).toBe(MAX_RETRY_MS / 2);
+    expect(retryWait(MAX_RETRY_MS, 1, false)).toBe(MAX_RETRY_MS);
+    expect(retryWait(16_000, 0, true)).toBe(8_000); // under the cap: untouched
+    expect(retryWait(16_000, 1, true)).toBe(16_000);
+  });
+
+  /** **Proven able to fail** with the old `min(jittered, cap)`: both draws give 30 s. */
+  it("keeps its jitter under the cap: 15 to 30 s, not a fixed 30 s", () => {
+    expect(retryWait(64_000, 0, true)).toBe(WORK_RETRY_MAX_MS / 2);
+    expect(retryWait(64_000, 1, true)).toBe(WORK_RETRY_MAX_MS);
+    expect(retryWait(MAX_RETRY_MS, 0.5, true)).toBe(22_500);
   });
 });

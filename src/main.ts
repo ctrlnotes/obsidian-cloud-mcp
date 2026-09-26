@@ -1346,13 +1346,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /** A vault event added to `touched`. The settle is armed as always; a parked device also
    * reconnects NOW, so the wake overlaps the settle's quiet window instead of following it
-   * (VS4). A device waiting out a long backoff brings that wait inside `WORK_RETRY_MAX_MS`
-   * (BI4): the socket read `hasWork` when it scheduled the wait, before this edit existed. */
+   * (VS4). */
   private noteTouched(): void {
     this.settler?.touch();
-    if (!hasSomethingToSend(this.touched, this.attachments)) return;
-    if (this.parked) this.wake();
-    else this.socket?.workArrived();
+    if (this.parked && hasSomethingToSend(this.touched, this.attachments)) this.wake();
   }
 
   private async fetchBytes(

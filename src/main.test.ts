@@ -1893,49 +1893,6 @@ describe("a reconnect after a retried closing, and the manifest scan", () => {
   });
 });
 
-/**
- * BI4, the wait already running. `hasWork` is read when a retry is scheduled, so an edit
- * made during a long backoff used to sit out the whole of it.
- */
-describe("an edit during a long backoff", () => {
-  /**
-   * **Proven able to fail** by leaving `workArrived` out of `noteTouched`: the reconnect waits
-   * out the 64 s rung and the wait for its socket runs out.
-   */
-  it("brings the reconnect within 30 s", async () => {
-    stubWebSocket();
-    const files: Record<string, string> = { "note.md": "hi" };
-    const hashes = { "note.md": await contentHash("hi") };
-    await load(files, {
-      controlplaneOrigin: "https://cp.test",
-      vaultId: "vault-1",
-      deviceId: "dev-1",
-      appOptions: {
-        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
-      },
-    });
-    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
-    await bringUp(FakeWebSocket.instances[0] as FakeWebSocket);
-    await settleMicrotasks(QUIET_MS + 500);
-
-    vi.spyOn(Math, "random").mockReturnValue(1); // the top of every jitter window
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    // Nothing queued: 1, 2, 4, 8, 16 and 32 s, then a drop that waits the whole 64 s rung.
-    for (let attempt = 0; attempt < 6; attempt++) {
-      (FakeWebSocket.instances[attempt] as FakeWebSocket).close();
-      vi.advanceTimersByTime(32_000);
-      await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(attempt + 2));
-    }
-    (FakeWebSocket.instances[6] as FakeWebSocket).close();
-
-    files["note.md"] = "edited";
-    fireVaultEvent("modify", "note.md");
-    vi.advanceTimersByTime(WORK_RETRY_MAX_MS);
-    await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(8));
-    vi.useRealTimers();
-  });
-});
-
 describe("a top-level dot-folder is never synced, in either direction", () => {
   /**
    * Every config folder starts with a dot (Obsidian refuses any other), and devices sharing
