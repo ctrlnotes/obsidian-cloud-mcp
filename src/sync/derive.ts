@@ -262,6 +262,15 @@ export const deriveChanges = async (
     if (alive.has(path)) continue;
     const base = hashes[path];
     if (base === undefined) continue;
+    // **Presence is never a deletion either.** Whatever named this path deleted — a watcher
+    // event, or a reconcile reading a listing that trailed the disk — the disk answers last,
+    // here. A delete pushed for a file that is still on disk is removed on every device.
+    try {
+      if ((await files.stat(path)) !== null) continue;
+    } catch (e) {
+      console.warn(`Ctrl Notes: could not confirm ${path} is gone; not deleting it`, e);
+      continue;
+    }
     deletes.push({ op: "delete", path, base });
   }
 

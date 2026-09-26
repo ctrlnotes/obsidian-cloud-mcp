@@ -1,7 +1,7 @@
 {
   "id": "ctrl-notes-cloud-mcp",
   "name": "Ctrl Notes Cloud MCP",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.13.4",
   "description": "Connect your vault to Claude Code and other AI agents through a hosted remote MCP server. Notes sync both ways, so an agent's edits appear here and yours reach the agent.",
   "author": "Ctrl Notes",
