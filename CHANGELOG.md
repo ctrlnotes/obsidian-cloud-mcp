@@ -2,6 +2,26 @@
 
 Each release's section becomes its release notes. Newest first.
 
+## 0.1.0
+
+- **See which AI agents can reach this vault.** The settings pane now lists every agent
+  connected to your Ctrl Notes vault, whether it can only read or can also write, and when
+  it was last used, with a link to manage them in the web app. With none yet, it shows the
+  command that connects Claude Code. The list loads when you open the pane and on Refresh.
+- **Sync status in the status bar.** A small icon and one word (Synced, Syncing, Idle,
+  Reconnecting, Error, Not paired) on desktop; click it, or press Enter on it, to open the
+  settings.
+- **A clearer settings pane.** Sync status comes first, your vault is shown by name, and the
+  two server addresses moved under Advanced. The status reads as short lines with real
+  plurals, and **Show files** lists every file that is not syncing and why.
+- **Fewer dead ends.** A device that was removed from your vault offers **Pair again…**
+  (after asking, because it replaces this device's key); any other refusal offers a harmless
+  **Try again**. While waiting for your browser you can open it again or cancel. **Sync
+  now** only appears when there is something it can do.
+- Connecting a device now highlights **Connect** and shows the vault id in a short form;
+  **Disconnect…** asks before it erases this device's key; messages are worded
+  consistently.
+
 ## 0.0.4
 
 - **A busy vault no longer stops a sync.** When the vault closes the connection it now says
