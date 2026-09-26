@@ -40,11 +40,9 @@
  * shape; the bump exists so that such a build is refused at the handshake with a sentence
  * telling its user to update, instead.
  *
- * **4: every closing says whether to retry** (bulk-ingest design BI1). `DownClosing` gained
- * `retry`, and this build decides from that field alone whether a closing is worth
- * reconnecting after — never from the reason's text. A v3 build reads any reason it does not
- * know as terminal, and a v4 vault sends new ones (`busy`), which is the whole bump: a build
- * that would stop syncing on them is refused at the handshake instead.
+ * **4: every closing says whether to retry** (bulk-ingest design BI1), in `retry`. A v3 build
+ * reads a reason it does not know as terminal, and a v4 vault sends new ones (`busy`), so such
+ * a build is refused at the handshake instead.
  */
 export const WIRE_VERSION = 4;
 
@@ -158,15 +156,10 @@ export interface BatchPutEntry {
 /**
  * Several puts in one frame (bulk-ingest design BI5), answered by one {@link DownAppliedBatch}.
  *
- * **Exactly `puts.length` binary frames follow, one per entry, in order** — entry i's WHOLE
- * content in frame i, a zero-length frame for an empty file, nothing interleaved. The vault
- * correlates by position, and a frame whose length is not its entry's `bytes` refuses that
- * entry alone. So only content that fits one frame is ever batched
- * ({@link PUT_CHUNK_BYTES}); anything larger goes alone as an ordinary chunked `put`.
- *
- * **Sent only to a vault that advertised it** in `ready` (`DownReady.max_batch_ops`). A vault
- * without it drops an unknown frame in silence, and the pump would wait for an answer that
- * never comes. Puts only: a delete or a rename is always its own frame.
+ * **Exactly `puts.length` binary frames follow, one per entry, in order** — entry i's whole
+ * content in frame i, zero-length for an empty file. The vault correlates by position, so only
+ * content that fits one frame ({@link PUT_CHUNK_BYTES}) is batched. Sent only to a vault that
+ * advertised it in `ready`; one without it drops the frame in silence.
  */
 export interface UpPutBatch {
   readonly type: "put_batch";
@@ -191,11 +184,8 @@ export interface DownChallenge {
 export interface DownReady {
   readonly type: "ready";
   readonly seq: number;
-  /**
-   * The most entries this vault takes in one {@link UpPutBatch}, and the most content bytes
-   * across them (bulk-ingest design BI5). **0 means "no batching"**, which is what a vault
-   * older than the frame looks like: it sends neither field, and every put goes singly.
-   */
+  /** The most entries, and content bytes, this vault takes in one {@link UpPutBatch} (BI5).
+   * **0 means "no batching"**: a vault older than the frame sends neither. */
   readonly max_batch_ops: number;
   readonly max_batch_bytes: number;
 }
@@ -240,12 +230,8 @@ export interface RefusedBatchEntry {
   readonly current_sha: string | null;
 }
 
-/**
- * The one answer to a {@link UpPutBatch} (bulk-ingest design BI5). **Every entry of the batch
- * appears in exactly one of the two lists**, keyed by path (a batch's paths are distinct). A
- * refused entry never refuses its neighbours: a stale base on one path is reconciled or
- * refused alone, and the rest land.
- */
+/** The one answer to a {@link UpPutBatch} (BI5): **every entry appears in exactly one of the
+ * two lists**, keyed by path. A refused entry never refuses its neighbours. */
 export interface DownAppliedBatch {
   readonly type: "applied_batch";
   readonly applied: readonly AppliedBatchEntry[];
@@ -272,12 +258,10 @@ export interface DownSnapshot {
 }
 
 /**
- * Whether a `closing` is worth reconnecting after (bulk-ingest design BI1).
- *
- * `later` is back off and reconnect: a handshake that timed out, a busy vault, a restart, an
- * idle close. `never` is stop until a person acts: an unknown or revoked device, a version
- * mismatch, a protocol bug. The decision is the vault's, made from its own typed reason, so
- * this build never has to parse a sentence to make it.
+ * Whether a `closing` is worth reconnecting after (bulk-ingest design BI1), decided by the
+ * vault: `later` (a handshake timeout, `busy`, a restart, an idle close) is back off and
+ * reconnect; `never` (an unknown or revoked device, a version mismatch) is stop until a person
+ * acts.
  */
 export type ClosingRetry = "later" | "never";
 

@@ -205,16 +205,13 @@ export class Pump {
   }
 
   /**
-   * Queue local changes and send, resolving each once the vault has answered it — one promise
-   * per change, in order. Every change is queued BEFORE anything is sent, so small puts leave
-   * as one `put_batch` rather than a lone `put` followed by a batch of the rest (BI5).
-   *
-   * **Single-flight, queued.** Changes queue behind whatever is in flight — see this module's
-   * header for why there is no other safe order.
+   * Queue local changes behind whatever is in flight, and send: one promise per change, in
+   * order, each resolved by the vault's answer. All are queued BEFORE anything is sent, so
+   * small puts leave as one `put_batch` (BI5).
    *
    * **Throws synchronously, before anything is queued**, for a `put` over `MAX_FRAME_BYTES`:
-   * `derive.ts` withholds such a file by its stat, so this is the second, load-bearing check
-   * (a file can grow between that stat and its read), and it names the change at fault.
+   * `derive.ts` withholds such a file by its stat, and a file can grow between that stat and
+   * its read.
    */
   pushAll(changes: readonly Change[]): Promise<ResultOutcome>[] {
     for (const change of changes) {
@@ -316,11 +313,8 @@ export class Pump {
     }
   }
 
-  /**
-   * The header, then exactly one binary frame per entry, in order — zero-length for an empty
-   * file, and nothing between them (`wire.ts`'s `UpPutBatch`). `planBatch` admits only puts
-   * that fit one frame, which is what makes one frame per entry possible.
-   */
+  /** The header, then exactly one binary frame per entry, in order (`wire.ts`'s
+   * `UpPutBatch`) — `planBatch` admits only puts that fit one frame. */
   private sendBatch(changes: readonly Change[]): void {
     const puts = changes.flatMap((c) => (c.op === "put" ? [c] : []));
     this.deps.transport.send({
@@ -386,13 +380,9 @@ export class Pump {
   }
 
   /**
-   * Settle every entry of the batch in flight from its one answer, by path.
-   *
-   * **An entry the answer does not name is rejected, not left pending.** The vault promises
-   * every entry appears in exactly one list; if one does not, waiting for it would hold the
-   * queue for good, and a rejection is what `main.ts` turns into "derive it again next
-   * settle". Both halves of a refusal behave as a single `refused` does: `onRefused`, then an
-   * outcome carrying it for `retry.ts`.
+   * Settle every entry of the batch in flight from its one answer, by path. **An entry the
+   * answer does not name is rejected**, not left to hold the queue for good; `main.ts`
+   * redirties it. A refused entry behaves as a single `refused` does.
    */
   private settleBatch(down: DownAppliedBatch): void {
     if (this.inFlight < 2) return; // Not an answer to anything outstanding — ignore it.
@@ -413,8 +403,7 @@ export class Pump {
         head.reject(new Error(`Ctrl Notes: the vault's batch answer did not name ${path}`));
       }
     }
-    // No `onCursor` here either, for `settlePush`'s reason: each entry's own echo arrives as
-    // an ordinary `Event` and advances the cursor when it lands.
+    // No `onCursor`, for `settlePush`'s reason: each entry's echo advances it.
     this.inFlight = 0;
     this.trySend();
   }

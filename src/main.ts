@@ -233,12 +233,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private parked = false;
   /**
    * The next `ready` reconnects a pair whose watchers kept running, so it skips the full
-   * rescan (VS5): it ends a park (set by `onIdle`) or a closing the vault said to retry after
-   * (set by `onClosing`, BI1 — a busy vault closes every few seconds during an import, and
-   * each rescan reads and hashes every file). Cleared by that `ready` and by
-   * `disconnectSyncing`, NOT by `wake` or a failed reconnect: those are still the same gap.
-   * An ordinary drop does not set it, so it rescans; nor does a closing before this pair's
-   * first `ready` (`readiedThisPair`), which has had no rescan yet.
+   * rescan (VS5): it ends a park (`onIdle`) or a closing the vault said to retry after
+   * (`onClosing`, BI1 — a busy import closes every few seconds). Cleared by that `ready` and
+   * by `disconnectSyncing`, not by a failed reconnect in between. A plain drop, and a closing
+   * before this pair's first `ready` (`readiedThisPair`), still rescan.
    */
   private watchersRan = false;
   /**
@@ -967,8 +965,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // — and it reads every file, so a large vault would pay a full scan each time a
             // phone came back to the foreground.
             //
-            // **Nor the reconnect after a closing the vault said to retry** (BI1), for the same
-            // reason: see `watchersRan`.
+            // Nor after a closing the vault said to retry (BI1): see `watchersRan`.
             //
             // A mobile device that went to the background meanwhile rescans anyway: its
             // watchers were suspended with the rest of its JavaScript.
@@ -1518,11 +1515,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         // Handing the changes back lets `ready`'s `settler.touch()` send them once.
         this.redirtyRemaining(changes);
       } else {
-        // All queued at once, so the pump can batch them (BI5). **Each outcome lands the
-        // moment its own answer does**, in queue order, not after the last: applied later, a
-        // push's ledger write would come after inbound events for the same path and overwrite
-        // them. A pump whose connection drops keeps its queue and re-sends on `resume()`; one
-        // that is abandoned rejects every promise, and a rejection is redirtied below.
+        // All queued at once, so the pump can batch them (BI5). **Each outcome applies the
+        // moment its own answer lands**: applied later, a push's ledger write would overwrite
+        // inbound events for the same path. A dropped connection keeps the pump's queue for
+        // `resume()`; an abandoned pump rejects, and a rejection is redirtied below.
         let left = changes.length;
         const failed: Change[] = [];
         const settled = pump.pushAll(changes).map((sent, i) => {

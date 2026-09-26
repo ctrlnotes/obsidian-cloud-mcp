@@ -31,18 +31,13 @@ export function batchLimitsFrom(ready: DownReady): BatchLimits | null {
  * How many changes at the head of `queue` to send next: 0 for an empty queue, n ≥ 2 for a
  * `put_batch` of the first n, and 1 for the head alone as its own frame.
  *
- * The batch is the longest PREFIX of the queue in which every change is a `put` that fits one
- * frame ({@link PUT_CHUNK_BYTES}) to a path not already taken, stopping at `maxOps` entries or
- * before the content would exceed `maxBytes`.
+ * The batch is the longest PREFIX of puts that each fit one frame ({@link PUT_CHUNK_BYTES}),
+ * to distinct paths, within `maxOps` and `maxBytes`.
  *
- * - **A prefix, never a pick.** The queue is in the order the device decided, and a delete or
- *   rename between two puts may be what makes the second one mean what it means. So the first
- *   change that cannot ride ends the batch, rather than being skipped over.
- * - **Distinct paths**, because the vault answers per path (`DownAppliedBatch`) and refuses a
- *   batch naming one twice.
- * - **A lone put stays a plain `put`** (n = 1, not a batch of one). A steady-state edit then
- *   takes exactly today's path, which is what G3 asks: nothing that makes a first sync fast
- *   may change steady-state sync.
+ * - **A prefix, never a pick**: a delete or rename between two puts may be what gives the
+ *   second its meaning, so the first change that cannot ride ends the batch.
+ * - **Distinct paths**: the vault answers per path and refuses a batch naming one twice.
+ * - **A lone put stays a plain `put`**, so steady-state sync is unchanged (G3).
  */
 export function planBatch(queue: readonly Change[], limits: BatchLimits | null): number {
   if (queue.length === 0) return 0;
