@@ -1,6 +1,7 @@
 import * as fc from "fast-check";
 import { describe, expect, it } from "vitest";
-import { BATCH_ENTRY_MAX_BYTES, type BatchLimits, planBatch } from "./batch.ts";
+import { PUT_CHUNK_BYTES } from "../wire.ts";
+import { type BatchLimits, planBatch } from "./batch.ts";
 import type { Change } from "./derive.ts";
 
 /**
@@ -11,7 +12,7 @@ import type { Change } from "./derive.ts";
 const path = fc.constantFrom("a.md", "b.md", "c.md", "d.md", "e.md", "f.md", "g.md", "h.md");
 const size = fc.oneof(
   fc.integer({ min: 0, max: 64 }),
-  fc.constantFrom(BATCH_ENTRY_MAX_BYTES, BATCH_ENTRY_MAX_BYTES + 1),
+  fc.constantFrom(PUT_CHUNK_BYTES, PUT_CHUNK_BYTES + 1),
 );
 const change: fc.Arbitrary<Change> = fc
   .oneof(
@@ -29,7 +30,7 @@ const change: fc.Arbitrary<Change> = fc
 const queue = fc.array(change, { maxLength: 30 });
 const limits: fc.Arbitrary<BatchLimits> = fc.record({
   maxOps: fc.integer({ min: 2, max: 12 }),
-  maxBytes: fc.integer({ min: 1, max: 2 * BATCH_ENTRY_MAX_BYTES }),
+  maxBytes: fc.integer({ min: 1, max: 2 * PUT_CHUNK_BYTES }),
 });
 
 const bytesOf = (c: Change): number => (c.op === "put" ? c.content.byteLength : 0);
@@ -37,7 +38,7 @@ const bytesOf = (c: Change): number => (c.op === "put" ? c.content.byteLength : 
 /** Whether `c` may join a batch already holding `taken` — every criterion but the op count. */
 const fits = (taken: readonly Change[], c: Change, l: BatchLimits): boolean =>
   c.op === "put" &&
-  c.content.byteLength <= BATCH_ENTRY_MAX_BYTES &&
+  c.content.byteLength <= PUT_CHUNK_BYTES &&
   !taken.some((t) => t.path === c.path) &&
   taken.reduce((sum, t) => sum + bytesOf(t), 0) + c.content.byteLength <= l.maxBytes;
 
@@ -77,7 +78,7 @@ describe("planBatch, as a property", () => {
         expect(batch.reduce((sum, c) => sum + bytesOf(c), 0)).toBeLessThanOrEqual(l.maxBytes);
         for (const c of batch) {
           expect(c.op).toBe("put");
-          expect(bytesOf(c)).toBeLessThanOrEqual(BATCH_ENTRY_MAX_BYTES);
+          expect(bytesOf(c)).toBeLessThanOrEqual(PUT_CHUNK_BYTES);
         }
         expect(new Set(batch.map((c) => c.path)).size).toBe(n);
       }),

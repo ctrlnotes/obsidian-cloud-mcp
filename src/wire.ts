@@ -80,6 +80,16 @@ export const MIN_WIRE_VERSION = 3;
  */
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
+/**
+ * How large one binary frame of a put's content is — and so the largest put a `put_batch`
+ * carries, since a batch entry is exactly one frame ({@link UpPutBatch}).
+ *
+ * **Not `MAX_FRAME_BYTES`.** That is the vault's wall on a WHOLE upload; this is how finely
+ * one upload is sliced on the way up, so a large attachment never holds the socket's send
+ * buffer at megabytes. The vault assembles any number of chunks (`Upload::push`).
+ */
+export const PUT_CHUNK_BYTES = 256 * 1024;
+
 // ---- Up: plugin -> vault ----
 
 export interface UpHello {
@@ -151,8 +161,8 @@ export interface BatchPutEntry {
  * **Exactly `puts.length` binary frames follow, one per entry, in order** — entry i's WHOLE
  * content in frame i, a zero-length frame for an empty file, nothing interleaved. The vault
  * correlates by position, and a frame whose length is not its entry's `bytes` refuses that
- * entry alone. So only content that fits one frame is ever batched (`sync/batch.ts`'s
- * `BATCH_ENTRY_MAX_BYTES`); anything larger goes alone as an ordinary chunked `put`.
+ * entry alone. So only content that fits one frame is ever batched
+ * ({@link PUT_CHUNK_BYTES}); anything larger goes alone as an ordinary chunked `put`.
  *
  * **Sent only to a vault that advertised it** in `ready` (`DownReady.max_batch_ops`). A vault
  * without it drops an unknown frame in silence, and the pump would wait for an answer that

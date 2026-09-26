@@ -11,11 +11,9 @@
 // is already in flight rather than racing it, because there would be no way to tell two
 // outstanding replies apart.
 //
-// **A `put_batch` is still one frame and one answer** (bulk-ingest design BI5). Against a
-// vault that advertised it in `ready`, consecutive small puts at the head of the queue go
-// together (`batch.ts`'s `planBatch` decides how many) and one `Down::AppliedBatch` answers
-// them all, keyed by path — the paths in a batch are distinct, so a path names exactly one
-// entry. Batching changes the unit, not the concurrency.
+// **A `put_batch` is still one frame and one answer** (bulk-ingest design BI5): consecutive
+// small puts at the head of the queue go together (`batch.ts`'s `planBatch`), and one
+// `Down::AppliedBatch` answers them all, keyed by their distinct paths.
 //
 // **§11: content addressing makes a retry a no-op.** A change is never removed from the
 // outbound queue until its own reply names it done — a connection dropping mid-upload
@@ -37,7 +35,7 @@ import type {
   SnapshotEntry,
   Up,
 } from "../wire.ts";
-import { MAX_FRAME_BYTES } from "../wire.ts";
+import { MAX_FRAME_BYTES, PUT_CHUNK_BYTES } from "../wire.ts";
 import {
   type Applied,
   type ApplyDeps,
@@ -48,23 +46,6 @@ import {
 import { type BatchLimits, planBatch } from "./batch.ts";
 import type { Change, DeriveOptions } from "./derive.ts";
 import { applyResult, type ResultOutcome } from "./results.ts";
-
-/**
- * How large one binary frame is while streaming a `put`'s content up.
- *
- * **Not `MAX_FRAME_BYTES`.** That is the vault's hard wall on the WHOLE upload
- * (`wire.ts`'s own doc comment; `derive.ts` already refuses a `Change` over it before one
- * is ever built) — this is a separate, much smaller choice about how many WebSocket frames
- * one upload is split into on the way up. A large attachment sent as a single message would
- * still be under the wall, but it would hold the socket's send buffer at multiple megabytes
- * for the duration; slicing it costs nothing on the wire (`Upload::push` in
- * `apps/vault/src/sync/upload.rs` already assembles arbitrarily many chunks) and never
- * blocks the socket for longer than one small write.
- *
- * **Also the largest put a `put_batch` carries**, because a batch entry is exactly one frame
- * (`batch.ts`'s `BATCH_ENTRY_MAX_BYTES`, which a test pins equal to this).
- */
-export const PUT_CHUNK_BYTES = 256 * 1024;
 
 /** The slice of `SyncSocket` this module drives — narrow, the same reasoning as
  * `device.ts`'s `SecretStorageHost`: a test hands this a plain object, never a real socket. */
@@ -171,10 +152,9 @@ export class Pump {
 
   private readonly pending: QueuedPush[] = [];
   /** How many entries at the head of `pending` the one outstanding frame carries: 0 when
-   * nothing is in flight, 1 for a single frame, n for a `put_batch` of n. */
+   * nothing is in flight, 1 for a single frame, n ≥ 2 for a `put_batch` (`planBatch` never
+   * plans a batch of one). */
   private inFlight = 0;
-  /** The outstanding frame is a `put_batch`, so only an `applied_batch` answers it. */
-  private inFlightBatch = false;
   /** What this connection's vault accepts in one `put_batch`, or `null` for no batching. Set
    * from each `ready`, because a reconnect may land on a vault with different limits. */
   private limits: BatchLimits | null = null;
@@ -219,80 +199,49 @@ export class Pump {
     }
   }
 
-  /**
-   * Send one local change and resolve once the vault has answered it.
-   *
-   * **Single-flight, queued.** A second call while one push is already outstanding is
-   * appended and sent only once the first resolves — see this module's header for why
-   * there is no other safe order. Queued changes may leave together as a `put_batch` once
-   * the one in flight is answered; {@link pushAll} is how a caller gets a batch from the
-   * start.
-   *
-   * **Throws synchronously, before anything is queued**, for a `put` over
-   * `MAX_FRAME_BYTES`. Checked here rather than at actual send time on purpose: this
-   * change might sit behind others in `pending` for a while, and a throw from deep inside
-   * `trySend` — reached later, from `settlePush` resolving something else entirely — would
-   * surface at a call site with no connection to the change that caused it. `derive.ts`
-   * already refuses anything this large before a `Change` is ever built, so reaching here
-   * at all means that guarantee broke somewhere upstream; this is the second, load-bearing
-   * place content leaves the device, not a decoration on the first.
-   */
+  /** {@link pushAll} for one change. */
   push(change: Change): Promise<ResultOutcome> {
-    const done = this.enqueue(change);
-    this.trySend();
-    return done;
+    return this.pushAll([change])[0] as Promise<ResultOutcome>;
   }
 
   /**
-   * {@link push} for several changes at once: every one is queued BEFORE anything is sent,
-   * so a window of small puts can leave as one `put_batch` rather than as a lone `put`
-   * followed by a batch of the rest (bulk-ingest design BI5).
+   * Queue local changes and send, resolving each once the vault has answered it — one promise
+   * per change, in order. Every change is queued BEFORE anything is sent, so small puts leave
+   * as one `put_batch` rather than a lone `put` followed by a batch of the rest (BI5).
    *
-   * **`push` alone cannot do that.** It sends at once when nothing is in flight, so a caller
-   * pushing a hundred changes in a loop would send the first by itself — a second round trip
-   * for every window, for nothing.
+   * **Single-flight, queued.** Changes queue behind whatever is in flight — see this module's
+   * header for why there is no other safe order.
    *
-   * One promise per change, in order. A change `push` would have thrown for (over
-   * `MAX_FRAME_BYTES`) gets a rejected promise instead and is not queued, so one bad change
-   * never stops its neighbours.
+   * **Throws synchronously, before anything is queued**, for a `put` over `MAX_FRAME_BYTES`:
+   * `derive.ts` withholds such a file by its stat, so this is the second, load-bearing check
+   * (a file can grow between that stat and its read), and it names the change at fault.
    */
   pushAll(changes: readonly Change[]): Promise<ResultOutcome>[] {
-    const done = changes.map((change) => {
-      try {
-        return this.enqueue(change);
-      } catch (e) {
-        return Promise.reject(e instanceof Error ? e : new Error(String(e)));
+    for (const change of changes) {
+      if (change.op === "put" && change.content.byteLength > MAX_FRAME_BYTES) {
+        throw new Error(
+          `Ctrl Notes: refusing to send ${change.path}: ${change.content.byteLength} bytes ` +
+            `exceeds MAX_FRAME_BYTES (${MAX_FRAME_BYTES})`,
+        );
       }
-    });
+    }
+    const done = changes.map(
+      (change) =>
+        new Promise<ResultOutcome>((resolve, reject) => {
+          this.pending.push({ change, resolve, reject });
+        }),
+    );
     this.trySend();
     return done;
   }
 
   /**
-   * What this connection's vault accepts in one `put_batch` (`batch.ts`'s `batchLimitsFrom`),
-   * or `null` for no batching. Call from each `ready`, BEFORE `resume()`, so the re-send of
-   * whatever was in flight is planned against the vault that is actually there.
+   * What this connection's vault accepts in one `put_batch` (`batch.ts`'s `batchLimitsFrom`).
+   * Call from each `ready`, BEFORE `resume()`, so the re-send of whatever was in flight is
+   * planned against the vault that is actually there.
    */
   setBatchLimits(limits: BatchLimits | null): void {
     this.limits = limits;
-  }
-
-  /** How many changes a caller should hand {@link pushAll} at once: a whole batch when the
-   * vault takes them, one otherwise — which is exactly today's one-at-a-time loop. */
-  windowSize(): number {
-    return this.limits?.maxOps ?? 1;
-  }
-
-  private enqueue(change: Change): Promise<ResultOutcome> {
-    if (change.op === "put" && change.content.byteLength > MAX_FRAME_BYTES) {
-      throw new Error(
-        `Ctrl Notes: refusing to send ${change.path}: ${change.content.byteLength} bytes ` +
-          `exceeds MAX_FRAME_BYTES (${MAX_FRAME_BYTES})`,
-      );
-    }
-    return new Promise((resolve, reject) => {
-      this.pending.push({ change, resolve, reject });
-    });
   }
 
   /**
@@ -307,7 +256,6 @@ export class Pump {
    */
   resume(): void {
     this.inFlight = 0;
-    this.inFlightBatch = false;
     this.trySend();
   }
 
@@ -336,7 +284,6 @@ export class Pump {
   abandon(): void {
     const queued = this.pending.splice(0, this.pending.length);
     this.inFlight = 0;
-    this.inFlightBatch = false;
     for (const q of queued) {
       q.reject(
         new Error(`Ctrl Notes: sync connection closed before ${q.change.path} was acknowledged`),
@@ -352,7 +299,6 @@ export class Pump {
     );
     const heads = this.pending.slice(0, n);
     this.inFlight = n;
-    this.inFlightBatch = n >= 2;
     try {
       if (n >= 2) this.sendBatch(heads.map((q) => q.change));
       else if (heads[0] !== undefined) this.sendChange(heads[0].change);
@@ -366,7 +312,6 @@ export class Pump {
       // owns the retry. Anything queued behind them waits for the next `resume()`.
       this.pending.splice(0, n);
       this.inFlight = 0;
-      this.inFlightBatch = false;
       for (const head of heads) head.reject(e);
     }
   }
@@ -415,10 +360,9 @@ export class Pump {
   }
 
   private settlePush(down: DownApplied | DownRefused): void {
-    // A batch is answered by `applied_batch` alone. A single answer arriving now names
-    // nothing this device is waiting on, and taking the batch's head for it would settle
-    // that entry with another frame's verdict.
-    if (this.inFlightBatch) return;
+    // A batch is answered by `applied_batch` alone: a single answer now names nothing this
+    // device is waiting on.
+    if (this.inFlight > 1) return;
     const head = this.pending.shift();
     this.inFlight = 0;
     if (head === undefined) return; // A reply with nothing outstanding — ignore, not throw.
@@ -451,7 +395,7 @@ export class Pump {
    * outcome carrying it for `retry.ts`.
    */
   private settleBatch(down: DownAppliedBatch): void {
-    if (!this.inFlightBatch) return; // Not an answer to anything outstanding — ignore it.
+    if (this.inFlight < 2) return; // Not an answer to anything outstanding — ignore it.
     const heads = this.pending.splice(0, this.inFlight);
     const applied = new Map(down.applied.map((e) => [e.path, e]));
     const refused = new Map(down.refused.map((e) => [e.path, e]));
@@ -472,7 +416,6 @@ export class Pump {
     // No `onCursor` here either, for `settlePush`'s reason: each entry's own echo arrives as
     // an ordinary `Event` and advances the cursor when it lands.
     this.inFlight = 0;
-    this.inFlightBatch = false;
     this.trySend();
   }
 

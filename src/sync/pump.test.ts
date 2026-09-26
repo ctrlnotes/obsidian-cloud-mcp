@@ -10,11 +10,11 @@ import type {
   Up,
   UpPutBatch,
 } from "../wire.ts";
-import { MAX_FRAME_BYTES } from "../wire.ts";
+import { MAX_FRAME_BYTES, PUT_CHUNK_BYTES } from "../wire.ts";
 import type { ApplyDeps, VaultFiles } from "./apply.ts";
 import type { Change } from "./derive.ts";
 import { contentHash } from "./hash.ts";
-import { PUT_CHUNK_BYTES, Pump, type PumpDeps, type SyncTransport } from "./pump.ts";
+import { Pump, type PumpDeps, type SyncTransport } from "./pump.ts";
 import { planRetry } from "./retry.ts";
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
@@ -896,7 +896,6 @@ describe("Pump — put_batch", () => {
     void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: "sha-a.md" });
     await done[0];
     expect(h.transport.sent.map((u) => u.type)).toEqual(["put", "put"]);
-    expect(h.pump.windowSize()).toBe(1);
   });
 
   it("rejects an entry the answer does not name, rather than leaving it pending", async () => {
@@ -976,27 +975,11 @@ describe("Pump — put_batch", () => {
     expect(h.transport.sent).toEqual([]);
   });
 
-  it("pushAll rejects an oversize change alone and still sends the rest", async () => {
+  it("pushAll throws for an oversize change before queuing or sending any", () => {
     const h = batching();
     const huge = put("huge.bin", MAX_FRAME_BYTES + 1);
-    const [a, bad, b] = h.pump.pushAll([put("a.md"), huge, put("b.md")]);
-    await expect(bad).rejects.toThrow(/MAX_FRAME_BYTES/);
-    expect(batches(h)[0]?.puts.map((p) => p.path)).toEqual(["a.md", "b.md"]);
-    void answer(h, {
-      applied: [
-        { path: "a.md", seq: 1, sha: "sha-a.md" },
-        { path: "b.md", seq: 2, sha: "sha-b.md" },
-      ],
-      refused: [],
-    });
-    await a;
-    await b;
-  });
-
-  it("offers a window of a whole batch only while the vault takes them", () => {
-    const h = harness();
-    expect(h.pump.windowSize()).toBe(1);
-    h.pump.setBatchLimits(LIMITS);
-    expect(h.pump.windowSize()).toBe(100);
+    expect(() => h.pump.pushAll([put("a.md"), huge, put("b.md")])).toThrow(/MAX_FRAME_BYTES/);
+    expect(h.transport.sent).toEqual([]);
+    expect(h.pump.hasOutstanding()).toBe(false);
   });
 });

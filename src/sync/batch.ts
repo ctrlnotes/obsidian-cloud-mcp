@@ -1,15 +1,13 @@
 // Which queued changes travel together as one `put_batch` (bulk-ingest design BI5).
 //
-// **Batching changes the unit, not the concurrency.** The pump is still single-flight: one
-// frame out, one answer back, then the next. What a batch changes is how much one round trip
-// carries — a first sync of 20,000 notes was 20,000 round trips, and the round trips, not the
-// vault's CPU, were what bounded it (design §5). A hundred puts per frame makes it ~200.
+// **Batching changes the unit, not the concurrency.** The pump is still single-flight; a batch
+// changes how much one round trip carries — a first sync of 20,000 notes was 20,000 round
+// trips, and those, not the vault's CPU, bounded it (design §5).
 //
-// **Pure, and the pump's only batching decision.** `planBatch` looks at the head of the queue
-// and says how many entries go next; `pump.ts` sends them. Everything a batch may not contain
-// is decided here, so it can be tested as a property rather than through a socket.
+// **Pure, and the pump's only batching decision**, so it is tested as a property rather than
+// through a socket.
 
-import type { DownReady } from "../wire.ts";
+import { type DownReady, PUT_CHUNK_BYTES } from "../wire.ts";
 import type { Change } from "./derive.ts";
 
 /** What the vault said it accepts in one `put_batch`, from its `ready`. */
@@ -19,26 +17,13 @@ export interface BatchLimits {
 }
 
 /**
- * The largest put that may ride in a batch: one binary frame's worth.
- *
- * **One frame per entry is the wire's rule** (`wire.ts`'s `UpPutBatch`): the vault correlates
- * binary frames with entries by position, so an entry cannot be split. This is the size the
- * pump already slices an ordinary put into (`pump.ts`'s `PUT_CHUNK_BYTES`, pinned equal by a
- * test), so anything that fits one chunk today fits one batch frame, and anything larger — an
- * image, a PDF — goes alone as today's chunked `put`.
- */
-export const BATCH_ENTRY_MAX_BYTES = 256 * 1024;
-
-/**
- * The vault's batch limits, or `null` when it offers none.
- *
- * `null` for a vault older than the frame (both fields absent, decoded as 0) and for one that
- * offers a batch of one, which is no batch at all. **Sending a `put_batch` to a vault that
- * did not advertise it would stall sync for good**: such a vault drops an unknown frame in
- * silence, and the pump would wait for an answer that never comes.
+ * The vault's batch limits, or `null` for a vault older than the frame (fields absent, decoded
+ * as 0). **Sending a `put_batch` to a vault that did not advertise it would stall sync for
+ * good**: such a vault drops an unknown frame in silence, and the pump would wait for an
+ * answer that never comes.
  */
 export function batchLimitsFrom(ready: DownReady): BatchLimits | null {
-  if (ready.max_batch_ops < 2 || ready.max_batch_bytes <= 0) return null;
+  if (ready.max_batch_ops <= 0) return null;
   return { maxOps: ready.max_batch_ops, maxBytes: ready.max_batch_bytes };
 }
 
@@ -46,8 +31,8 @@ export function batchLimitsFrom(ready: DownReady): BatchLimits | null {
  * How many changes at the head of `queue` to send next: 0 for an empty queue, n ≥ 2 for a
  * `put_batch` of the first n, and 1 for the head alone as its own frame.
  *
- * The batch is the longest PREFIX of the queue in which every change is a `put` of at most
- * {@link BATCH_ENTRY_MAX_BYTES} to a path not already taken, stopping at `maxOps` entries or
+ * The batch is the longest PREFIX of the queue in which every change is a `put` that fits one
+ * frame ({@link PUT_CHUNK_BYTES}) to a path not already taken, stopping at `maxOps` entries or
  * before the content would exceed `maxBytes`.
  *
  * - **A prefix, never a pick.** The queue is in the order the device decided, and a delete or
@@ -69,7 +54,7 @@ export function planBatch(queue: readonly Change[], limits: BatchLimits | null):
     if (n >= limits.maxOps) break;
     if (change.op !== "put") break;
     const size = change.content.byteLength;
-    if (size > BATCH_ENTRY_MAX_BYTES) break;
+    if (size > PUT_CHUNK_BYTES) break;
     if (taken.has(change.path)) break;
     if (bytes + size > limits.maxBytes) break;
     taken.add(change.path);

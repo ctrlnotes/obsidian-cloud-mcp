@@ -1524,61 +1524,51 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         unsyncable: this.shadowed.length + this.withheld.size,
       });
 
-      // A window at a time: a whole batch against a vault that takes them (BI5), one change
-      // against one that does not — which is exactly the one-at-a-time loop this replaced.
-      // The window is re-read each time round, because a reconnect in the middle of a long
-      // first sync may land on a vault with different limits.
-      for (let start = 0; start < changes.length; ) {
-        const pump = this.pump;
-        if (pump === null || this.socket?.isReady !== true) {
-          // Disconnected mid-loop (unpair, a terminal closing, or unload). This window and
-          // everything still behind it in `changes` were derived from `touched` but never
-          // sent — blocker fix: losing them here silently drops the rest of this settle's
-          // batch, not just the one change that happened to be at the front.
-          //
-          // **Or not ready yet**, which is checked again here because the derive awaits: an
-          // idle close that landed mid-derive has woken the device, and its reconnect may
-          // still be handshaking when the derive finishes. Sending then throws inside the
-          // pump; handing the changes back instead lets `ready`'s `settler.touch()` derive
-          // and send them once, on a connection that can carry them.
-          this.redirtyRemaining(changes.slice(start));
-          break;
-        }
-        const slice = changes.slice(start, start + pump.windowSize());
-        // **Each outcome lands the moment its own answer does, not when the window's last
-        // does.** A window can hold a batch and then a large put sent after it, several round
-        // trips later; the vault meanwhile drains the batch's echoes and other devices'
-        // events. Applied only after `allSettled`, a push's ledger write came AFTER those
-        // inbound events for the same path: an echo of a merge found no ledger entry and was
-        // "kept" as a local edit, and another device's edit, already applied to disk and
-        // ledger, had its ledger hash overwritten by this push's older one — so the next
-        // inbound edit there read as local, was skipped, and re-uploaded against the wrong
-        // base. The pump settles in queue order, so outcomes for one path still apply in the
-        // order the queue sent them, and each in the same macrotask as its answer, as the
-        // one-at-a-time loop this replaced did with `await pump.push(change)`.
-        const tracked = pump.pushAll(slice).map((p) =>
-          p.then((outcome) => {
-            this.applyPushOutcome(outcome);
-          }),
-        );
-        const settled = await Promise.allSettled(tracked);
+      const pump = this.pump;
+      if (pump === null || this.socket?.isReady !== true) {
+        // Disconnected (unpair, a terminal closing, or unload): these changes were derived
+        // from `touched` but never sent, and losing them would drop the whole settle.
+        //
+        // **Or not ready yet**, checked here because the derive awaits: an idle close that
+        // landed mid-derive has woken the device, and its reconnect may still be handshaking.
+        // Handing the changes back lets `ready`'s `settler.touch()` send them once.
+        this.redirtyRemaining(changes);
+      } else {
+        // All queued at once, so the pump can batch them (BI5). **Each outcome lands the
+        // moment its own answer does**, in queue order, not after the last: applied later, a
+        // push's ledger write would come after inbound events for the same path and overwrite
+        // them. A pump whose connection drops keeps its queue and re-sends on `resume()`; one
+        // that is abandoned rejects every promise, and a rejection is redirtied below.
+        let left = changes.length;
         const failed: Change[] = [];
-        for (const [i, result] of settled.entries()) {
-          if (result.status === "fulfilled") continue;
-          const change = slice[i] as Change;
-          console.warn(`Ctrl Notes: could not send ${change.path}`, result.reason);
-          failed.push(change);
-        }
-        start += slice.length;
-        // Progress an import can see: the count falls a window at a time, not all at once
-        // at the end.
-        this.setStatus({ pending: changes.length - start });
-        if (failed.length > 0) {
-          // Retried on the next settle, not lost — the same blocker fix: whatever failed in
-          // this window and everything behind it, not only the one that threw.
-          this.redirtyRemaining([...failed, ...changes.slice(start)]);
-          break;
-        }
+        const settled = pump.pushAll(changes).map((sent, i) => {
+          const change = changes[i] as Change;
+          return sent
+            .then(
+              (outcome) => {
+                try {
+                  this.applyPushOutcome(outcome);
+                } catch (e) {
+                  console.warn(
+                    `Ctrl Notes: ${change.path} reached the vault, but recording its answer failed`,
+                    e,
+                  );
+                  failed.push(change);
+                }
+              },
+              (e: unknown) => {
+                console.warn(`Ctrl Notes: could not send ${change.path}`, e);
+                failed.push(change);
+              },
+            )
+            .finally(() => {
+              left--;
+              this.setStatus({ pending: left });
+            });
+        });
+        await Promise.all(settled);
+        // Retried on the next settle, not lost.
+        this.redirtyRemaining(failed);
       }
       this.setStatus({ pending: 0 });
     } catch (e) {
