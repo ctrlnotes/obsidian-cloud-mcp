@@ -1,0 +1,7 @@
+{
+  "vault": { "vault_id": "e000518f8653638e404ca98c6d0a8f10", "name": "Work" },
+  "agents": [
+    { "name": "Claude Code", "capability": "rw", "issued_at": 1790370000000, "last_used_at": 1790373000000, "expires_at": 1797000000000 },
+    { "name": null, "capability": "r", "issued_at": 1790000000000, "last_used_at": null, "expires_at": 1797000000000 }
+  ]
+}

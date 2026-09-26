@@ -33,9 +33,12 @@ community directory asks plugins to state the following up front, and so do we.
 - **It uses the network, and only these services:**
   - `https://sync.ctrlnotes.app`: the Ctrl Notes control plane. This device registers a
     pairing request there, and the sync connection (a WebSocket) is made to it. The
-    control plane routes that connection to your vault and never stores your notes.
+    control plane routes that connection to your vault and never stores your notes. When
+    you open the plugin's settings, it also asks the control plane for your vault's name
+    and the list of agents that can reach it, to show them there.
   - `https://ctrlnotes.app`: opened in **your browser**, not by the plugin, when you pair
-    a device. It is where you sign in and choose which vault this device joins.
+    a device or press **Manage devices** or **Manage agents**. It is where you sign in and
+    choose which vault this device joins.
   - Your Ctrl Notes vault, reached only through the control plane. It holds the synced
     copy of your notes and attachments.
 
@@ -87,7 +90,7 @@ https://mcp.ctrlnotes.app/mcp
 In Claude Code:
 
 ```bash
-claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp
+claude mcp add --transport http --scope user ctrlnotes https://mcp.ctrlnotes.app/mcp
 ```
 
 Then run `/mcp` in Claude Code and authenticate. Your browser opens at ctrlnotes.app:
@@ -127,7 +130,14 @@ A few things to know:
 
 ## Settings, and what "Disconnect this device" does
 
-Two addresses, both prefilled with the hosted service's and both editable:
+The pane opens on this device's sync status, then the vault and this device, then the
+**Agents** that can reach the vault: each one's name, whether it can read only or read and
+write, and when it was last used. If a count of files that are not syncing appears,
+**Show files** lists each one and why. On desktop, the same status is in Obsidian's status
+bar; click it to open these settings.
+
+Under **Advanced**, at the end, are two addresses, both prefilled with the hosted
+service's and both editable:
 
 - **Control plane**: where this device registers a pairing and where the sync connection
   is made. This is the *direct* hostname (`https://sync.ctrlnotes.app`), not the web
@@ -139,7 +149,7 @@ There is deliberately **no vault-id field**. The vault is chosen in the browser,
 vaults you own, and adopted here only after you confirm it in Obsidian.
 
 **"Disconnect this device" is local.** It forgets this device's registration and erases
-its private key from this computer, so this installation can no longer prove it is that
+its private key from this device, so this installation can no longer prove it is that
 device. It is **not** a revocation: the vault keeps trusting the registration until it is
 removed from the device list at ctrlnotes.app. If a device is lost, revoke it there;
 disconnecting on a device you still hold is not a substitute.
@@ -147,7 +157,10 @@ disconnecting on a device you still hold is not a substitute.
 If a device is revoked while it is running, the vault refuses its next connection with a
 deliberately uninformative *"not authorised"*, the same answer an unknown device gets, so
 that nobody can probe which devices exist. The settings pane explains what that most
-likely means.
+likely means, and offers **Pair again…**, which asks first: pairing again erases this
+device's key, and the old registration stays in the device list until it is removed
+there. Any other refusal is offered **Try again**, which keeps the registration; **Sync
+now** in the command palette does the same.
 
 ## Security
 

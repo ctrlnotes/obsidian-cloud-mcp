@@ -93,7 +93,14 @@ describe("README.md", () => {
 
   // The listing sells the plugin as a way to reach an agent, so the README has to say how.
   // The disclosure that the plugin never calls the MCP server is pinned on its truth as
-  // well as its wording: no shipped source names the address.
+  // well as its wording.
+  //
+  // **Narrowed on 2026-09-25, not dropped.** This used to say no shipped source names the
+  // address at all. The settings pane's empty Agents list now SHOWS the command that connects
+  // Claude Code, which has to contain it — so the address may appear in exactly one place:
+  // `settings-tab.ts`'s `CONNECT_CLAUDE_CODE`, a string drawn as text, in a module that makes
+  // no request of any kind. Anything else naming it, or that module growing a transport,
+  // fails here as before.
   it("names the MCP server an agent connects to, and the plugin never calls it", () => {
     expect(readme).toMatch(/https:\/\/mcp\.ctrlnotes\.app\/mcp/);
     expect(readme).toMatch(/used\s+by\s+the\s+agent,\s+never\s+by\s+this\s+plugin/i);
@@ -101,10 +108,23 @@ describe("README.md", () => {
       recursive: true,
       encoding: "utf8",
     }).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts") && !f.startsWith("testing"));
+    const naming: string[] = [];
     for (const file of shipped) {
       const source = readFileSync(new URL(`src/${file}`, ROOT), "utf8");
-      expect(source, file).not.toMatch(/mcp\.ctrlnotes\.app/);
+      const lines = source.split("\n").filter((l) => /mcp\.ctrlnotes\.app/.test(l));
+      if (lines.length === 0) continue;
+      naming.push(file);
+      expect(lines, file).toEqual([
+        '  "claude mcp add --transport http --scope user ctrlnotes https://mcp.ctrlnotes.app/mcp";',
+      ]);
+      expect(source, file).toMatch(/export const CONNECT_CLAUDE_CODE =\n {2}"claude mcp add/);
+      // Code, not comments: the comments here discuss `requestUrl` freely.
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      expect(code, file).not.toMatch(
+        /\b(?:request|requestUrl|fetch|fetchOverview)\(|new WebSocket|openInSystemBrowser/,
+      );
     }
+    expect(naming).toEqual(["settings-tab.ts"]);
   });
 
   it("names no agent client that has not been tested end to end", () => {

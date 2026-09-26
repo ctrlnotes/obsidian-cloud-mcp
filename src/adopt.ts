@@ -47,6 +47,8 @@
 import { type App, Modal, Setting } from "obsidian";
 import { reasonFrom, request } from "./controlplane-http.ts";
 import type { BoundPairing, RetrieveResult } from "./pairing-intent.ts";
+import { PRODUCT_NAME } from "./product.ts";
+import { shortId } from "./short-id.ts";
 
 /** What the user is being asked to agree to, and everything the redemption needs. */
 export interface AdoptionOffer {
@@ -65,6 +67,14 @@ export interface AdoptionOffer {
 export interface AdoptionCopy {
   readonly title: string;
   readonly body: readonly string[];
+  /**
+   * The vault id as a person reads one — a short, grouped prefix (`short-id.ts`) — drawn
+   * monospaced on its own line after the sentence that introduces it, rather than 32 hex
+   * characters in the middle of that sentence.
+   */
+  readonly vaultIdShown: string;
+  /** What the user is told after the id: the question they can actually answer. */
+  readonly after: readonly string[];
   readonly confirmText: string;
   readonly cancelText: string;
 }
@@ -81,17 +91,23 @@ export interface AdoptionCopy {
  * The line that actually does work is the last one. In the attack the victim's browser
  * showed a 409 for a choice they never completed, so "cancel if you did not just finish
  * this in your browser" is a question they can answer from what they have just seen.
+ *
+ * **The id is shortened, and that costs nothing here.** It never was the defence (above),
+ * and the eight characters shown are the ones the web app shows beside the same vault.
  */
 export const adoptionCopy = (offer: AdoptionOffer): AdoptionCopy => ({
   title: "Connect this device?",
   body: [
-    `Connect the Obsidian vault "${offer.obsidianVaultName}" to the Ctrl Notes vault you ` +
+    `Connect the Obsidian vault "${offer.obsidianVaultName}" to the ${PRODUCT_NAME} vault you ` +
       `just chose in your browser.`,
     "That vault gets full read and write access to these notes: it can add files here, " +
       "change them, and delete them.",
-    "This device cannot check which vault this is. It only knows the id " +
-      `${offer.vaultId}. If you did not just finish connecting this device in your ` +
-      "browser, or your browser showed an error, cancel.",
+    "This device cannot check which vault this is. All it knows is the vault's ID:",
+  ],
+  vaultIdShown: shortId(offer.vaultId),
+  after: [
+    "If you did not just finish connecting this device in your browser, or your browser " +
+      "showed an error, cancel.",
   ],
   confirmText: "Connect",
   cancelText: "Cancel",
@@ -135,12 +151,20 @@ class AdoptionModal extends Modal {
     const copy = adoptionCopy(this.offer);
     this.titleEl.setText(copy.title);
     for (const line of copy.body) this.contentEl.createEl("p", { text: line });
+    this.contentEl.createEl("p").createEl("code", { text: copy.vaultIdShown });
+    for (const line of copy.after) this.contentEl.createEl("p", { text: line });
+    // **Cancel first, and nothing takes focus from it**: the default — what Enter presses —
+    // is the answer that changes nothing. Connect is styled as the call to action because it
+    // is the one the flow is for, not because it is the safe one.
     new Setting(this.contentEl)
       .addButton((button) =>
         button.setButtonText(copy.cancelText).onClick(() => this.answer(false)),
       )
       .addButton((button) =>
-        button.setButtonText(copy.confirmText).onClick(() => this.answer(true)),
+        button
+          .setButtonText(copy.confirmText)
+          .setCta()
+          .onClick(() => this.answer(true)),
       );
   }
 

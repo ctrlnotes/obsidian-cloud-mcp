@@ -9,6 +9,7 @@ import {
   settingRows,
   settingsText,
 } from "./testing/fake-obsidian.ts";
+import { settingsHostDefaults } from "./testing/fake-settings-host.ts";
 
 /**
  * The two origins this plugin cannot derive from anything else, and what the tab does to a
@@ -45,6 +46,7 @@ const fakeHost = (
     onPairingChange: () => () => {},
     // `Plugin.register` — the tab hands it the pairing subscription to own.
     register: () => {},
+    ...settingsHostDefaults(),
     ...overrides,
   };
   return { host: host as unknown as Plugin & SettingsHost, calls };
