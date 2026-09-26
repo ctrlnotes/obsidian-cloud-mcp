@@ -557,6 +557,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     item.addClass("mod-clickable");
     item.setAttr("data-tooltip-position", "top");
     const icon = item.createSpan({ cls: "status-bar-item-icon" });
+    // **The gap is a character, not a style.** Obsidian's own status-bar items are icon-only,
+    // so nothing native spaces an icon from a word: measured in 1.13.7, the two touched
+    // ("⚠Error"). With no stylesheet (above), a no-break space is the one gap that cannot
+    // collapse. Screen readers are unaffected — `aria-label` carries the whole sentence.
+    item.createSpan({ text: " " });
     const word = item.createSpan();
     const draw = (): void => {
       const face = statusBarFace(this.isPaired() ? this.status : null);
