@@ -3,9 +3,22 @@ import {
   Notice,
   type Plugin,
   PluginSettingTab,
+  type Setting,
   type SettingDefinitionItem,
+  type SettingGroupItem,
 } from "obsidian";
-import { describeStatus, type SyncStatus } from "./sync/status.ts";
+import { askToConfirm, type ConfirmCopy, showSkippedFiles } from "./modals.ts";
+import { capabilityText, lastUsedText, type OverviewResult } from "./overview.ts";
+import { PRODUCT_NAME } from "./product.ts";
+import { shortId } from "./short-id.ts";
+import {
+  type SkippedFile,
+  type StatusReport,
+  type SyncStatus,
+  statusReport,
+} from "./sync/status.ts";
+
+export { PRODUCT_NAME };
 
 /**
  * Everything the tab needs of "the plugin" — a narrow interface it owns, the same shape
@@ -69,6 +82,25 @@ export interface SettingsHost {
   onStatusChange(listener: (status: SyncStatus) => void): () => void;
   /** Fires when this device starts, finishes or abandons a pairing. */
   onPairingChange(listener: () => void): () => void;
+
+  /** The files behind the status's three counts, each with its reason. */
+  skippedFiles(): readonly SkippedFile[];
+  /**
+   * `GET /v1/sync/overview`, signed with the same routing proof as the sync socket. Never
+   * rejects: every failure is a value, because this section must never break the pane.
+   */
+  loadOverview(): Promise<OverviewResult>;
+  /** The plugin's one wall clock (`main.ts`'s `now` seam), for "last used 3 days ago". */
+  now(): number;
+  /** Open a web app page in the system browser — the same call pairing uses. */
+  openInBrowser(url: string): void;
+  /**
+   * Send the browser back to the pair page for the intent this device is waiting on.
+   * `false` when there is no persisted intent to rebuild the link from.
+   */
+  reopenPairingPage(): boolean;
+  /** Stop waiting: forget the local intent and stop polling for it. Nothing is sent. */
+  cancelPairing(): void;
 }
 
 /**
@@ -86,17 +118,6 @@ export const DEFAULT_CONTROLPLANE_ORIGIN = "https://sync.ctrlnotes.app";
 export const DEFAULT_WEB_APP_ORIGIN = "https://ctrlnotes.app";
 
 /**
- * The product's name, for UI text that names it. **Interpolated, not written into the
- * literal**: `obsidianmd/ui/sentence-case` does not know it is a brand and wants "ctrl
- * notes" in a plain string, which is why four notices said "ctrlrouter" until 2026-09-24.
- * The rule checks only a plain string or a template with no expressions, so a message
- * that interpolates this is not case-checked at all — the brand is not exempted, the
- * whole string is. We assume the directory's scan runs with its own configuration rather
- * than this repository's, so a `brands` option here would not reach it (unverified).
- */
-export const PRODUCT_NAME = "Ctrl Notes";
-
-/**
  * **Declarative, on Obsidian 1.13's settings API** (`getSettingDefinitions`), so the pane's
  * rows appear in Obsidian's settings search. It was an imperative `display()` until
  * `minAppVersion` reached 1.13; `display()` is deprecated there, and the directory's review
@@ -105,8 +126,29 @@ export const PRODUCT_NAME = "Ctrl Notes";
  * The pane has three faces — unpaired, waiting for the browser, connected — and each row
  * says which it belongs to with `visible`. A pairing starting, finishing or being
  * abandoned calls `update()`, which re-reads the definitions and redraws an open pane.
+ *
+ * **Status and the primary action first; the two addresses last, under Advanced.** Nearly
+ * nobody changes either — the shipped defaults are the deployment — and a pane that opened
+ * on two text boxes of hostnames read as a form to fill in before anything would work.
  */
 export class CtrlNotesSettingsTab extends PluginSettingTab {
+  /**
+   * The agents list, and the vault name that arrives with it. `idle` means "not asked for
+   * since the pane last opened", which is what `ensureAgents` acts on.
+   */
+  private agents: AgentsState = { status: "idle" };
+  /**
+   * Bumped whenever the pane closes or a refresh starts, so an answer that lands after
+   * either is dropped rather than written over a newer state. `requestUrl` has no abort.
+   */
+  private generation = 0;
+
+  /**
+   * The confirmation before Disconnect, as a seam: the real modal by default, the same
+   * shape `main.ts`'s `confirmAdoption` has.
+   */
+  confirm: (copy: ConfirmCopy) => Promise<boolean> = (copy) => askToConfirm(this.app, copy);
+
   constructor(
     app: App,
     private readonly host: Plugin & SettingsHost,
@@ -119,33 +161,23 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
     host.register(host.onPairingChange(() => this.update()));
   }
 
+  /**
+   * Closing the pane forgets the agents list, so the next open asks again. **Loaded when the
+   * pane opens and on Refresh, never on a timer**: which agents can reach a vault changes when
+   * somebody changes it in the web app, and polling for that from every open Obsidian would
+   * cost the control plane a request a minute per device for a list nobody is looking at.
+   */
+  override hide(): void {
+    super.hide();
+    this.generation += 1;
+    this.agents = { status: "idle" };
+  }
+
   override getSettingDefinitions(): SettingDefinitionItem[] {
     const connected = (): boolean => this.host.deviceId !== null;
     const waiting = (): boolean => !connected() && this.host.pairingInFlight;
     const unpaired = (): boolean => !connected() && !this.host.pairingInFlight;
     return [
-      {
-        name: "Control plane",
-        desc:
-          "Where this device registers a pairing and looks up its result. Use the direct " +
-          `hostname (${DEFAULT_CONTROLPLANE_ORIGIN}), not the web app's: this plugin is not a ` +
-          "browser, and the sync connection is made to this address too.",
-        control: {
-          type: "text",
-          key: "controlplaneOrigin",
-          placeholder: DEFAULT_CONTROLPLANE_ORIGIN,
-        },
-      },
-      // **A separate origin, not a derivation of the first** (design §7). The web app and
-      // the control plane may be different hosts, and on the shipped deployment they are:
-      // one is behind Cloudflare's Worker and the other deliberately is not.
-      {
-        name: "Web app",
-        desc:
-          "Where your browser confirms this device and lists the devices on your vaults " +
-          `(${DEFAULT_WEB_APP_ORIGIN}). This is the site you sign in to.`,
-        control: { type: "text", key: "webAppOrigin", placeholder: DEFAULT_WEB_APP_ORIGIN },
-      },
       {
         name: "Pair this device",
         desc:
@@ -156,6 +188,7 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
           setting.addButton((button) =>
             button
               .setButtonText("Pair")
+              .setCta()
               // **Both origins, and NOT a vault id.** The old condition asked for a vault id
               // this flow cannot have yet, which disabled the button forever; the web app's
               // origin is what `startPairing` genuinely refuses without.
@@ -170,7 +203,8 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
       // **Carries no value from the pairing, and that is the point** (rule 1, rule 5). Its
       // predecessor rendered "Code: abc123" here. Everything this pane knows is that a
       // browser is expected to do something: the intent id it waits on is spendable only by
-      // proving possession of the device key (D14).
+      // proving possession of the device key (D14). "Open browser again" rebuilds the link
+      // from that id without showing it.
       {
         name: "Waiting for your browser",
         desc:
@@ -178,6 +212,23 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
           "confirm it. Obsidian can be closed in the meantime; this device picks the " +
           "request back up when it next starts.",
         visible: waiting,
+        render: (setting) => {
+          setting
+            .addButton((button) =>
+              button.setButtonText("Open browser again").onClick(() => {
+                if (!this.host.reopenPairingPage()) {
+                  new Notice(
+                    "This device is no longer waiting for a browser. Pair it again to continue.",
+                  );
+                }
+              }),
+            )
+            .addButton((button) =>
+              button.setButtonText("Cancel pairing").onClick(() => {
+                this.host.cancelPairing();
+              }),
+            );
+        },
       },
       {
         name: "Sync",
@@ -185,17 +236,100 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
         // The status changes while the pane is open, so the row subscribes when it is drawn
         // and returns the unsubscribe — Obsidian runs it before tearing the row down, which
         // is what stops a reused tab accumulating one listener per visit.
+        //
+        // **Redrawn in place, unless its buttons would change.** "Pair again" belongs to a
+        // refused session and "Show files" to a non-zero count, and a row cannot grow a
+        // button after it is drawn — so a status that crosses either line re-reads the
+        // definitions instead. Everything else only rewrites the words.
         render: (setting) => {
-          setting.setDesc(describeStatus(this.host.syncStatus()));
+          const drawn = this.host.syncStatus();
+          this.drawStatus(setting, statusReport(drawn));
+          if (hasSkipped(drawn)) {
+            setting.addButton((button) =>
+              button.setButtonText("Show files").onClick(() => {
+                showSkippedFiles(this.app, this.host.skippedFiles());
+              }),
+            );
+          }
+          if (statusReport(drawn).warning) {
+            setting.addButton((button) =>
+              button
+                .setButtonText("Pair again")
+                .setCta()
+                .onClick(() => {
+                  void this.pairAgain();
+                }),
+            );
+          }
           return this.host.onStatusChange((next) => {
-            setting.setDesc(describeStatus(next));
+            if (shapeOf(next) !== shapeOf(drawn)) {
+              this.update();
+              return;
+            }
+            this.drawStatus(setting, statusReport(next));
           });
         },
       },
+      // **Named "Vault" and "This device", never "Connected".** Those rows used to read
+      // "Connected: this device is …" directly beneath "Sync was refused", which is two
+      // contradictory claims about one device. What the rows know is identity, not state;
+      // the state is the Sync row's job.
       {
-        name: "Connected",
-        desc: `This device is ${this.host.deviceId}, syncing with vault ${this.host.vaultId}.`,
+        name: "Vault",
         visible: connected,
+        render: (setting) => {
+          // Every open of the pane draws this row, so it is where the agents list (and the
+          // vault name with it) is asked for. See `hide`.
+          this.ensureAgents();
+          const name = this.agents.status === "loaded" ? this.agents.overview.vault.name : null;
+          if (name !== null && name !== "") {
+            setting.setDesc(name);
+          } else {
+            labelledId(setting, "Vault ID", this.host.vaultId);
+          }
+        },
+      },
+      {
+        name: "This device",
+        visible: connected,
+        render: (setting) => {
+          labelledId(setting, "Device ID", this.host.deviceId ?? "");
+          setting.addButton((button) =>
+            button.setButtonText("Manage devices").onClick(() => {
+              this.host.openInBrowser(`${this.webAppBase()}/app/devices`);
+            }),
+          );
+        },
+      },
+      {
+        type: "group",
+        heading: "Agents",
+        // A 404 is a control plane older than the route: there is no list to show, and a
+        // section that says "couldn't load" forever would be an error about nothing.
+        visible: () => connected() && this.agents.status !== "absent",
+        extraButtons: [
+          (button) =>
+            button
+              .setIcon("refresh-cw")
+              .setTooltip("Refresh")
+              .onClick(() => {
+                this.refreshAgents();
+              }),
+        ],
+        items: [
+          ...this.agentRows(),
+          {
+            name: "Connect or remove agents",
+            desc: "Agents are managed in the web app, where you sign in.",
+            render: (setting) => {
+              setting.addButton((button) =>
+                button.setButtonText("Manage agents").onClick(() => {
+                  this.host.openInBrowser(`${this.webAppBase()}/app/agents`);
+                }),
+              );
+            },
+          },
+        ],
       },
       // **The copy IS the deliverable here** (design §6.3). This button makes no request and
       // cannot: hop 2's revoke needs a grant only a signed-in browser can mint, and the
@@ -211,14 +345,39 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
         visible: connected,
         render: (setting) => {
           setting.addButton((button) =>
-            button.setButtonText("Disconnect this device").onClick(() => {
-              void this.host.disconnect().then(() => {
-                new Notice(`This device is disconnected from ${PRODUCT_NAME}`);
-                this.update();
-              });
-            }),
+            button
+              .setButtonText("Disconnect…")
+              .setDestructive()
+              .onClick(() => {
+                void this.disconnectAfterConfirming();
+              }),
           );
         },
+      },
+      {
+        type: "group",
+        heading: "Advanced",
+        items: [
+          {
+            name: "Control plane",
+            desc:
+              "The service this device connects to. Use its direct address " +
+              `(${DEFAULT_CONTROLPLANE_ORIGIN}), not the web app's.`,
+            control: {
+              type: "text",
+              key: "controlplaneOrigin",
+              placeholder: DEFAULT_CONTROLPLANE_ORIGIN,
+            },
+          },
+          // **A separate origin, not a derivation of the first** (design §7). The web app and
+          // the control plane may be different hosts, and on the shipped deployment they are:
+          // one is behind Cloudflare's Worker and the other deliberately is not.
+          {
+            name: "Web app",
+            desc: `Where you sign in and manage your devices and agents (${DEFAULT_WEB_APP_ORIGIN}).`,
+            control: { type: "text", key: "webAppOrigin", placeholder: DEFAULT_WEB_APP_ORIGIN },
+          },
+        ],
       },
     ];
   }
@@ -245,8 +404,128 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
   /** The web app by name, or a description of it when the field is still empty — this pane
    * is telling the user where to GO, and "at ." is not an address. */
   private webApp(): string {
-    return this.host.webAppOrigin === "" ? "your Ctrl Notes web app" : this.host.webAppOrigin;
+    return this.host.webAppOrigin === "" ? `your ${PRODUCT_NAME} web app` : this.host.webAppOrigin;
   }
+
+  /** The web app to link to, falling back to the shipped one: a link to a relative path
+   * would open nothing. */
+  private webAppBase(): string {
+    return this.host.webAppOrigin === "" ? DEFAULT_WEB_APP_ORIGIN : this.host.webAppOrigin;
+  }
+
+  /** The headline, then one line per count, and warning styling for a refused session. */
+  private drawStatus(setting: Setting, report: StatusReport): void {
+    const desc = setting.descEl;
+    desc.empty();
+    desc.toggleClass("mod-warning", report.warning);
+    desc.createDiv({ text: report.headline });
+    for (const line of report.lines) desc.createDiv({ text: line });
+  }
+
+  /** The rows under the Agents heading, for whatever the last load said. */
+  private agentRows(): SettingGroupItem[] {
+    const state = this.agents;
+    if (state.status === "idle" || state.status === "loading") {
+      return [{ name: "", desc: "Loading agents…", searchable: false }];
+    }
+    if (state.status !== "loaded") {
+      return [{ name: "", desc: "Couldn't load agents.", searchable: false }];
+    }
+    if (state.overview.agents.length === 0) {
+      return [
+        {
+          name: "No agents are connected to this vault yet.",
+          render: (setting) => {
+            setting.descEl.appendText("To connect Claude Code, run ");
+            setting.descEl.createEl("code", { text: CONNECT_CLAUDE_CODE });
+          },
+        },
+      ];
+    }
+    const now = this.host.now();
+    return state.overview.agents.map((agent) => ({
+      name: agent.name ?? "Unnamed agent",
+      desc: `${capabilityText(agent.capability)} · ${lastUsedText(agent.last_used_at, now)}`,
+    }));
+  }
+
+  /** Ask for the agents list if nothing has since the pane opened. */
+  private ensureAgents(): void {
+    if (this.agents.status === "idle") this.loadAgents();
+  }
+
+  private refreshAgents(): void {
+    this.generation += 1;
+    this.loadAgents();
+    this.update();
+  }
+
+  private loadAgents(): void {
+    const generation = this.generation;
+    // Only the first load shows "Loading": a reopen keeps drawing the list it already has
+    // until the new answer lands, rather than flashing it away and back.
+    if (this.agents.status === "idle" || this.agents.status === "failed") {
+      this.agents = { status: "loading" };
+    }
+    void this.host.loadOverview().then((result) => {
+      if (generation !== this.generation) return;
+      if (result.status === "failed") {
+        console.warn(`Ctrl Notes: could not load this vault's agents: ${result.reason}`);
+      }
+      this.agents = result;
+      this.update();
+    });
+  }
+
+  /**
+   * "Pair again", beside a refused session: forget this registration locally, then start a
+   * pairing. The first half is exactly Disconnect, and needs no confirmation here — the
+   * vault has already refused this device, so there is nothing left to disconnect from.
+   */
+  private async pairAgain(): Promise<void> {
+    await this.host.disconnect();
+    this.update();
+    await this.host.startPairing(this.host.vaultName);
+  }
+
+  private async disconnectAfterConfirming(): Promise<void> {
+    const yes = await this.confirm({
+      title: "Disconnect this device?",
+      body: [
+        "This removes the connection on this device only, and erases its key from this " +
+          "computer. Your notes stay here.",
+        "It does not revoke the device. To do that, remove it from your device list at " +
+          `${this.webApp()}.`,
+      ],
+      confirmText: "Disconnect",
+      cancelText: "Cancel",
+      destructive: true,
+    });
+    if (!yes) return;
+    await this.host.disconnect();
+    new Notice(`This device is disconnected from ${PRODUCT_NAME}.`);
+    this.update();
+  }
+}
+
+type AgentsState = { readonly status: "idle" } | { readonly status: "loading" } | OverviewResult;
+
+/** The command the empty Agents list suggests. The server name matches the MCP's own. */
+export const CONNECT_CLAUDE_CODE =
+  "claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp";
+
+const hasSkipped = (status: SyncStatus): boolean =>
+  status.unsyncable + status.refused + status.unavailable > 0;
+
+/** Which buttons the Sync row carries for a status. A change here needs a new row. */
+const shapeOf = (status: SyncStatus): string =>
+  `${statusReport(status).warning}/${hasSkipped(status)}`;
+
+/** `Vault ID e000 518f…`, the id in monospace. */
+function labelledId(setting: Setting, label: string, id: string): void {
+  setting.descEl.empty();
+  setting.descEl.appendText(`${label} `);
+  setting.descEl.createEl("code", { text: shortId(id) });
 }
 
 /** Trimmed, with any trailing slash off: both fields are joined to a path, and

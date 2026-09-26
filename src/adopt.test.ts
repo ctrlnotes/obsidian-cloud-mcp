@@ -295,7 +295,7 @@ describe("the copy is honest about what the tap does and does not prove", () => 
     deviceLabel: "My Laptop",
     obsidianVaultName: "My Vault",
   });
-  const body = copy.body.join(" ");
+  const body = [...copy.body, copy.vaultIdShown, ...copy.after].join(" ");
 
   /** §5's rule for the browser's confirm page, and it applies here for the same reason: an
    * attacker-influenced label cannot carry the weight of what is being granted. */
@@ -319,6 +319,19 @@ describe("the copy is honest about what the tap does and does not prove", () => 
 
   it("names this Obsidian vault, so the user knows which one is being connected", () => {
     expect(body).toContain("My Vault");
+  });
+
+  /** The audit: 32 hex characters mid-sentence pushed the sentence that matters off the
+   * line. The id is its own line, shortened, and no sentence carries it. */
+  it("shows the vault id as a short prefix on its own line, not mid-sentence", () => {
+    const long = adoptionCopy({
+      vaultId: "e000518f8653638e404ca98c6d0a8f10",
+      pairingId: "pai_1",
+      deviceLabel: "My Laptop",
+      obsidianVaultName: "My Vault",
+    });
+    expect(long.vaultIdShown).toBe("e000 518f…");
+    for (const line of [...long.body, ...long.after]) expect(line).not.toContain("e000518f");
   });
 });
 
@@ -370,14 +383,30 @@ describe("the modal seam", () => {
       obsidianVaultName: "My Vault",
     });
     const rendered = openModals[0]?.contentEl.texts.join(" ") ?? "";
-    for (const line of adoptionCopy({
+    const copy = adoptionCopy({
       vaultId: "vault-1",
       pairingId: "pai_1",
       deviceLabel: "My Laptop",
       obsidianVaultName: "My Vault",
-    }).body) {
-      expect(rendered).toContain(line);
-    }
+    });
+    for (const line of [...copy.body, ...copy.after]) expect(rendered).toContain(line);
+    // Monospaced: the id is drawn as code, not as prose.
+    expect(openModals[0]?.contentEl.code).toEqual([copy.vaultIdShown]);
+  });
+
+  /** Connect is the call to action; Cancel comes first and nothing moves focus off it, so
+   * Enter on an unread dialog is the answer that changes nothing. */
+  it("styles Connect as the call to action and leaves Cancel first", () => {
+    void askToAdopt(app, {
+      vaultId: "vault-1",
+      pairingId: "pai_1",
+      deviceLabel: "My Laptop",
+      obsidianVaultName: "My Vault",
+    });
+    expect(buttons.map((b) => [b.text, b.cta])).toEqual([
+      ["Cancel", false],
+      ["Connect", true],
+    ]);
   });
 
   it("is typed as a ConfirmAdoption, so main.ts's seam and the real modal cannot drift", () => {

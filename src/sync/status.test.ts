@@ -1,9 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { describeStatus, IDLE_STATUS } from "./status.ts";
+import { PRODUCT_NAME } from "../product.ts";
+import {
+  describeStatus,
+  IDLE_STATUS,
+  plural,
+  type SyncStatus,
+  skipReasonText,
+  statusBarFace,
+  statusReport,
+} from "./status.ts";
 
 describe("describeStatus", () => {
   it("reports never-synced before the first exchange", () => {
-    expect(describeStatus(IDLE_STATUS)).toContain("Never synced");
+    expect(describeStatus(IDLE_STATUS)).toBe("Not synced yet.");
   });
 
   it("reports the pending count while syncing", () => {
@@ -45,8 +54,8 @@ describe("describeStatus", () => {
    * is not the same thing as disconnected, and says so. */
   it("a parked device reads as up to date and idle, not disconnected", () => {
     const parked = { ...IDLE_STATUS, syncedCursor: 7, parked: true };
-    expect(describeStatus(parked)).toBe("Up to date at change 7 (idle).");
-    expect(describeStatus({ ...parked, parked: false })).toBe("Up to date at change 7.");
+    expect(describeStatus(parked)).toBe("Up to date. Idle until there is something to sync.");
+    expect(describeStatus({ ...parked, parked: false })).toBe("Up to date.");
   });
 
   it("mentions skipped files when there are any", () => {
@@ -82,7 +91,7 @@ describe("describeStatus", () => {
       parked: false,
     });
     expect(text).toContain("Up to date");
-    expect(text).toContain("2 file(s) could not be downloaded");
+    expect(text).toContain("2 files could not be downloaded");
     expect(text).toContain("another device");
     // The fix is elsewhere, so it must not be filed under this device's own
     // choices — that clause would send the user hunting their own vault for a
@@ -165,12 +174,12 @@ describe("describeStatus", () => {
     const text = describeStatus({ ...IDLE_STATUS, syncedCursor: 4, unsyncable: 2 });
     expect(text).toContain("not UTF-8 text");
     expect(text).toContain("re-save one as UTF-8");
-    expect(text).toContain("8 MiB");
+    expect(text).toContain("8 MB");
   });
 
   it("keeps the two skip reasons apart when both apply", () => {
     const text = describeStatus({ ...IDLE_STATUS, syncedCursor: 4, unsyncable: 3, refused: 2 });
-    expect(text).toContain("Unicode-normalised");
+    expect(text).toContain("clash with another file's");
     expect(text).toContain("refused by the server");
   });
 
@@ -278,13 +287,13 @@ describe("a device reconnecting by itself", () => {
       pending: 120,
       retrying: "busy",
     });
-    expect(text).toBe('Syncing: 120 change(s) still to send. Reconnecting: the vault said "busy".');
+    expect(text).toBe('Syncing: 120 changes still to send. Reconnecting: the vault said "busy".');
   });
 
   it("is not rendered as a refusal", () => {
     const text = describeStatus({ ...IDLE_STATUS, syncedCursor: 4, retrying: "busy" });
     expect(text).not.toContain("refused");
-    expect(text.startsWith("Up to date at change 4.")).toBe(true);
+    expect(text.startsWith("Up to date.")).toBe(true);
   });
 
   /**
@@ -305,5 +314,111 @@ describe("a device reconnecting by itself", () => {
   it("a refusal still outranks it", () => {
     const text = describeStatus({ ...IDLE_STATUS, refusal: "teapot", retrying: "busy" });
     expect(text).toBe("Sync was refused: teapot.");
+  });
+});
+
+/**
+ * The audit's findings on the sentence itself: it read as one run-on paragraph, said
+ * "file(s)", carried a cursor number nobody can use, and spoke of wires, MiB and Unicode
+ * normalisation. The pane now draws a headline and one line per count.
+ */
+describe("the status as a headline and short lines", () => {
+  const full: SyncStatus = {
+    ...IDLE_STATUS,
+    syncedCursor: 84,
+    unsyncable: 1,
+    refused: 3,
+    unavailable: 1,
+  };
+
+  it("puts each count on its own line under a short headline", () => {
+    const report = statusReport(full);
+    expect(report.headline).toBe("Up to date.");
+    expect(report.lines).toHaveLength(3);
+    expect(report.warning).toBe(false);
+  });
+
+  it("uses real plurals, never file(s) or change(s)", () => {
+    const text = describeStatus(full);
+    expect(text).toContain("1 file is not synced");
+    expect(text).toContain("3 files were refused");
+    expect(text).toContain("1 file could not be downloaded");
+    expect(text).not.toMatch(/\(s\)/);
+    expect(describeStatus({ ...IDLE_STATUS, syncedCursor: 1, pending: 1 })).toContain(
+      "1 change still to send",
+    );
+    expect(describeStatus({ ...IDLE_STATUS, syncedCursor: 1, pending: 12 })).toContain(
+      "12 changes still to send",
+    );
+  });
+
+  it("never shows the cursor number", () => {
+    expect(describeStatus(full)).not.toContain("84");
+  });
+
+  it("drops the implementation words", () => {
+    const text = describeStatus(full);
+    expect(text).not.toMatch(/wire|MiB|Unicode|console/i);
+  });
+
+  it("plural is singular only at one", () => {
+    expect(plural(0, "file")).toBe("0 files");
+    expect(plural(1, "file")).toBe("1 file");
+    expect(plural(2, "change")).toBe("2 changes");
+  });
+
+  it("marks a refused session as a warning, and nothing else", () => {
+    expect(statusReport({ ...IDLE_STATUS, refusal: "not authorised" }).warning).toBe(true);
+    expect(statusReport(full).warning).toBe(false);
+    expect(statusReport({ ...IDLE_STATUS, retrying: "busy" }).warning).toBe(false);
+  });
+
+  it("puts the revocation advice on its own line", () => {
+    const report = statusReport({ ...IDLE_STATUS, refusal: "not authorised" });
+    expect(report.headline).toBe("Sync was refused: not authorised.");
+    expect(report.lines.join(" ")).toMatch(/pair this device again/i);
+  });
+});
+
+describe("the status bar", () => {
+  const face = (s: Partial<SyncStatus> | null) =>
+    statusBarFace(s === null ? null : { ...IDLE_STATUS, syncedCursor: 3, ...s });
+
+  it.each([
+    [null, "Not paired", "cloud-off"],
+    [{}, "Synced", "check"],
+    [{ pending: 4 }, "Syncing 4", "refresh-cw"],
+    [{ parked: true }, "Idle", "moon"],
+    [{ updating: true }, "Updating", "refresh-cw"],
+    [{ retrying: "busy" }, "Reconnecting", "refresh-cw"],
+    [{ refusal: "not authorised" }, "Error", "alert-triangle"],
+    [{ syncedCursor: null }, "Connecting", "refresh-cw"],
+  ] as const)("%o reads %s", (status, text, icon) => {
+    expect(face(status).text).toBe(text);
+    expect(face(status).icon).toBe(icon);
+  });
+
+  it("labels the item with the full sentence, for a screen reader and a hover", () => {
+    expect(face({ pending: 2 }).label).toBe(`${PRODUCT_NAME}: Syncing: 2 changes still to send.`);
+    expect(face(null).label).toMatch(/not paired/i);
+  });
+
+  /** "Updating" outranks a refusal for the same reason the pane's headline does: it is the
+   * newer fact. A refusal outranks "Reconnecting", as it does in the pane. */
+  it("does not say Error while the vault is restarting", () => {
+    expect(face({ updating: true, refusal: "old" }).text).toBe("Updating");
+    expect(face({ retrying: "busy", refusal: "old" }).text).toBe("Error");
+  });
+});
+
+describe("why a file is on the list", () => {
+  it("gives each kind its own reason", () => {
+    expect(skipReasonText({ path: "a.md", kind: "clash" })).toMatch(/clashes/);
+    expect(skipReasonText({ path: "a.png", kind: "oversize" })).toMatch(/8 MB/);
+    expect(skipReasonText({ path: "a.txt", kind: "undecodable" })).toMatch(/UTF-8/);
+    expect(skipReasonText({ path: "a.md", kind: "refused", detail: "too large" })).toBe(
+      "Refused by the server: too large.",
+    );
+    expect(skipReasonText({ path: "a.md", kind: "unavailable" })).toMatch(/no longer has/);
   });
 });

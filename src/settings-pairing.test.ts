@@ -4,6 +4,7 @@ import type { SettingsHost } from "./settings-tab.ts";
 import { CtrlNotesSettingsTab } from "./settings-tab.ts";
 import { IDLE_STATUS } from "./sync/status.ts";
 import { buttons, registerTab, settingRows, settingsText } from "./testing/fake-obsidian.ts";
+import { settingsHostDefaults } from "./testing/fake-settings-host.ts";
 
 /**
  * The pane's half of design §5 and §6.3 — what a user can press, and what they are told
@@ -37,6 +38,7 @@ const fakeHost = (overrides: Partial<SettingsHost> = {}): Plugin & SettingsHost 
     onPairingChange: () => () => {},
     // `Plugin.register` — the tab hands it the pairing subscription to own.
     register: () => {},
+    ...settingsHostDefaults(),
     ...overrides,
     spies: { startPairing, disconnect },
   };
@@ -150,33 +152,72 @@ describe("pairing this device", () => {
   });
 });
 
+describe("the waiting face", () => {
+  it("offers to open the browser again, and to cancel", () => {
+    const reopen = vi.fn(() => true);
+    const cancel = vi.fn();
+    const host = fakeHost({
+      pairingInFlight: true,
+      reopenPairingPage: reopen,
+      cancelPairing: cancel,
+    });
+    registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
+
+    buttons.find((b) => b.text === "Open browser again")?.click();
+    buttons.find((b) => b.text === "Cancel pairing")?.click();
+    expect(reopen).toHaveBeenCalledTimes(1);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers neither once the device is paired or idle", () => {
+    registerTab(new CtrlNotesSettingsTab({} as App, fakeHost())).display();
+    expect(buttons.map((b) => b.text)).not.toContain("Open browser again");
+    expect(buttons.map((b) => b.text)).not.toContain("Cancel pairing");
+  });
+
+  it("styles Pair as the pane's primary action", () => {
+    registerTab(new CtrlNotesSettingsTab({} as App, fakeHost())).display();
+    expect(buttons.find((b) => b.text === "Pair")?.cta).toBe(true);
+  });
+});
+
 describe("a connected device", () => {
-  it("shows the adopted vault and device, and never a Pair button", () => {
-    const host = fakeHost({ deviceId: "dev-abc", vaultId: "vault-1" });
+  const VAULT = "e000518f8653638e404ca98c6d0a8f10";
+  const DEVICE = "d41d8cd98f00b204e9800998ecf8427e";
+
+  it("shows the adopted vault and device by short id, and never a Pair button", () => {
+    const host = fakeHost({ deviceId: DEVICE, vaultId: VAULT });
     registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
 
     expect(buttons.find((b) => b.text === "Pair")).toBeUndefined();
-    expect(settingsText()).toContain("dev-abc");
-    expect(settingsText()).toContain("vault-1");
+    const vault = settingRows.find((r) => r.name === "Vault");
+    const device = settingRows.find((r) => r.name === "This device");
+    expect(vault?.desc).toMatch(/^Vault ID /);
+    expect(vault?.descEl.code).toEqual(["e000 518f…"]);
+    expect(device?.desc).toMatch(/^Device ID /);
+    expect(device?.descEl.code).toEqual(["d41d 8cd9…"]);
   });
 
   /**
    * **Spec §6.3, and the copy is the whole point.** No revoke path is reachable from the
    * plugin — hop 2 needs a browser-minted grant and the vault's own DELETE needs the
    * operator static token — so a button called "Unpair" beside a device list the user
-   * cannot see reads as a revocation and is not one. The name and the sentence are what
-   * stop a user believing they have cut a lost laptop off.
+   * cannot see reads as a revocation and is not one. The row's name and the sentence are
+   * what stop a user believing they have cut a lost laptop off; the button no longer
+   * repeats the row's name, and says with its ellipsis that it asks first.
    */
-  it("calls the button Disconnect this device, never Unpair", () => {
-    const host = fakeHost({ deviceId: "dev-abc", vaultId: "vault-1" });
+  it("names the row Disconnect this device, and the button Disconnect…, never Unpair", () => {
+    const host = fakeHost({ deviceId: DEVICE, vaultId: VAULT });
     registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
 
-    expect(buttons.find((b) => b.text === "Disconnect this device")).toBeDefined();
-    expect(buttons.find((b) => b.text === "Unpair")).toBeUndefined();
+    expect(settingRows.map((r) => r.name)).toContain("Disconnect this device");
+    const button = buttons.find((b) => b.text === "Disconnect…");
+    expect(button?.destructive).toBe(true);
+    expect(buttons.find((b) => /unpair/i.test(b.text))).toBeUndefined();
   });
 
   it("says the disconnect is local and points at the device list for a real revoke", () => {
-    const host = fakeHost({ deviceId: "dev-abc", vaultId: "vault-1" });
+    const host = fakeHost({ deviceId: DEVICE, vaultId: VAULT });
     registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
 
     const text = settingsText();
@@ -187,13 +228,42 @@ describe("a connected device", () => {
     expect(text).toContain("https://app.ctrlrouter.test");
   });
 
-  it("pressing Disconnect this device calls the host", async () => {
-    const host = fakeHost({ deviceId: "dev-abc", vaultId: "vault-1" });
+  it("asks first, and disconnects only on a yes", async () => {
+    const host = fakeHost({ deviceId: DEVICE, vaultId: VAULT });
+    const tab = registerTab(new CtrlNotesSettingsTab({} as App, host));
+    const asked: string[] = [];
+    let answer = false;
+    tab.confirm = (copy) => {
+      asked.push(copy.title);
+      expect(copy.destructive).toBe(true);
+      expect(copy.body.join(" ")).toMatch(/device list/i);
+      return Promise.resolve(answer);
+    };
+    tab.display();
+
+    buttons.find((b) => b.text === "Disconnect…")?.click();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(asked).toEqual(["Disconnect this device?"]);
+    expect(host.spies.disconnect).not.toHaveBeenCalled();
+
+    answer = true;
+    buttons.find((b) => b.text === "Disconnect…")?.click();
+    await vi.waitFor(() => expect(host.spies.disconnect).toHaveBeenCalledTimes(1));
+  });
+
+  /** The real modal, through the default seam: dismissal is a no, and its confirm button is
+   * styled as destructive. */
+  it("uses a real confirmation modal by default", async () => {
+    const host = fakeHost({ deviceId: DEVICE, vaultId: VAULT });
     registerTab(new CtrlNotesSettingsTab({} as App, host)).display();
 
-    buttons.find((b) => b.text === "Disconnect this device")?.click();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(host.spies.disconnect).toHaveBeenCalled();
+    buttons.find((b) => b.text === "Disconnect…")?.click();
+    const confirm = buttons.find((b) => b.text === "Disconnect");
+    expect(confirm?.destructive).toBe(true);
+    // Cancel comes first, so it keeps the modal's default focus.
+    expect(buttons.map((b) => b.text).slice(-2)).toEqual(["Cancel", "Disconnect"]);
+    confirm?.click();
+    await vi.waitFor(() => expect(host.spies.disconnect).toHaveBeenCalledTimes(1));
   });
 });

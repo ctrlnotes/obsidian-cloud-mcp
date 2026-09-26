@@ -24,6 +24,7 @@ import {
   fireVaultEvent,
   load,
   manifest,
+  openedUrls,
   readGates,
   removedPaths,
   settleMicrotasks,
@@ -32,7 +33,7 @@ import {
   unloadAll,
 } from "./testing/fake-host.ts";
 import {
-  commands,
+  commandAvailable,
   fakeDocument,
   fireDomEvent,
   notices,
@@ -43,6 +44,8 @@ import {
   requestUrlHangs,
   requestUrlHeld,
   requestUrlQueue,
+  runCommand,
+  statusBarItems,
 } from "./testing/fake-obsidian.ts";
 import { WIRE_VERSION } from "./wire.ts";
 
@@ -1773,7 +1776,7 @@ describe("a closing the vault says to retry after", () => {
     await microtasks();
 
     expect(notices.slice(noticesBefore).map(noticeText)).toEqual([
-      "Disconnected from the Ctrl Notes vault: not authorised",
+      "Sync with Ctrl Notes stopped: not authorised.",
     ]);
     expect(plugin.syncStatus().refusal).toBe("not authorised");
     vi.advanceTimersByTime(10 * 60_000); // past every backoff step there is
@@ -1914,6 +1917,247 @@ describe("a reconnect after a retried closing, and the manifest scan", () => {
   });
 });
 
+/**
+ * Item 4 of the design audit. A closing the device retries by itself was reported as a
+ * refusal: a Notice reading "Disconnected from the Ctrl Notes vault" and "Sync was refused"
+ * at the head of the pane, about a connection already on its way back.
+ */
+describe("a closing the device retries on its own", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  it("raises no Notice and reads Reconnecting, not refused", async () => {
+    stubWebSocket();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const plugin = await load({ "note.md": "hi" }, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws);
+    const noticesBefore = notices.length;
+
+    ws.emit({ type: "closing", reason: "too many connections open for this device" });
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).not.toBeNull(), UNTIL);
+
+    expect(notices.length).toBe(noticesBefore);
+    expect(plugin.syncStatus().refusal).toBeNull();
+    expect(describeStatus(plugin.syncStatus())).toContain(
+      'Reconnecting: the vault said "too many connections open for this device".',
+    );
+  });
+
+  /** The control: a terminal closing still tells the user, once, in a sentence. */
+  it("still tells the user about a terminal closing", async () => {
+    stubWebSocket();
+    const plugin = await load({ "note.md": "hi" }, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws);
+    const noticesBefore = notices.length;
+
+    ws.emit({ type: "closing", reason: "not authorised", retry: "never" });
+    await vi.waitFor(() => expect(plugin.syncStatus().refusal).not.toBeNull(), UNTIL);
+
+    expect(notices.slice(noticesBefore).map(noticeText)).toEqual([
+      "Sync with Ctrl Notes stopped: not authorised.",
+    ]);
+    expect(plugin.syncStatus().retrying).toBeNull();
+  });
+});
+
+describe("the status bar", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+  const item = () => statusBarItems[0];
+  const word = () => item()?.texts.slice(-1)[0];
+
+  it("reads Not paired on an unpaired device", async () => {
+    stubWebSocket();
+    await load({});
+    expect(word()).toBe("Not paired");
+    expect(item()?.attrs.get("aria-label")).toMatch(/not paired/i);
+    expect(item()?.classes.has("mod-clickable")).toBe(true);
+  });
+
+  it("follows the status, with the full sentence as its label", async () => {
+    stubWebSocket();
+    await load({ "note.md": "hi" }, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    await bringUp(FakeWebSocket.instances[0] as FakeWebSocket);
+
+    await vi.waitFor(() => expect(word()).toBe("Synced"), UNTIL);
+    expect(item()?.attrs.get("aria-label")).toBe("Ctrl Notes: Up to date.");
+  });
+
+  it("reads Not paired again once the device disconnects", async () => {
+    stubWebSocket();
+    const plugin = await load({}, PAIRED);
+    await plugin.disconnect();
+    expect(word()).toBe("Not paired");
+  });
+
+  it("opens this plugin's settings tab when clicked", async () => {
+    stubWebSocket();
+    const plugin = await load({});
+    const opened: string[] = [];
+    (plugin.app as unknown as { setting: unknown }).setting = {
+      open: () => opened.push("settings"),
+      openTabById: (id: string) => opened.push(id),
+    };
+    fireDomEvent("click");
+    expect(opened).toEqual(["settings", manifest.id]);
+  });
+
+  it("is not added on mobile, which has no status bar", async () => {
+    stubWebSocket();
+    Platform.isMobile = true;
+    await load({});
+    expect(statusBarItems).toHaveLength(0);
+  });
+});
+
+describe("Sync now in the palette", () => {
+  it("is not offered to an unpaired device", async () => {
+    stubWebSocket();
+    await load({});
+    expect(commandAvailable("Sync now")).toBe(false);
+  });
+
+  it("is offered once the device has a connection", async () => {
+    stubWebSocket();
+    await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    expect(commandAvailable("Sync now")).toBe(true);
+  });
+});
+
+describe("the files behind the counts", () => {
+  it("names a refused file with the server's reason, and counts it once", async () => {
+    stubWebSocket();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const plugin = await load(
+      { "note.md": "hi" },
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws);
+
+    fireVaultEvent("modify", "note.md");
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "note.md")).toBe(true),
+      UNTIL,
+    );
+    ws.emit({ type: "refused", path: "note.md", reason: "too large", current_sha: null });
+    await vi.waitFor(() => expect(plugin.syncStatus().refused).toBe(1), UNTIL);
+
+    expect(plugin.skippedFiles()).toEqual([
+      { path: "note.md", kind: "refused", detail: "too large" },
+    ]);
+
+    // Disconnecting forgets them with the vault they belonged to.
+    await plugin.disconnect();
+    expect(plugin.skippedFiles()).toEqual([]);
+    expect(plugin.syncStatus().refused).toBe(0);
+  });
+});
+
+describe("the agents overview", () => {
+  /** The same routing proof as the socket and the signal poll: `d`, `k`, `t`, `s`. */
+  it("asks the overview route with the device's routing proof", async () => {
+    stubWebSocket();
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    requestUrlQueue.push({
+      status: 200,
+      json: { vault: { vault_id: "vault-1", name: "Work" }, agents: [] },
+    });
+
+    const result = await plugin.loadOverview();
+
+    expect(result).toEqual({
+      status: "loaded",
+      overview: { vault: { vault_id: "vault-1", name: "Work" }, agents: [] },
+    });
+    const call = requestUrlCalls.find((c) => c.url.includes("/v1/sync/overview"));
+    const url = new URL(call?.url ?? "https://x.invalid");
+    expect(url.origin + url.pathname).toBe("https://cp.test/v1/sync/overview");
+    expect([...url.searchParams.keys()].sort()).toEqual(["d", "k", "s", "t"]);
+    expect(url.searchParams.get("d")).toBe("dev-1");
+    // The signature verifies over the routing context, exactly as the socket's does.
+    const identity = await DeviceIdentity.load(plugin.app);
+    expect(url.searchParams.get("k")).toBe(identity.publicKeyBase64);
+  });
+
+  it("asks nothing on an unpaired device", async () => {
+    stubWebSocket();
+    const plugin = await load({});
+    expect(await plugin.loadOverview()).toEqual({ status: "failed", reason: "not_paired" });
+    expect(requestUrlCalls).toEqual([]);
+  });
+
+  it("answers a failure as a value, never a rejection", async () => {
+    stubWebSocket();
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    // Unscripted: the fake transport rejects, which `request` turns into a failure.
+    expect(await plugin.loadOverview()).toEqual({ status: "failed", reason: "transport_failed" });
+  });
+});
+
+describe("waiting on the browser", () => {
+  const started = async () => {
+    stubWebSocket();
+    stubSystemBrowser();
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", webAppOrigin: "https://app.test" },
+    );
+    requestUrlQueue.push({
+      status: 201,
+      json: { intent_id: "intent-1", expires_at: Date.now() + 600_000 },
+    });
+    // The poll's first challenge fails retryably, so the device keeps waiting — sleeping
+    // two seconds before it asks again, which is where a cancel finds it.
+    requestUrlQueue.push({ status: 503, json: null });
+    const run = plugin.startPairing("My Laptop");
+    await vi.waitFor(() => expect(openedUrls).toHaveLength(1), UNTIL);
+    return { plugin, run };
+  };
+
+  it("opens the same pair page again, registering nothing new", async () => {
+    const { plugin } = await started();
+    const registered = requestUrlCalls.filter((c) => c.url.endsWith("/v1/pairing-intents"));
+
+    expect(plugin.reopenPairingPage()).toBe(true);
+
+    expect(openedUrls).toEqual([
+      "https://app.test/app/pair?i=intent-1",
+      "https://app.test/app/pair?i=intent-1",
+    ]);
+    expect(requestUrlCalls.filter((c) => c.url.endsWith("/v1/pairing-intents"))).toEqual(
+      registered,
+    );
+  });
+
+  it("cancels: forgets the intent, stops waiting, and says nothing", async () => {
+    const { plugin, run } = await started();
+    const noticesBefore = notices.length;
+
+    plugin.cancelPairing();
+    await run;
+
+    expect(plugin.pairingInFlight).toBe(false);
+    expect(pairingIntent.loadPairingState(plugin.app)).toBeNull();
+    expect(notices.length).toBe(noticesBefore);
+    expect(plugin.reopenPairingPage()).toBe(false);
+  });
+});
+
 describe("a top-level dot-folder is never synced, in either direction", () => {
   /**
    * Every config folder starts with a dot (Obsidian refuses any other), and devices sharing
@@ -2013,7 +2257,9 @@ describe("a parked device", () => {
     const { plugin, first } = await parkedPlugin();
 
     expect(first.closed).toBe(true);
-    expect(describeStatus(plugin.syncStatus())).toBe("Up to date at change 0 (idle).");
+    expect(describeStatus(plugin.syncStatus())).toBe(
+      "Up to date. Idle until there is something to sync.",
+    );
     expect(notices.length).toBe(noticesBefore);
     expect(plugin.syncStatus().refusal).toBeNull();
     await settleMicrotasks(1_500); // past the first backoff step: nothing reconnects
@@ -2365,11 +2611,10 @@ describe("a parked device", () => {
 
   it("reconnects on Sync now, once however often it is pressed", async () => {
     await parkedPlugin();
-    const syncNow = commands.find((c) => c.name === "Sync now");
-    expect(syncNow).toBeDefined();
+    expect(commandAvailable("Sync now")).toBe(true);
 
-    syncNow?.callback?.();
-    syncNow?.callback?.();
+    runCommand("Sync now");
+    runCommand("Sync now");
     await untilSockets(2);
     await settleMicrotasks(500); // quiet window: no third
 
@@ -2437,7 +2682,7 @@ describe("a parked device", () => {
     const noticesBefore = notices.length;
 
     fireDomEvent("focus");
-    commands.find((c) => c.name === "Sync now")?.callback?.();
+    runCommand("Sync now");
     await settleMicrotasks(500); // quiet window
 
     expect(FakeWebSocket.instances).toHaveLength(1);
@@ -2464,7 +2709,7 @@ describe("a parked device", () => {
 
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     first.close(); // an unplanned drop: a retry is scheduled on the (faked) backoff
-    commands.find((c) => c.name === "Sync now")?.callback?.();
+    runCommand("Sync now");
     await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(2));
     vi.useRealTimers();
   });
@@ -2483,7 +2728,7 @@ describe("a parked device", () => {
     const { plugin } = await parkedPlugin(files);
     files["note.md"] = "two\n"; // no vault event: invisible to everything but a rescan
 
-    commands.find((c) => c.name === "Sync now")?.callback?.();
+    runCommand("Sync now");
     await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
     const woken = FakeWebSocket.instances[1] as FakeWebSocket;
     await bringUp(woken);
@@ -2521,7 +2766,7 @@ describe("a parked device", () => {
     fakeDocument.visibilityState = "visible";
     fireDomEvent("visibilitychange"); // an unscripted poll: fails, wakes nothing
 
-    commands.find((c) => c.name === "Sync now")?.callback?.();
+    runCommand("Sync now");
     await untilSockets(2);
     const woken = FakeWebSocket.instances[1] as FakeWebSocket;
     await bringUp(woken);

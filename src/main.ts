@@ -34,7 +34,7 @@
 // snapshot entry that needs content is logged and skipped rather than guessed at.
 
 import type { App, PluginManifest, TAbstractFile } from "obsidian";
-import { Notice, Platform, Plugin } from "obsidian";
+import { Notice, Platform, Plugin, setIcon } from "obsidian";
 import {
   type AdoptionOffer,
   askToAdopt,
@@ -44,17 +44,20 @@ import {
 } from "./adopt.ts";
 import { type Requested, request } from "./controlplane-http.ts";
 import { DeviceIdentity, forgetDeviceKey, publicKeyStandardBase64 } from "./device.ts";
+import { fetchOverview, type OverviewResult } from "./overview.ts";
 import {
   type BoundPairing,
   clearPairingState,
   loadPairingState,
   openInSystemBrowser,
   type PairingState,
+  pairPageUrl,
   startPairing as registerPairingIntent,
   retrieveOnce,
   retrieveWhenBound,
 } from "./pairing-intent.ts";
 import { handleProtocol, PAIRED_ACTIONS } from "./protocol.ts";
+import { asSentence, failureMessage } from "./reasons.ts";
 import {
   CtrlNotesSettingsTab,
   DEFAULT_CONTROLPLANE_ORIGIN,
@@ -84,7 +87,7 @@ import { planRetry } from "./sync/retry.ts";
 import { Settler } from "./sync/settle.ts";
 import { type SocketLike, SyncSocket } from "./sync/socket.ts";
 import { adoptUnstampedState, loadSyncState, type SyncState, saveSyncState } from "./sync/state.ts";
-import { IDLE_STATUS, type SyncStatus } from "./sync/status.ts";
+import { IDLE_STATUS, type SkippedFile, type SyncStatus, statusBarFace } from "./sync/status.ts";
 import { foldListing, indexOddSpellings, toWirePath } from "./sync/wire-path.ts";
 import type { Down, DownRefused } from "./wire.ts";
 
@@ -140,6 +143,12 @@ const DEFAULT_SETTINGS: Settings = {
   vaultId: "",
   deviceId: null,
 };
+
+/** The two members of Obsidian's settings modal `openOwnSettings` calls. Not public API. */
+interface SettingsModal {
+  open(): void;
+  openTabById(id: string): unknown;
+}
 
 interface Touched {
   readonly dirty: Set<string>;
@@ -222,7 +231,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * top. Membership is refreshed the only honest way: every path this settle actually
    * re-examined is dropped first, and whatever the derive withheld goes back in.
    */
-  private withheld = new Set<string>();
+  private withheld = new Map<string, "oversize" | "undecodable">();
+  /**
+   * Files the server refused for good, with its reason — the paths behind
+   * `SyncStatus.refused`. Keyed by path, so a file refused twice is one file, not two.
+   */
+  private refusedFiles = new Map<string, string>();
+  /** Files the server can no longer send (O3) — the paths behind `SyncStatus.unavailable`. */
+  private unavailableFiles = new Set<string>();
 
   /**
    * The vault closed an idle connection and this device holds none (vault-sleep design VS4).
@@ -305,6 +321,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private readonly pairingAborter = new AbortController();
 
   /**
+   * Stops THIS pairing's poll — "Cancel pairing" in the pane. One per run, and aborted too
+   * when the plugin unloads, so a run has one signal to watch rather than two.
+   */
+  private pairingRunAborter: AbortController | null = null;
+
+  /**
    * Resolves once load-time setup — the device identity, and a resumed connection if this
    * device was already paired — has finished. A seam for tests, exactly like an earlier prototype's
    * `ready`: nothing in the plugin reads it.
@@ -370,6 +392,57 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     return () => {
       this.pairingListeners.delete(listener);
     };
+  }
+
+  skippedFiles(): readonly SkippedFile[] {
+    const files: SkippedFile[] = [];
+    for (const path of this.shadowed) files.push({ path, kind: "clash" });
+    for (const [path, kind] of this.withheld) files.push({ path, kind });
+    for (const [path, detail] of this.refusedFiles) files.push({ path, kind: "refused", detail });
+    for (const path of this.unavailableFiles) files.push({ path, kind: "unavailable" });
+    return files;
+  }
+
+  /**
+   * `GET /v1/sync/overview` (`overview.ts`), proved with the same query as the socket and the
+   * signal poll — `routingProof` below, minted fresh because it carries a 30-second window.
+   * Bounded like the signal poll: a pane waiting on a half-open connection would say
+   * "Loading" until Obsidian restarted.
+   */
+  async loadOverview(): Promise<OverviewResult> {
+    if (!this.isPaired()) return { status: "failed", reason: "not_paired" };
+    const proof = await this.routingProof();
+    return fetchOverview(this.cfg.controlplaneOrigin, proof, (origin, path) =>
+      this.boundedRequest(origin, path),
+    );
+  }
+
+  openInBrowser(url: string): void {
+    void openInSystemBrowser(url);
+  }
+
+  /**
+   * The pair page again, for the intent this device is already waiting on — the link
+   * `pairPageUrl` rebuilds from the persisted id, exactly as `startPairing`'s own
+   * `browser_failed` branch says it can be. Registers nothing: a second intent would strand
+   * the first, and the poll that is running is for this one.
+   */
+  reopenPairingPage(): boolean {
+    if (this.pairingRun === null || this.cfg.webAppOrigin === "") return false;
+    const state = loadPairingState(this.app);
+    if (state === null) return false;
+    void openInSystemBrowser(pairPageUrl(this.cfg.webAppOrigin, state.intentId));
+    return true;
+  }
+
+  /**
+   * Stop waiting on the browser. The intent is forgotten locally and its poll stopped; the
+   * server's copy simply expires, which is what an unfinished intent does anyway and grants
+   * nothing (D16). The pane redraws when the run ends, through `endPairingRun`.
+   */
+  cancelPairing(): void {
+    clearPairingState(this.app);
+    this.pairingRunAborter?.abort();
   }
 
   private setStatus(patch: Partial<SyncStatus>): void {
@@ -449,6 +522,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     }
 
     this.addSettingTab(new CtrlNotesSettingsTab(this.app, this));
+    this.showStatusBar();
 
     this.register(() => this.disconnectSyncing());
     this.watchVault();
@@ -464,6 +538,51 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     if (this.isPaired()) {
       this.ready = this.startSyncing();
     }
+  }
+
+  /**
+   * The ambient status: an icon and one word in Obsidian's status bar, the full sentence as
+   * its label, and a click that opens this plugin's settings.
+   *
+   * **Desktop only.** Obsidian's mobile app has no status bar, and a mobile user has the
+   * settings pane.
+   *
+   * Native classes only (`mod-clickable`, `status-bar-item-icon`), so the plugin still ships
+   * no stylesheet: a `styles.css` would be a third release asset, which `tools/release.mjs`
+   * would then demand of every release, including the ones already published without it.
+   */
+  private showStatusBar(): void {
+    if (Platform.isMobile) return;
+    const item = this.addStatusBarItem();
+    item.addClass("mod-clickable");
+    item.setAttr("data-tooltip-position", "top");
+    const icon = item.createSpan({ cls: "status-bar-item-icon" });
+    const word = item.createSpan();
+    const draw = (): void => {
+      const face = statusBarFace(this.isPaired() ? this.status : null);
+      setIcon(icon, face.icon);
+      word.setText(face.text);
+      item.setAttr("aria-label", face.label);
+    };
+    draw();
+    this.register(this.onStatusChange(draw));
+    this.register(this.onPairingChange(draw));
+    this.registerDomEvent(item, "click", () => this.openOwnSettings());
+  }
+
+  /**
+   * Open Settings at this plugin's tab.
+   *
+   * **`app.setting` is not in `obsidian.d.ts`**, so it is reached through a narrow type and
+   * checked before each call rather than assumed. It is the object Obsidian's own "Open
+   * settings" command drives, and plugins have used `open` and `openTabById` for years; if a
+   * release ever removes them, the click does nothing rather than throwing.
+   */
+  private openOwnSettings(): void {
+    const setting = (this.app as unknown as { setting?: Partial<SettingsModal> }).setting;
+    if (typeof setting?.open !== "function" || typeof setting.openTabById !== "function") return;
+    setting.open();
+    setting.openTabById(this.manifest.id);
   }
 
   /**
@@ -496,11 +615,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   async startPairing(label: string): Promise<void> {
     if (this.pairingRun !== null) {
-      new Notice(`This device is already waiting to be connected to ${PRODUCT_NAME}`);
+      new Notice(`This device is already waiting to be connected to ${PRODUCT_NAME}.`);
       return;
     }
     if (this.identity === null) return; // Not reachable in practice: onload loads it first.
-    const run = this.beginPairing(label);
+    const run = this.beginPairing(label, this.newPairingSignal());
     this.pairingRun = run;
     try {
       await run;
@@ -526,7 +645,16 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.notifyPairingChange();
   }
 
-  private async beginPairing(label: string): Promise<void> {
+  /** A fresh abort signal for one pairing run, fired by "Cancel pairing" or by unload. */
+  private newPairingSignal(): AbortSignal {
+    const run = new AbortController();
+    this.pairingRunAborter = run;
+    if (this.pairingAborter.signal.aborted) run.abort();
+    else this.pairingAborter.signal.addEventListener("abort", () => run.abort(), { once: true });
+    return run.signal;
+  }
+
+  private async beginPairing(label: string, signal: AbortSignal): Promise<void> {
     const identity = this.identity;
     if (identity === null) return;
 
@@ -541,15 +669,31 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     if (!this.active) return; // The plugin was disabled while we were asking.
     if (!started.ok) {
       new Notice(
-        started.reason === "origin_not_configured"
-          ? "Set the control plane and web app origins in the Ctrl Notes Cloud MCP settings first"
-          : `Could not start pairing with Ctrl Notes (${started.reason})`,
+        failureMessage(
+          `Could not start pairing with ${PRODUCT_NAME}.`,
+          started.reason,
+          "could not start pairing",
+        ),
       );
+      // **`browser_failed` left a live, persisted intent behind** (`pairing-intent.ts`
+      // keeps it on purpose), so this device waits on it like any other: the pane's "Open
+      // browser again" rebuilds the link, and its Notice says so. Every other refusal left
+      // nothing to wait on.
+      if (started.reason !== "browser_failed") return;
+      const kept = loadPairingState(this.app);
+      if (kept === null || signal.aborted) return;
+      this.notifyPairingChange();
+      await this.awaitAndAdopt(kept, label, signal);
+      return;
+    }
+    // Cancelled while the intent was being registered: it is persisted by now, so it goes.
+    if (signal.aborted) {
+      clearPairingState(this.app);
       return;
     }
     this.notifyPairingChange();
-    new Notice("Finish connecting this device in your browser");
-    await this.awaitAndAdopt(started.value.state, label);
+    new Notice("Finish connecting this device in your browser.");
+    await this.awaitAndAdopt(started.value.state, label, signal);
   }
 
   /**
@@ -565,7 +709,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     if (state === null) return;
     // `vault.getName()` rather than a stored label: it is what the settings tab passes on
     // the Pair press too, and a label is display text the user can change later anyway.
-    const run = this.awaitAndAdopt(state, this.app.vault.getName());
+    const run = this.awaitAndAdopt(state, this.app.vault.getName(), this.newPairingSignal());
     this.pairingRun = run;
     this.notifyPairingChange();
     void run.finally(() => {
@@ -580,27 +724,30 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * reason the old flow's own comment gave and which has not changed: `requestUrl` has no
    * abort, so a response already on the wire lands whatever the signal says.
    */
-  private async awaitAndAdopt(state: PairingState, label: string): Promise<void> {
+  private async awaitAndAdopt(
+    state: PairingState,
+    label: string,
+    signal: AbortSignal,
+  ): Promise<void> {
     const identity = this.identity;
     if (identity === null) return;
 
-    const settled = await retrieveWhenBound(
-      this.cfg.controlplaneOrigin,
-      state,
-      identity,
-      this.pairingAborter.signal,
-    );
+    const settled = await retrieveWhenBound(this.cfg.controlplaneOrigin, state, identity, signal);
     if (!this.active) return;
 
     switch (settled.status) {
       case "cancelled":
-        return; // Unloading. Nobody is left to tell.
+        // Unloading, or "Cancel pairing" — which already forgot the intent, and whose pane
+        // redraws when this run ends. Nobody needs telling either way.
+        return;
       case "expired":
         // Forgotten rather than kept: an intent past its deadline can never bind, so
         // keeping it would have every later load resume a poll that reports the same thing
         // again. The recovery is the one the user already knows — press Pair.
         this.forgetPairing();
-        new Notice("This pairing request expired before it was completed");
+        new Notice(
+          "This pairing request expired before it was completed. Pair this device again to continue.",
+        );
         return;
       case "redeemed":
         // **Terminal, and the user must pair again.** `adopt.ts` keeps the intent after a
@@ -611,14 +758,22 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         // process that has since gone (D19 is a tap on THIS device, in THIS run). Adopting
         // here would be adopting without one.
         this.forgetPairing();
-        new Notice("This pairing request has already been used");
+        new Notice(
+          "This pairing request has already been used. Pair this device again to continue.",
+        );
         return;
       case "refused":
         // A 4xx is the server's considered answer about this intent (AT8 folds unknown,
         // expired and unverifiable into one refusal on purpose), so it cannot change by
         // being asked again.
         this.forgetPairing();
-        new Notice(`Could not finish pairing with Ctrl Notes (${settled.reason})`);
+        new Notice(
+          failureMessage(
+            `Could not finish pairing with ${PRODUCT_NAME}.`,
+            settled.reason,
+            "the pairing request was refused",
+          ),
+        );
         return;
       case "bound":
         await this.adopt(state, settled.pairing, label);
@@ -682,14 +837,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         // something that cannot complete.
         this.forgetPairing();
         new Notice(
-          "This Ctrl Notes control plane cannot finish pairing: it has no signing key " +
-            "configured",
+          `This ${PRODUCT_NAME} control plane cannot finish pairing: it has no signing key ` +
+            "configured.",
         );
         return;
       case "declined":
         // The gate already dropped the intent; this is only the pane catching up.
         this.notifyPairingChange();
-        new Notice(`This device was not connected to ${PRODUCT_NAME}`);
+        new Notice(`This device was not connected to ${PRODUCT_NAME}.`);
         return;
       case "mismatch":
         // The re-read after the tap named a different pairing or vault than the dialog
@@ -697,17 +852,23 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         // told plainly, because this is the one refusal that is worth being suspicious of.
         this.notifyPairingChange();
         new Notice(
-          "This device was NOT connected to Ctrl Notes. The pairing changed after you " +
+          `This device was not connected to ${PRODUCT_NAME}. The pairing changed after you ` +
             "confirmed it. Start again, and cancel if you are asked twice.",
         );
         return;
       case "failed":
         this.notifyPairingChange();
-        new Notice(`Could not pair with Ctrl Notes (${outcome.reason})`);
+        new Notice(
+          failureMessage(
+            `Could not pair with ${PRODUCT_NAME}.`,
+            outcome.reason,
+            "redemption failed",
+          ),
+        );
         return;
       case "adopted":
         this.notifyPairingChange();
-        new Notice(`Paired with ${PRODUCT_NAME}`);
+        new Notice(`Paired with ${PRODUCT_NAME}.`);
         // **Disconnected first, and not only for tidiness.** `SyncSocket` is constructed
         // with the vault id it will sign every challenge for, so a connection opened for
         // the PREVIOUS vault keeps signing for that one — and `startSyncing` returns early
@@ -776,6 +937,15 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     await this.saveData(this.cfg);
     await forgetDeviceKey(this.app);
     this.identity = await DeviceIdentity.load(this.app);
+    // The status described the vault this device just left. Kept, a re-pair would open on
+    // the old refusal ("Sync was refused" beside a device that has just been paired) until
+    // its first `ready`, and "Show files" would list files of a vault it no longer syncs.
+    this.withheld.clear();
+    this.refusedFiles.clear();
+    this.unavailableFiles.clear();
+    this.setStatus(IDLE_STATUS);
+    // The status bar reads "Not paired" from this; the settings pane redraws on it too.
+    this.notifyPairingChange();
   }
 
   private seedInitialUpload(): void {
@@ -1015,14 +1185,18 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           // here would abandon the very push or queue that retry is meant to resume, and
           // `startSyncing`'s only other entry point is a fresh pairing, not what this needs.
           //
-          // **No `Notice` for it** (BI1): a busy vault closes every few seconds during an
-          // import and nothing is wrong. The status line says so (`status.ts`'s `retrying`).
+          // **No `Notice` for it, and it is not a refusal** (BI1): a busy vault closes every
+          // few seconds during an import and nothing is wrong. It used to raise a Notice and
+          // set `refusal`, so a closing the device recovers from on its own popped
+          // "Disconnected" and put "Sync was refused" at the head of the pane until the
+          // reconnect landed. The status line says so instead (`status.ts`'s `retrying`), and
+          // `ready` clears it.
           if (willRetry) {
             if (this.readiedThisPair) this.watchersRan = true;
             this.setStatus({ retrying: message, updating: false });
             return;
           }
-          new Notice(`Disconnected from the Ctrl Notes vault: ${message}`);
+          new Notice(`Sync with ${PRODUCT_NAME} stopped: ${asSentence(message)}`);
           this.setStatus({ refusal: message, updating: false });
           this.disconnectSyncing();
         },
@@ -1132,7 +1306,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       // is gone — so this contributes a clause and nothing more.
       onUnavailable: (path, reason) => {
         console.warn(`Ctrl Notes: the server has no content for ${path} (${reason})`);
-        this.setStatus({ unavailable: this.status.unavailable + 1 });
+        this.unavailableFiles.add(path);
+        this.setStatus({ unavailable: this.unavailableFiles.size });
       },
       attachments: this.attachments,
     };
@@ -1207,7 +1382,17 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   /** Registered at load, whatever the pairing state: each handler does nothing unless a
    * paired device is parked, and a device paired later needs them without a reload. */
   private watchForReturn(): void {
-    this.addCommand({ id: "sync-now", name: "Sync now", callback: () => this.syncNow() });
+    // `checkCallback`, so the palette offers "Sync now" only to a device that has something
+    // to sync with. It did nothing at all on an unpaired device, which reads as broken.
+    this.addCommand({
+      id: "sync-now",
+      name: "Sync now",
+      checkCallback: (checking) => {
+        if (!this.isPaired() || this.socket === null) return false;
+        if (!checking) this.syncNow();
+        return true;
+      },
+    });
     this.registerDomEvent(window, "focus", () => void this.pollSignal(false));
     this.registerDomEvent(activeDocument, "visibilitychange", () => {
       if (this.inForeground()) void this.pollSignal(false);
@@ -1294,20 +1479,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     try {
       const proof = await this.routingProof();
       if (proof === null || !this.active || !this.parked) return;
-      // Bounded (`SIGNAL_TIMEOUT_MS`): a poll that never settles counts as a failure —
-      // no wake — and clears `polling` below. The orphaned request may still answer
-      // later; nothing awaits it, so its result is discarded.
-      let timer: number | undefined;
-      const got = await Promise.race([
-        request(this.cfg.controlplaneOrigin, `/v1/sync/signal?${proof}`, "GET"),
-        new Promise<Requested>((resolve) => {
-          timer = window.setTimeout(
-            () => resolve({ ok: false, reason: "timeout" }),
-            SIGNAL_TIMEOUT_MS,
-          );
-        }),
-      ]);
-      window.clearTimeout(timer);
+      // Bounded: a poll that never settles counts as a failure — no wake — and clears
+      // `polling` below.
+      const got = await this.boundedRequest(
+        this.cfg.controlplaneOrigin,
+        `/v1/sync/signal?${proof}`,
+      );
       if (!this.active || !this.parked) return;
       if (!got.ok || got.value.status !== 200) return;
       const seq = readSignal(got.value.body);
@@ -1321,6 +1498,26 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     } finally {
       this.polling = false;
     }
+  }
+
+  /**
+   * A control-plane GET bounded by `SIGNAL_TIMEOUT_MS`: one that never settles answers
+   * `timeout`. The orphaned request may still answer later; nothing awaits it, so its result
+   * is discarded. Shared by the signal poll and the settings pane's overview.
+   */
+  private async boundedRequest(origin: string, path: string): Promise<Requested> {
+    let timer: number | undefined;
+    const got = await Promise.race([
+      request(origin, path, "GET"),
+      new Promise<Requested>((resolve) => {
+        timer = window.setTimeout(
+          () => resolve({ ok: false, reason: "timeout" }),
+          SIGNAL_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    window.clearTimeout(timer);
+    return got;
   }
 
   /** A vault event added to `touched`. The settle is armed as always; a parked device also
@@ -1368,11 +1565,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     }
     for (const r of plan.report) {
       console.warn(`Ctrl Notes: ${r.path} was refused and will not be retried: ${r.reason}`);
+      this.refusedFiles.set(r.path, r.reason);
       // Not `refusal`, for the reason `onUnavailable` gives (O3): one refused FILE is not a
       // refused session. Setting it put "Sync was refused: <reason>" at the head of the
       // pane — which outranks every clause, the refused count included — with nothing to
       // clear it, so one bad file read as sync being down until a reload.
-      this.setStatus({ refused: this.status.refused + 1 });
+      this.setStatus({ refused: this.refusedFiles.size });
     }
   }
 
@@ -1498,8 +1696,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       // deleted stops being counted the moment the next derive sees it.
       for (const path of touched.dirty) this.withheld.delete(path);
       for (const path of touched.deleted) this.withheld.delete(path);
-      for (const path of oversize) this.withheld.add(path);
-      for (const path of undecodable) this.withheld.add(path);
+      for (const path of oversize) this.withheld.set(path, "oversize");
+      for (const path of undecodable) this.withheld.set(path, "undecodable");
       this.setStatus({
         pending: changes.length,
         unsyncable: this.shadowed.length + this.withheld.size,

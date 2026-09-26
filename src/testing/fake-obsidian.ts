@@ -127,6 +127,20 @@ export class Plugin extends Component {
     });
   }
 
+  /**
+   * Obsidian's `addStatusBarItem`: an element in the status bar, removed on unload. Recorded
+   * in `statusBarItems` so a test can read what the item says and how it is labelled.
+   */
+  addStatusBarItem(): FakeEl {
+    const item = fakeEl();
+    statusBarItems.push(item);
+    this.register(() => {
+      const at = statusBarItems.indexOf(item);
+      if (at >= 0) statusBarItems.splice(at, 1);
+    });
+    return item;
+  }
+
   /** Obsidian's `registerInterval`: cleared on unload. The id is a real one from
    * `window.setInterval`, so fake timers drive it like any other. */
   registerInterval(id: number): number {
@@ -139,10 +153,38 @@ export interface FakeCommand {
   readonly id: string;
   readonly name: string;
   readonly callback?: () => unknown;
+  readonly checkCallback?: (checking: boolean) => boolean | undefined;
 }
 
 /** Every command a loaded plugin has added, in order. */
 export const commands: FakeCommand[] = [];
+
+/**
+ * Whether the palette would list a command now: Obsidian asks a `checkCallback` with
+ * `checking: true` before showing it, and lists a plain `callback` command always.
+ */
+export const commandAvailable = (name: string): boolean => {
+  const command = commands.find((c) => c.name === name);
+  if (command === undefined) return false;
+  if (command.checkCallback !== undefined) return command.checkCallback(true) === true;
+  return command.callback !== undefined;
+};
+
+/** Run a command the way a user picking it from the palette does — only if it is listed. */
+export const runCommand = (name: string): void => {
+  const command = commands.find((c) => c.name === name);
+  if (command === undefined || !commandAvailable(name)) return;
+  if (command.checkCallback !== undefined) command.checkCallback(false);
+  else void command.callback?.();
+};
+
+/** Every status bar item a loaded plugin holds, in order. */
+export const statusBarItems: FakeEl[] = [];
+
+/** Obsidian's `setIcon`: records which icon an element shows. */
+export const setIcon = (el: FakeEl, icon: string): void => {
+  el.icon = icon;
+};
 
 /** Every live `registerDomEvent` listener, by event type. */
 export const domListeners = new Map<string, Array<() => unknown>>();
@@ -179,29 +221,92 @@ if (!("activeDocument" in globalThis)) {
  */
 export interface FakeEl {
   readonly texts: string[];
+  /** The `<code>` spans drawn in this element or below it, by text. */
+  readonly code: string[];
+  readonly classes: Set<string>;
+  readonly attrs: Map<string, string>;
+  /** The icon `setIcon` last drew here. */
+  icon: string | null;
   setText(text: string): void;
+  appendText(text: string): void;
+  /** Test-only: record text as drawn by a child, as `code` when it was a `<code>`. */
+  appendTextAs(text: string, isCode: boolean): void;
   empty(): void;
   createEl(tag: string, o?: { text?: string; cls?: string } | string): FakeEl;
+  createDiv(o?: { text?: string; cls?: string } | string): FakeEl;
+  createSpan(o?: { text?: string; cls?: string } | string): FakeEl;
+  addClass(...cls: string[]): void;
+  toggleClass(cls: string, on: boolean): void;
+  setAttr(name: string, value: string): void;
 }
 
-const fakeEl = (): FakeEl => {
+/**
+ * A recording element. A child's text is recorded on every ancestor too, because what a
+ * test asks is "what does this element say", and a modal or a settings row says what its
+ * children say. `setText` replaces the element's own text, as it does on a real one.
+ *
+ * `onChange` runs after every change, so a settings row can keep its `desc` in step.
+ */
+export const fakeEl = (onChange: () => void = () => {}, parent: FakeEl | null = null): FakeEl => {
   const texts: string[] = [];
+  const code: string[] = [];
+  const record = (text: string, isCode: boolean): void => {
+    for (let at: FakeEl | null = el; at !== null; at = parentOf.get(at) ?? null) {
+      at.texts.push(text);
+      if (isCode) at.code.push(text);
+    }
+    onChange();
+  };
+  const create = (tag: string, o?: { text?: string; cls?: string } | string): FakeEl => {
+    const child = fakeEl(onChange, el);
+    const cls = typeof o === "string" ? o : o?.cls;
+    if (cls !== undefined) child.classes.add(cls);
+    const text = typeof o === "string" ? undefined : o?.text;
+    if (text !== undefined) child.appendTextAs(text, tag === "code");
+    return child;
+  };
   const el: FakeEl = {
     texts,
+    code,
+    classes: new Set(),
+    attrs: new Map(),
+    icon: null,
     setText: (text) => {
-      texts.push(text);
+      texts.length = 0;
+      record(text, false);
+    },
+    appendText: (text) => {
+      record(text, false);
+    },
+    appendTextAs: (text, isCode) => {
+      record(text, isCode);
     },
     empty: () => {
       texts.length = 0;
+      code.length = 0;
+      onChange();
     },
-    createEl: (_tag, o) => {
-      const text = typeof o === "string" ? o : o?.text;
-      if (text !== undefined) texts.push(text);
-      return el;
+    createEl: create,
+    createDiv: (o) => create("div", o),
+    createSpan: (o) => create("span", o),
+    addClass: (...cls) => {
+      for (const c of cls) el.classes.add(c);
+      onChange();
+    },
+    toggleClass: (cls, on) => {
+      if (on) el.classes.add(cls);
+      else el.classes.delete(cls);
+      onChange();
+    },
+    setAttr: (name, value) => {
+      el.attrs.set(name, value);
     },
   };
+  if (parent !== null) parentOf.set(el, parent);
   return el;
 };
+
+const parentOf = new WeakMap<FakeEl, FakeEl>();
 
 /**
  * Every modal currently open, oldest first. A test dismisses one (`close()`) the way Escape,
@@ -272,11 +377,21 @@ export const noticeText = (n: Notice): string =>
  * shapes `settings-tab.ts` returns from `getSettingDefinitions()`.
  */
 interface FakeSettingDefinition {
+  type?: undefined;
   name: string;
   desc?: string;
   visible?: boolean | (() => boolean);
   control?: { type: "text"; key: string; placeholder?: string };
   render?: (setting: Setting, group: unknown) => undefined | (() => void);
+}
+
+/** A group: a heading, header buttons, and its own items, all hidden with `visible`. */
+interface FakeSettingGroup {
+  type: "group" | "list";
+  heading?: string;
+  visible?: boolean | (() => boolean);
+  extraButtons?: Array<(button: FakeExtraButtonComponent) => unknown>;
+  items?: FakeSettingDefinition[];
 }
 
 /**
@@ -323,7 +438,21 @@ export class PluginSettingTab {
 
   display(): void {
     this.#teardown();
-    for (const item of this.settingItems as FakeSettingDefinition[]) this.#render(item);
+    for (const item of this.settingItems as Array<FakeSettingDefinition | FakeSettingGroup>) {
+      if (item.type === undefined) this.#render(item);
+      else this.#renderGroup(item);
+    }
+  }
+
+  /** A group's heading is recorded as a row with `heading: true`, so a test can see both
+   * where a section starts and whether it is there at all. */
+  #renderGroup(group: FakeSettingGroup): void {
+    const visible = typeof group.visible === "function" ? group.visible() : (group.visible ?? true);
+    if (!visible) return;
+    const row = { name: group.heading ?? "", desc: "", heading: true, descEl: fakeEl() };
+    settingRows.push(row);
+    for (const extra of group.extraButtons ?? []) extra(new FakeExtraButtonComponent());
+    for (const item of group.items ?? []) this.#render(item);
   }
 
   hide(): void {
@@ -353,8 +482,20 @@ export class PluginSettingTab {
   }
 }
 
-/** Every button drawn into a settings pane, by its label, so a test can press one. */
-export const buttons: Array<{ text: string; click: () => unknown }> = [];
+/**
+ * Every button drawn into a settings pane or a modal, by its label, so a test can press one.
+ * `cta` and `destructive` record `setCta()` and `setDestructive()`; an icon-only header button is
+ * recorded under its tooltip.
+ */
+export interface FakeButton {
+  text: string;
+  click: () => unknown;
+  cta: boolean;
+  destructive: boolean;
+  disabled: boolean;
+}
+
+export const buttons: FakeButton[] = [];
 
 class FakeTextComponent {
   #value = "";
@@ -388,30 +529,60 @@ class FakeTextComponent {
 /** Every `FakeTextComponent` drawn, in order, so a test can `.type()` into one. */
 export const fakeTextComponents: FakeTextComponent[] = [];
 
+/** Records itself into `buttons` on first use, so a `setCta()` after `onClick` still lands. */
 class FakeButtonComponent {
-  #text = "";
-  #disabled = false;
+  readonly #record: FakeButton = {
+    text: "",
+    click: () => {},
+    cta: false,
+    destructive: false,
+    disabled: false,
+  };
+
+  constructor() {
+    buttons.push(this.#record);
+  }
 
   setButtonText(text: string): this {
-    this.#text = text;
+    this.#record.text = text;
+    return this;
+  }
+
+  setTooltip(tooltip: string): this {
+    if (this.#record.text === "") this.#record.text = tooltip;
+    return this;
+  }
+
+  setIcon(_icon: string): this {
     return this;
   }
 
   setDisabled(disabled: boolean): this {
-    this.#disabled = disabled;
+    this.#record.disabled = disabled;
+    return this;
+  }
+
+  setCta(): this {
+    this.#record.cta = true;
+    return this;
+  }
+
+  setDestructive(): this {
+    this.#record.destructive = true;
     return this;
   }
 
   onClick(cb: () => unknown): this {
-    buttons.push({
-      text: this.#text,
-      click: () => {
-        if (!this.#disabled) return cb();
-      },
-    });
+    const record = this.#record;
+    record.click = () => {
+      if (!record.disabled) return cb();
+    };
     return this;
   }
 }
+
+/** A group header's icon button: the same record, labelled by its tooltip. */
+class FakeExtraButtonComponent extends FakeButtonComponent {}
 
 /**
  * Every settings row drawn, in order, with the words that reached the user.
@@ -423,17 +594,34 @@ class FakeButtonComponent {
  * §6.3): the copy IS the deliverable there, not decoration around a button. Same reasoning
  * as `FakeEl.texts`, one surface over. Clear it in `afterEach`.
  */
-export const settingRows: Array<{ name: string; desc: string }> = [];
+export interface FakeSettingRow {
+  name: string;
+  desc: string;
+  heading?: boolean;
+  /** The row's description element, whose text `desc` mirrors. */
+  descEl: FakeEl;
+}
+
+export const settingRows: FakeSettingRow[] = [];
 
 /** Every word any settings row put in front of the user, joined — what a copy assertion
  * actually wants to search. */
 export const settingsText = (): string => settingRows.map((r) => `${r.name} ${r.desc}`).join("\n");
 
 export class Setting {
-  readonly #row: { name: string; desc: string } = { name: "", desc: "" };
+  readonly #row: FakeSettingRow;
+  readonly descEl: FakeEl;
 
   constructor(readonly containerEl: unknown) {
-    settingRows.push(this.#row);
+    const row: FakeSettingRow = { name: "", desc: "", descEl: fakeEl() };
+    // `desc` follows whatever was drawn into the description element, `setDesc` or not.
+    row.descEl = fakeEl(() => {
+      // Pieces drawn separately read as words separated by one space, as they render.
+      row.desc = row.descEl.texts.map((t) => t.trim()).join(" ");
+    });
+    this.#row = row;
+    this.descEl = row.descEl;
+    settingRows.push(row);
   }
 
   setName(name: string): this {
@@ -442,7 +630,7 @@ export class Setting {
   }
 
   setDesc(desc: string): this {
-    this.#row.desc = desc;
+    this.descEl.setText(desc);
     return this;
   }
 
