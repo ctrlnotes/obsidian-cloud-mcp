@@ -2,7 +2,7 @@
 
 Each release's section becomes its release notes. Newest first.
 
-## Unreleased
+## 0.0.4
 
 - **A busy vault no longer stops a sync.** When the vault closes the connection it now says
   whether to come back, and the plugin reconnects by itself unless the vault says not to
