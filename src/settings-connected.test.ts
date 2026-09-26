@@ -1,5 +1,6 @@
 import type { App, Plugin } from "obsidian";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import type { ConfirmCopy } from "./modals.ts";
 import type { OverviewResult } from "./overview.ts";
 import { CONNECT_CLAUDE_CODE, CtrlNotesSettingsTab, type SettingsHost } from "./settings-tab.ts";
 import { IDLE_STATUS, type SyncStatus } from "./sync/status.ts";
@@ -35,6 +36,10 @@ interface Harness {
   readonly setStatus: (status: SyncStatus) => void;
   readonly disconnect: ReturnType<typeof vi.fn>;
   readonly startPairing: ReturnType<typeof vi.fn>;
+  readonly retrySyncing: ReturnType<typeof vi.fn>;
+  /** Change which vault and device the host is paired with, and announce it the way the
+   * plugin's `notifyPairingChange` does. */
+  readonly repair: (vaultId: string, deviceId: string | null) => void;
 }
 
 const harness = (
@@ -47,6 +52,8 @@ const harness = (
   const opened: string[] = [];
   const disconnect = vi.fn(async () => {});
   const startPairing = vi.fn(async () => {});
+  const retrySyncing = vi.fn(() => {});
+  const pairingListeners = new Set<() => void>();
   const host = {
     controlplaneOrigin: "https://sync.test",
     webAppOrigin: "https://app.test",
@@ -65,9 +72,15 @@ const harness = (
         listeners.delete(fn);
       };
     },
-    onPairingChange: () => () => {},
+    onPairingChange: (fn: () => void) => {
+      pairingListeners.add(fn);
+      return () => {
+        pairingListeners.delete(fn);
+      };
+    },
     register: () => {},
     ...settingsHostDefaults(),
+    retrySyncing,
     now: () => NOW,
     openInBrowser: (url: string) => {
       opened.push(url);
@@ -88,6 +101,11 @@ const harness = (
     },
     disconnect,
     startPairing,
+    retrySyncing,
+    repair: (vaultId, deviceId) => {
+      Object.assign(host, { vaultId, deviceId });
+      for (const fn of [...pairingListeners]) fn();
+    },
   };
 };
 
@@ -198,6 +216,17 @@ describe("the status row", () => {
 /** Item 3: a refused device must not read as connected, and must be offered the way back. */
 describe("a refused session", () => {
   const refused: SyncStatus = { ...IDLE_STATUS, syncedCursor: 3, refusal: "not authorised" };
+  /** What `socket.ts` makes of the same refusal met during a handshake. */
+  const refusedOnConnect: SyncStatus = {
+    ...refused,
+    refusal: 'could not connect to vault "v": not authorised',
+  };
+  /** A refusal that is not about this device's registration at all. */
+  const mismatched: SyncStatus = {
+    ...IDLE_STATUS,
+    syncedCursor: 3,
+    refusal: "wire version 4 is not supported by this vault",
+  };
 
   it("is drawn as a warning, and nothing on the pane says Connected", () => {
     const h = harness();
@@ -211,32 +240,100 @@ describe("a refused session", () => {
     expect(row("Sync")?.desc).toMatch(/removed from your vault's device list/);
   });
 
-  it("offers Pair again, which disconnects locally and then starts pairing", async () => {
+  it("offers Pair again for the revoked-elsewhere refusal, in either form", () => {
+    for (const status of [refused, refusedOnConnect]) {
+      buttons.length = 0;
+      const h = harness();
+      h.setStatus(status);
+      open(h);
+      expect(buttons.find((b) => b.text === "Pair again…")?.cta).toBe(true);
+      expect(buttons.map((b) => b.text)).not.toContain("Try again");
+    }
+  });
+
+  /**
+   * **Pair again erases the key, so it is offered only where it can help.** Until
+   * 2026-09-26 any refusal carried it — a wire-version mismatch included, where a new
+   * registration fixes nothing and the old key was fine. Such a refusal is still a warning,
+   * and is offered a retry that keeps everything.
+   */
+  it("offers no Pair again for any other refusal, and a non-destructive Try again instead", () => {
     const h = harness();
-    h.setStatus(refused);
+    h.setStatus(mismatched);
     open(h);
 
-    const pairAgain = buttons.find((b) => b.text === "Pair again");
-    expect(pairAgain?.cta).toBe(true);
-    pairAgain?.click();
+    expect(row("Sync")?.descEl.classes.has("mod-warning")).toBe(true);
+    expect(buttons.map((b) => b.text)).not.toContain("Pair again…");
+    expect(buttons.find((b) => /pair/i.test(b.text))).toBeUndefined();
+    const retry = buttons.find((b) => b.text === "Try again");
+    expect(retry?.destructive).toBe(false);
+    retry?.click();
+    expect(h.retrySyncing).toHaveBeenCalledTimes(1);
+    expect(h.disconnect).not.toHaveBeenCalled();
+    expect(h.startPairing).not.toHaveBeenCalled();
+  });
+
+  it("asks first, as Disconnect does, then disconnects locally and starts pairing", async () => {
+    const h = harness();
+    h.setStatus(refused);
+    const tab = open(h);
+    const asked: ConfirmCopy[] = [];
+    tab.confirm = (copy) => {
+      asked.push(copy);
+      return Promise.resolve(true);
+    };
+
+    buttons.find((b) => b.text === "Pair again…")?.click();
     await vi.waitFor(() => expect(h.startPairing).toHaveBeenCalledWith("My Vault"));
+
+    expect(asked.map((c) => c.title)).toEqual(["Pair this device again?"]);
+    expect(asked[0]?.destructive).toBe(true);
+    const body = asked[0]?.body.join(" ") ?? "";
+    expect(body).toMatch(/erases this device's key/);
+    expect(body).toMatch(/stays in your device list until you remove it there/);
+    expect(body).toContain("https://app.test");
     expect(h.disconnect).toHaveBeenCalledTimes(1);
     expect(h.disconnect.mock.invocationCallOrder[0]).toBeLessThan(
       h.startPairing.mock.invocationCallOrder[0] ?? 0,
     );
   });
 
+  /** The real modal, through the default seam: dismissing it is a no, and a no erases
+   * nothing. */
+  it("erases nothing when the confirmation is dismissed", async () => {
+    const h = harness();
+    h.setStatus(refused);
+    open(h);
+
+    buttons.find((b) => b.text === "Pair again…")?.click();
+    const modal = openModals[0];
+    expect(modal?.titleEl.texts).toEqual(["Pair this device again?"]);
+    expect(buttons.find((b) => b.text === "Pair again")?.destructive).toBe(true);
+    modal?.close();
+    await landed();
+
+    expect(h.disconnect).not.toHaveBeenCalled();
+    expect(h.startPairing).not.toHaveBeenCalled();
+  });
+
   it("appears when a refusal arrives while the pane is open, and goes when it clears", () => {
     const h = harness();
     open(h);
-    expect(buttons.map((b) => b.text)).not.toContain("Pair again");
+    expect(buttons.map((b) => b.text)).not.toContain("Pair again…");
 
     h.setStatus(refused);
-    expect(buttons.map((b) => b.text)).toContain("Pair again");
+    expect(buttons.map((b) => b.text)).toContain("Pair again…");
+
+    // A different refusal swaps the button rather than keeping the old one.
+    buttons.length = 0;
+    h.setStatus(mismatched);
+    expect(buttons.map((b) => b.text)).toContain("Try again");
+    expect(buttons.map((b) => b.text)).not.toContain("Pair again…");
 
     buttons.length = 0;
     h.setStatus({ ...IDLE_STATUS, syncedCursor: 3 });
-    expect(buttons.map((b) => b.text)).not.toContain("Pair again");
+    expect(buttons.map((b) => b.text)).not.toContain("Pair again…");
+    expect(buttons.map((b) => b.text)).not.toContain("Try again");
     expect(row("Sync")?.descEl.classes.has("mod-warning")).toBe(false);
   });
 });
@@ -293,8 +390,9 @@ describe("the agents that can reach this vault", () => {
     const empty = row("No agents are connected to this vault yet.");
     expect(empty).toBeDefined();
     expect(empty?.descEl.code).toEqual([CONNECT_CLAUDE_CODE]);
+    // Word for word the web app's Claude Code guide (`apps/client/src/lib/guides.ts`).
     expect(CONNECT_CLAUDE_CODE).toBe(
-      "claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp",
+      "claude mcp add --transport http --scope user ctrlnotes https://mcp.ctrlnotes.app/mcp",
     );
   });
 
@@ -369,9 +467,98 @@ describe("the agents that can reach this vault", () => {
     expect(h.overviewCalls()).toBe(2);
   });
 
+  /**
+   * Closing the pane keeps the last answer, so a reopen goes on naming the vault and listing
+   * its agents while the fresh answer is on its way — rather than dropping to a vault id and
+   * "Loading" and back again, which is what `hide()` used to do by forgetting everything.
+   */
+  it("keeps showing the last answer while a reopen refreshes it", async () => {
+    let calls = 0;
+    const h = harness({}, () => {
+      calls += 1;
+      return calls === 1 ? Promise.resolve(loaded(agents)) : new Promise(() => {});
+    });
+    const tab = open(h);
+    await landed();
+    tab.hide();
+
+    settingRows.length = 0;
+    tab.display();
+    await landed();
+
+    expect(h.overviewCalls()).toBe(2);
+    expect(row("Vault")?.desc).toBe("Work");
+    expect(names()).toContain("Claude Code");
+    expect(settingsText()).not.toContain("Loading agents…");
+  });
+
   it("is not polled", () => {
     const interval = vi.spyOn(globalThis, "setInterval");
     open(harness());
     expect(interval).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * **A list belongs to the pairing it was loaded under.** Disconnect, then a pairing to a
+ * different vault, with the pane open throughout: the pane used to go on naming the old
+ * vault and listing its agents, and an answer still in flight from before the change could
+ * land on top of the new one.
+ */
+describe("the agents list across a change of pairing", () => {
+  const OLD = "e000518f8653638e404ca98c6d0a8f10";
+  const NEW = "b1946ac92492d2347c6235b4d2611184";
+  const overviewOf = (vault_id: string, name: string, agent: string): OverviewResult => ({
+    status: "loaded",
+    overview: {
+      vault: { vault_id, name },
+      agents: [{ name: agent, capability: "r", issued_at: 0, last_used_at: null, expires_at: 0 }],
+    },
+  });
+
+  it("reloads for the new vault, never shows the old list, and drops an old answer", async () => {
+    const answers: Array<(r: OverviewResult) => void> = [];
+    const h = harness({}, () => new Promise((resolve) => answers.push(resolve)));
+    open(h);
+    answers[0]?.(overviewOf(OLD, "Work", "Old agent"));
+    await landed();
+    expect(names()).toContain("Old agent");
+
+    // A refresh for the old vault, still in flight when the pairing changes under it.
+    buttons.find((b) => b.text === "Refresh")?.click();
+    expect(answers).toHaveLength(2);
+
+    settingRows.length = 0;
+    h.repair("", null); // Disconnect.
+    h.repair(NEW, "0cc175b9c0f1b6a831c399e269772661"); // Adopted a different vault.
+    expect(answers).toHaveLength(3);
+    expect(names()).not.toContain("Old agent");
+    expect(settingsText()).toContain("Loading agents…");
+
+    // The old vault's answer lands late. It must not be drawn.
+    answers[1]?.(overviewOf(OLD, "Work", "Old agent"));
+    await landed();
+    expect(names()).not.toContain("Old agent");
+    expect(settingRows.filter((r) => r.name === "Vault").map((r) => r.desc)).not.toContain("Work");
+
+    answers[2]?.(overviewOf(NEW, "Personal", "New agent"));
+    await landed();
+    expect(names()).toContain("New agent");
+    expect(settingRows.filter((r) => r.name === "Vault").slice(-1)[0]?.desc).toBe("Personal");
+    expect(names()).not.toContain("Old agent");
+  });
+
+  /** The guard where the overview is read: an answer naming another vault is not drawn. */
+  it("draws no overview that names a vault other than this device's", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    open(harness({}, () => Promise.resolve(overviewOf(NEW, "Personal", "Stranger"))));
+    await landed();
+
+    expect(names()).not.toContain("Stranger");
+    expect(settingRows.filter((r) => r.name === "Vault").slice(-1)[0]?.desc).toBe(
+      "Vault ID e000 518f…",
+    );
+    expect(settingsText()).toContain("Couldn't load agents.");
+    expect(warn).toHaveBeenCalled();
   });
 });

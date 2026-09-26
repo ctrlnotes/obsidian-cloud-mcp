@@ -90,7 +90,7 @@ https://mcp.ctrlnotes.app/mcp
 In Claude Code:
 
 ```bash
-claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp
+claude mcp add --transport http --scope user ctrlnotes https://mcp.ctrlnotes.app/mcp
 ```
 
 Then run `/mcp` in Claude Code and authenticate. Your browser opens at ctrlnotes.app:
@@ -149,7 +149,7 @@ There is deliberately **no vault-id field**. The vault is chosen in the browser,
 vaults you own, and adopted here only after you confirm it in Obsidian.
 
 **"Disconnect this device" is local.** It forgets this device's registration and erases
-its private key from this computer, so this installation can no longer prove it is that
+its private key from this device, so this installation can no longer prove it is that
 device. It is **not** a revocation: the vault keeps trusting the registration until it is
 removed from the device list at ctrlnotes.app. If a device is lost, revoke it there;
 disconnecting on a device you still hold is not a substitute.
@@ -157,7 +157,10 @@ disconnecting on a device you still hold is not a substitute.
 If a device is revoked while it is running, the vault refuses its next connection with a
 deliberately uninformative *"not authorised"*, the same answer an unknown device gets, so
 that nobody can probe which devices exist. The settings pane explains what that most
-likely means, and offers **Pair again**.
+likely means, and offers **Pair again…**, which asks first: pairing again erases this
+device's key, and the old registration stays in the device list until it is removed
+there. Any other refusal is offered **Try again**, which keeps the registration; **Sync
+now** in the command palette does the same.
 
 ## Security
 

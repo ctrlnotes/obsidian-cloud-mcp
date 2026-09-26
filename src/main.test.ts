@@ -5,9 +5,10 @@
 // safety around `onunload`, the settle → derive → push wiring, and the honest "unpaired
 // means untouched" default.
 
+import { verifyAsync } from "@noble/ed25519";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ConfirmAdoption } from "./adopt.ts";
-import { DeviceIdentity, decodeBase64Url, SECRET_ID } from "./device.ts";
+import { DeviceIdentity, decodeBase64Url, routingContextMessage, SECRET_ID } from "./device.ts";
 import CtrlNotesPlugin from "./main.ts";
 import * as pairingIntent from "./pairing-intent.ts";
 import { PAIRED_ACTIONS } from "./protocol.ts";
@@ -33,6 +34,7 @@ import {
   unloadAll,
 } from "./testing/fake-host.ts";
 import {
+  buttons,
   commandAvailable,
   fakeDocument,
   fireDomEvent,
@@ -45,6 +47,7 @@ import {
   requestUrlHeld,
   requestUrlQueue,
   runCommand,
+  settingRows,
   statusBarItems,
 } from "./testing/fake-obsidian.ts";
 import { WIRE_VERSION } from "./wire.ts";
@@ -1320,6 +1323,27 @@ describe("disconnecting this device", () => {
     expect(after).not.toBe(before);
   });
 
+  /** "Show files" must not list clashes counted for the vault this device has left. */
+  it("forgets the name clashes it counted, with the rest of the skipped files", async () => {
+    stubWebSocket();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The same name twice: composed and decomposed, one wire path (`toWirePath` is NFC).
+    const plugin = await load(
+      { "caf\u00e9.md": "one", "cafe\u0301.md": "two" },
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    await bringUp(FakeWebSocket.instances[0] as FakeWebSocket);
+    await vi.waitFor(
+      () => expect(plugin.skippedFiles().map((f) => f.kind)).toContain("clash"),
+      UNTIL,
+    );
+
+    await plugin.disconnect();
+
+    expect(plugin.skippedFiles()).toEqual([]);
+  });
+
   it("closes the socket rather than leaving one signing for the vault it just left", async () => {
     stubWebSocket();
     const plugin = await load(
@@ -1396,6 +1420,80 @@ describe("an open settings pane and a pairing that moves", () => {
 
     expect(redraws).toBeGreaterThan(1);
     expect(redraws).toBeLessThan(6);
+  });
+});
+
+/**
+ * **The pane needs no redraw of its own after Disconnect or Pair again.** Both used to call
+ * `update()` right after `host.disconnect()`, which already announces itself through
+ * `notifyPairingChange` — and the settings suites' fake hosts announce nothing, so only the
+ * real plugin can show the pane still follows.
+ *
+ * **Each case waits for the agents answer to land before it presses anything**, because
+ * that answer redraws the pane too, and one landing after the press would redraw it for
+ * the notify and pass the case whatever `disconnect()` does. Proven: with the notify
+ * removed from `disconnect()`, the Disconnect case goes red. The Pair again case stays
+ * green without it — its refused status clearing redraws the Sync row's changed buttons as
+ * well, which is a second path to the same redraw, not a hole in the first.
+ */
+describe("the pane follows a disconnect by itself", () => {
+  const openTab = async (files: Record<string, string> = {}) => {
+    stubWebSocket();
+    stubSystemBrowser();
+    const plugin = await load(files, {
+      controlplaneOrigin: "https://cp.test",
+      webAppOrigin: "https://app.test",
+      vaultId: "vault-1",
+      deviceId: "dev-1",
+    });
+    const tab = new CtrlNotesSettingsTab(plugin.app, plugin);
+    tab.update();
+    (tab.containerEl as unknown as { isConnected: boolean }).isConnected = true;
+    tab.confirm = async () => true;
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    tab.display();
+    // Unscripted, so the overview fails — and redraws the pane once it has.
+    await vi.waitFor(
+      () => expect(settingRows.map((r) => r.desc)).toContain("Couldn't load agents."),
+      UNTIL,
+    );
+    return { plugin, tab };
+  };
+  const drawn = (): string[] => settingRows.map((r) => r.name);
+
+  afterEach(() => {
+    settingRows.length = 0;
+    buttons.length = 0;
+  });
+
+  it("redraws to the unpaired face after Disconnect", async () => {
+    await openTab();
+    expect(drawn()).toContain("Disconnect this device");
+
+    settingRows.length = 0;
+    buttons.find((b) => b.text === "Disconnect…")?.click();
+    await vi.waitFor(() => expect(drawn()).toContain("Pair this device"), UNTIL);
+    expect(drawn().slice(drawn().lastIndexOf("Pair this device"))).not.toContain(
+      "Disconnect this device",
+    );
+  });
+
+  it("redraws after Pair again, beside a revoked-elsewhere refusal", async () => {
+    const { plugin } = await openTab({ "note.md": "hi" });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws);
+    ws.emit({ type: "closing", reason: "not authorised", retry: "never" });
+    await vi.waitFor(() => expect(plugin.syncStatus().refusal).not.toBeNull(), UNTIL);
+    await vi.waitFor(() => expect(buttons.map((b) => b.text)).toContain("Pair again…"), UNTIL);
+
+    // The new pairing's registration is refused, so the run ends without a browser.
+    requestUrlQueue.push({ status: 400, json: { detail: "no" } });
+    settingRows.length = 0;
+    const pairAgain = buttons.filter((b) => b.text === "Pair again…");
+    pairAgain[pairAgain.length - 1]?.click();
+    await vi.waitFor(() => expect(drawn()).toContain("Pair this device"), UNTIL);
+    expect(plugin.deviceId).toBeNull();
   });
 });
 
@@ -1477,6 +1575,9 @@ describe("a vault restarting for an update", () => {
       { "note.md": "hi" },
       { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
     );
+    // Waited for, not assumed: the socket opens after a real signature, and reading it at
+    // once failed about one run in two once the suite grew (see `UNTIL`).
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
     const ws = FakeWebSocket.instances[0];
     expect(ws).toBeDefined();
     if (ws === undefined) return;
@@ -2005,6 +2106,38 @@ describe("the status bar", () => {
     expect(opened).toEqual(["settings", manifest.id]);
   });
 
+  /** A button to assistive technology, reachable and pressable from the keyboard. */
+  it("is a focusable button that Enter and Space press, and other keys do not", async () => {
+    stubWebSocket();
+    const plugin = await load({});
+    expect(item()?.attrs.get("role")).toBe("button");
+    expect(item()?.attrs.get("tabindex")).toBe("0");
+    const opened: string[] = [];
+    (plugin.app as unknown as { setting: unknown }).setting = {
+      open: () => opened.push("settings"),
+      openTabById: (id: string) => opened.push(id),
+    };
+    const press = (key: string): { prevented: boolean } => {
+      const event = {
+        key,
+        prevented: false,
+        preventDefault() {
+          event.prevented = true;
+        },
+      };
+      fireDomEvent("keydown", event);
+      return event;
+    };
+
+    expect(press("Tab").prevented).toBe(false);
+    expect(opened).toEqual([]);
+    expect(press("Enter").prevented).toBe(true);
+    expect(opened).toEqual(["settings", manifest.id]);
+    // Space is prevented too, or it would scroll the pane behind the status bar.
+    expect(press(" ").prevented).toBe(true);
+    expect(opened).toEqual(["settings", manifest.id, "settings", manifest.id]);
+  });
+
   it("is not added on mobile, which has no status bar", async () => {
     stubWebSocket();
     Platform.isMobile = true;
@@ -2018,6 +2151,39 @@ describe("Sync now in the palette", () => {
     stubWebSocket();
     await load({});
     expect(commandAvailable("Sync now")).toBe(false);
+  });
+
+  /**
+   * **A terminal refusal tears the socket down**, which is exactly what hid "Sync now" from
+   * the palette — so the one state a user most wants to retry from was the one the command
+   * disappeared in. There it restarts syncing, keeping the registration, and says
+   * "Reconnecting…" until the vault answers.
+   */
+  it("is offered after a refusal ended syncing, and connects again", async () => {
+    stubWebSocket();
+    const plugin = await load(
+      { "note.md": "hi" },
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws0 = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws0);
+    const reason = "wire version 4 is not supported by this vault";
+    ws0.emit({ type: "closing", reason, retry: "never" });
+    await vi.waitFor(() => expect(plugin.syncStatus().refusal).not.toBeNull(), UNTIL);
+
+    expect(commandAvailable("Sync now")).toBe(true);
+    runCommand("Sync now");
+    // Reconnecting, still saying what the vault said: not a refusal the user just retried.
+    expect(plugin.syncStatus().refusal).toBeNull();
+    expect(plugin.syncStatus().retrying).toBe(reason);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
+    // The registration was kept: the same device, the same vault.
+    expect(plugin.deviceId).toBe("dev-1");
+    await bringUp(FakeWebSocket.instances[1] as FakeWebSocket);
+
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).toBeNull(), UNTIL);
+    expect(plugin.syncStatus().refusal).toBeNull();
   });
 
   it("is offered once the device has a connection", async () => {
@@ -2086,9 +2252,21 @@ describe("the agents overview", () => {
     expect(url.origin + url.pathname).toBe("https://cp.test/v1/sync/overview");
     expect([...url.searchParams.keys()].sort()).toEqual(["d", "k", "s", "t"]);
     expect(url.searchParams.get("d")).toBe("dev-1");
-    // The signature verifies over the routing context, exactly as the socket's does.
+    // The signature verifies over the routing context, exactly as the socket's does —
+    // checked, with the public key the query names, rather than asserted by its presence.
     const identity = await DeviceIdentity.load(plugin.app);
     expect(url.searchParams.get("k")).toBe(identity.publicKeyBase64);
+    const signature = decodeBase64Url(url.searchParams.get("s") ?? "");
+    const publicKey = decodeBase64Url(url.searchParams.get("k") ?? "");
+    const at = Number(url.searchParams.get("t"));
+    expect(signature).not.toBeNull();
+    expect(publicKey).not.toBeNull();
+    if (signature === null || publicKey === null) return;
+    const context = routingContextMessage("dev-1", "vault-1", at);
+    expect(await verifyAsync(signature, context, publicKey)).toBe(true);
+    // …and not over some other vault's context, which would pass a looser check.
+    const other = routingContextMessage("dev-1", "vault-2", at);
+    expect(await verifyAsync(signature, other, publicKey)).toBe(false);
   });
 
   it("asks nothing on an unpaired device", async () => {
@@ -2142,6 +2320,61 @@ describe("waiting on the browser", () => {
     expect(requestUrlCalls.filter((c) => c.url.endsWith("/v1/pairing-intents"))).toEqual(
       registered,
     );
+  });
+
+  /**
+   * Cancelled while the intent was being registered, and then the browser would not open.
+   * `browser_failed` keeps the persisted intent on purpose — so a cancel that reached this
+   * branch left it on disk, and the next load resumed a pairing the user had cancelled.
+   */
+  it("forgets an intent cancelled mid-registration even when the browser failed", async () => {
+    stubWebSocket();
+    vi.stubGlobal("window", {
+      ...globalThis.window,
+      open: () => {
+        throw new Error("no browser");
+      },
+    });
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", webAppOrigin: "https://app.test" },
+    );
+    requestUrlHeld.next = 1;
+    const run = plugin.startPairing("My Laptop");
+    await vi.waitFor(() => expect(requestUrlHeld.answers).toHaveLength(1), UNTIL);
+
+    plugin.cancelPairing();
+    requestUrlHeld.answers[0]?.({
+      status: 201,
+      json: { intent_id: "intent-1", expires_at: Date.now() + 600_000 },
+    });
+    await run;
+
+    expect(pairingIntent.loadPairingState(plugin.app)).toBeNull();
+    expect(plugin.pairingInFlight).toBe(false);
+  });
+
+  /** One listener per run on the plugin-lifetime signal, removed when the run ends. */
+  it("leaves no listener behind on the unload signal once a run ends", async () => {
+    stubWebSocket();
+    stubSystemBrowser();
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", webAppOrigin: "https://app.test" },
+    );
+    const lifetime = (plugin as unknown as { pairingAborter: AbortController }).pairingAborter
+      .signal;
+    const added = vi.spyOn(lifetime, "addEventListener");
+    const removed = vi.spyOn(lifetime, "removeEventListener");
+
+    for (let i = 0; i < 3; i++) {
+      requestUrlQueue.push({ status: 400, json: { detail: "no" } });
+      await plugin.startPairing("My Laptop");
+    }
+
+    expect(added).toHaveBeenCalledTimes(3);
+    expect(removed).toHaveBeenCalledTimes(3);
+    expect(removed.mock.calls.map((c) => c[1])).toEqual(added.mock.calls.map((c) => c[1]));
   });
 
   it("cancels: forgets the intent, stops waiting, and says nothing", async () => {

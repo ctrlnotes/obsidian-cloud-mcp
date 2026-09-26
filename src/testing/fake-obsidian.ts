@@ -111,10 +111,11 @@ export class Plugin extends Component {
   /**
    * Obsidian's `registerDomEvent`: the listener is removed on unload. Recorded by event type
    * in `domListeners` rather than attached to anything — the suite has no DOM — and a test
-   * fires one with `fireDomEvent`. The element is not kept: nothing here listens for the
-   * same type on two elements.
+   * fires one with `fireDomEvent`, handing it whatever event object the case needs (a
+   * `key` for a `keydown`). The element is not kept: nothing here listens for the same type
+   * on two elements.
    */
-  registerDomEvent(_el: unknown, type: string, callback: () => unknown): void {
+  registerDomEvent(_el: unknown, type: string, callback: (event: never) => unknown): void {
     const held = domListeners.get(type) ?? [];
     held.push(callback);
     domListeners.set(type, held);
@@ -187,11 +188,11 @@ export const setIcon = (el: FakeEl, icon: string): void => {
 };
 
 /** Every live `registerDomEvent` listener, by event type. */
-export const domListeners = new Map<string, Array<() => unknown>>();
+export const domListeners = new Map<string, Array<(event: never) => unknown>>();
 
 /** Fire a DOM event at every listener registered for its type, as the browser would. */
-export const fireDomEvent = (type: string): void => {
-  for (const cb of domListeners.get(type) ?? []) cb();
+export const fireDomEvent = (type: string, event: object = {}): void => {
+  for (const cb of domListeners.get(type) ?? []) cb(event as never);
 };
 
 /**

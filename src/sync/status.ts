@@ -145,13 +145,24 @@ export const IDLE_STATUS: SyncStatus = {
 
 /**
  * What the status says, split the way the settings pane shows it: one short headline, then
- * one short line per count. `warning` marks the one state a user has to act on — a refused
- * session — so the pane can style it as a warning and offer "Pair again" beside it.
+ * one short line per count. `warning` marks a refused session, so the pane can style it as
+ * a warning.
  */
 export interface StatusReport {
   readonly headline: string;
   readonly lines: readonly string[];
   readonly warning: boolean;
+  /**
+   * The refusal is the one pairing again can fix: the vault's {@link REVOKED_ELSEWHERE_REASON}
+   * — and only that one. The pane offers "Pair again" on this flag and nothing else.
+   *
+   * **Its own flag, not `warning`.** "Pair again" erases this device's key, and until
+   * 2026-09-26 it was offered beside EVERY refusal — a wire-version mismatch, a vault
+   * sentence this plugin has never seen — none of which a new registration fixes. A device
+   * refused for a reason that is not about its registration still has a good key, and the
+   * pane's answer to that is a retry, which costs nothing.
+   */
+  readonly repairable: boolean;
 }
 
 /** `1 file`, `3 files`. Every count in the pane goes through this, so none says "file(s)". */
@@ -183,7 +194,9 @@ export function statusReport(status: SyncStatus): StatusReport {
   // Before the refusal, because it is the newer fact: a vault restart can only reach a
   // device that was connected, and a refusal still set from earlier would otherwise tell a
   // user whose sync is about to resume by itself that it was refused.
-  if (status.updating) return { headline: UPDATING_TEXT, lines: [], warning: false };
+  if (status.updating) {
+    return { headline: UPDATING_TEXT, lines: [], warning: false, repairable: false };
+  }
   if (status.refusal !== null) return refusalReport(status.refusal);
 
   const headline =
@@ -232,7 +245,7 @@ export function statusReport(status: SyncStatus): StatusReport {
         `${one ? "it" : "one of them"}, editing or re-saving it there uploads it again.`,
     );
   }
-  return { headline, lines, warning: false };
+  return { headline, lines, warning: false, repairable: false };
 }
 
 /** The whole report as one string — the status bar's tooltip, and what a test can search. */
@@ -297,10 +310,12 @@ export function statusBarFace(status: SyncStatus | null): StatusBarFace {
  */
 function refusalReport(reason: string): StatusReport {
   const headline = `Sync was refused: ${reason}.`;
+  const revoked = reason.endsWith(REVOKED_ELSEWHERE_REASON);
   return {
     headline,
-    lines: reason.endsWith(REVOKED_ELSEWHERE_REASON) ? [REVOKED_ELSEWHERE_ADVICE] : [],
+    lines: revoked ? [REVOKED_ELSEWHERE_ADVICE] : [],
     warning: true,
+    repairable: revoked,
   };
 }
 

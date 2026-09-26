@@ -8,7 +8,7 @@ import {
   type SettingGroupItem,
 } from "obsidian";
 import { askToConfirm, type ConfirmCopy, showSkippedFiles } from "./modals.ts";
-import { capabilityText, lastUsedText, type OverviewResult } from "./overview.ts";
+import { capabilityText, lastUsedText, type Overview, type OverviewResult } from "./overview.ts";
 import { PRODUCT_NAME } from "./product.ts";
 import { shortId } from "./short-id.ts";
 import {
@@ -101,6 +101,14 @@ export interface SettingsHost {
   reopenPairingPage(): boolean;
   /** Stop waiting: forget the local intent and stop polling for it. Nothing is sent. */
   cancelPairing(): void;
+  /**
+   * Connect again after a refusal ended syncing — the pane's "Try again", and the same call
+   * "Sync now" makes in that state. **Non-destructive**: the registration and its key are
+   * kept, so a refusal that was about the moment (a vault mid-upgrade answering with a wire
+   * version this plugin does not speak yet) clears by itself when the vault next accepts.
+   * Does nothing unless this device is paired and holds no connection.
+   */
+  retrySyncing(): void;
 }
 
 /**
@@ -133,13 +141,21 @@ export const DEFAULT_WEB_APP_ORIGIN = "https://ctrlnotes.app";
  */
 export class CtrlNotesSettingsTab extends PluginSettingTab {
   /**
-   * The agents list, and the vault name that arrives with it. `idle` means "not asked for
-   * since the pane last opened", which is what `ensureAgents` acts on.
+   * The agents list, and the vault name that arrives with it. `idle` means nothing is known
+   * for the vault this device is paired with now.
+   *
+   * **Kept across closing the pane**, so a reopen goes on showing the last answer — the
+   * vault's name included — until the fresh one lands, rather than flashing back to "Loading"
+   * and a vault id. What it is NOT kept across is a pairing change (`forgetAgents`): a list
+   * loaded for one vault must never be drawn under another.
    */
   private agents: AgentsState = { status: "idle" };
+  /** A load has been started since the pane last opened, which is what `ensureAgents` asks. */
+  private asked = false;
   /**
-   * Bumped whenever the pane closes or a refresh starts, so an answer that lands after
-   * either is dropped rather than written over a newer state. `requestUrl` has no abort.
+   * Bumped whenever the pane closes, a refresh starts or the pairing changes, so an answer
+   * that lands after any of them is dropped rather than written over a newer state.
+   * `requestUrl` has no abort.
    */
   private generation = 0;
 
@@ -158,19 +174,33 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
     // or finish while the pane shows any of its three faces — a cold-launch resume and an
     // `obsidian://` nudge both begin one with nobody having pressed anything — so the rows
     // must be re-derived whichever face is showing. The plugin owns the unsubscribe.
-    host.register(host.onPairingChange(() => this.update()));
+    //
+    // **The agents list is forgotten here too.** It belongs to the pairing it was loaded
+    // under: after Disconnect and a pairing to a different vault, the pane would otherwise go
+    // on naming the old vault and listing the old vault's agents — and an answer still in
+    // flight from before the change would land on top of the new one.
+    host.register(
+      host.onPairingChange(() => {
+        this.forgetAgents();
+        this.update();
+      }),
+    );
   }
 
   /**
-   * Closing the pane forgets the agents list, so the next open asks again. **Loaded when the
-   * pane opens and on Refresh, never on a timer**: which agents can reach a vault changes when
-   * somebody changes it in the web app, and polling for that from every open Obsidian would
-   * cost the control plane a request a minute per device for a list nobody is looking at.
+   * Closing the pane means the next open asks again. **Loaded when the pane opens and on
+   * Refresh, never on a timer**: which agents can reach a vault changes when somebody changes
+   * it in the web app, and polling for that from every open Obsidian would cost the control
+   * plane a request a minute per device for a list nobody is looking at.
+   *
+   * The last answer is kept (see `agents`); only a load still in flight is abandoned, and it
+   * is the one state that cannot be kept, because its answer will now be dropped.
    */
   override hide(): void {
     super.hide();
     this.generation += 1;
-    this.agents = { status: "idle" };
+    this.asked = false;
+    if (this.agents.status === "loading") this.agents = { status: "idle" };
   }
 
   override getSettingDefinitions(): SettingDefinitionItem[] {
@@ -237,13 +267,19 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
         // and returns the unsubscribe — Obsidian runs it before tearing the row down, which
         // is what stops a reused tab accumulating one listener per visit.
         //
-        // **Redrawn in place, unless its buttons would change.** "Pair again" belongs to a
-        // refused session and "Show files" to a non-zero count, and a row cannot grow a
-        // button after it is drawn — so a status that crosses either line re-reads the
-        // definitions instead. Everything else only rewrites the words.
+        // **Redrawn in place, unless its buttons would change.** "Pair again" and "Try
+        // again" belong to a refused session and "Show files" to a non-zero count, and a row
+        // cannot grow a button after it is drawn — so a status that crosses any of those
+        // lines re-reads the definitions instead. Everything else only rewrites the words.
+        //
+        // **Only the revoked-elsewhere refusal is offered "Pair again"** (`repairable`),
+        // because pairing again erases this device's key. Every other refusal — a wire
+        // version this plugin does not speak, a sentence it has never seen — is not about the
+        // registration at all, and is offered a retry that keeps it.
         render: (setting) => {
           const drawn = this.host.syncStatus();
-          this.drawStatus(setting, statusReport(drawn));
+          const report = statusReport(drawn);
+          this.drawStatus(setting, report);
           if (hasSkipped(drawn)) {
             setting.addButton((button) =>
               button.setButtonText("Show files").onClick(() => {
@@ -251,14 +287,20 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
               }),
             );
           }
-          if (statusReport(drawn).warning) {
+          if (report.repairable) {
             setting.addButton((button) =>
               button
-                .setButtonText("Pair again")
+                .setButtonText("Pair again…")
                 .setCta()
                 .onClick(() => {
-                  void this.pairAgain();
+                  void this.pairAgainAfterConfirming();
                 }),
+            );
+          } else if (report.warning) {
+            setting.addButton((button) =>
+              button.setButtonText("Try again").onClick(() => {
+                this.host.retrySyncing();
+              }),
             );
           }
           return this.host.onStatusChange((next) => {
@@ -281,7 +323,7 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
           // Every open of the pane draws this row, so it is where the agents list (and the
           // vault name with it) is asked for. See `hide`.
           this.ensureAgents();
-          const name = this.agents.status === "loaded" ? this.agents.overview.vault.name : null;
+          const name = this.overview()?.vault.name ?? null;
           if (name !== null && name !== "") {
             setting.setDesc(name);
           } else {
@@ -340,7 +382,7 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
         name: "Disconnect this device",
         desc:
           "Removes the connection on this device only, and erases its key from this " +
-          "computer. To revoke its access, remove it from your device list at " +
+          "device. To revoke its access, remove it from your device list at " +
           `${this.webApp()}. Revoking there is immediate and cannot be undone.`,
         visible: connected,
         render: (setting) => {
@@ -422,16 +464,29 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
     for (const line of report.lines) desc.createDiv({ text: line });
   }
 
+  /**
+   * The last overview, **only if it describes the vault this device is paired with now** —
+   * the guard behind `forgetAgents`, checked where the overview is read rather than trusted
+   * to have been cleared. A list drawn under the wrong vault's name is the one thing this
+   * section must never show, and the vault id is right there in the answer to check.
+   */
+  private overview(): Overview | null {
+    const state = this.agents;
+    if (state.status !== "loaded") return null;
+    return state.overview.vault.vault_id === this.host.vaultId ? state.overview : null;
+  }
+
   /** The rows under the Agents heading, for whatever the last load said. */
   private agentRows(): SettingGroupItem[] {
     const state = this.agents;
-    if (state.status === "idle" || state.status === "loading") {
-      return [{ name: "", desc: "Loading agents…", searchable: false }];
-    }
-    if (state.status !== "loaded") {
+    if (state.status === "failed") {
       return [{ name: "", desc: "Couldn't load agents.", searchable: false }];
     }
-    if (state.overview.agents.length === 0) {
+    const overview = this.overview();
+    if (overview === null) {
+      return [{ name: "", desc: "Loading agents…", searchable: false }];
+    }
+    if (overview.agents.length === 0) {
       return [
         {
           name: "No agents are connected to this vault yet.",
@@ -443,7 +498,7 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
       ];
     }
     const now = this.host.now();
-    return state.overview.agents.map((agent) => ({
+    return overview.agents.map((agent) => ({
       name: agent.name ?? "Unnamed agent",
       desc: `${capabilityText(agent.capability)} · ${lastUsedText(agent.last_used_at, now)}`,
     }));
@@ -451,7 +506,15 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
 
   /** Ask for the agents list if nothing has since the pane opened. */
   private ensureAgents(): void {
-    if (this.agents.status === "idle") this.loadAgents();
+    if (!this.asked) this.loadAgents();
+  }
+
+  /** The pairing changed: nothing known about the old vault's agents applies any more, and
+   * an answer still in flight for it is dropped. */
+  private forgetAgents(): void {
+    this.generation += 1;
+    this.asked = false;
+    this.agents = { status: "idle" };
   }
 
   private refreshAgents(): void {
@@ -462,13 +525,21 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
 
   private loadAgents(): void {
     const generation = this.generation;
+    this.asked = true;
     // Only the first load shows "Loading": a reopen keeps drawing the list it already has
-    // until the new answer lands, rather than flashing it away and back.
+    // (`hide` keeps it) until the new answer lands, rather than flashing it away and back.
     if (this.agents.status === "idle" || this.agents.status === "failed") {
       this.agents = { status: "loading" };
     }
-    void this.host.loadOverview().then((result) => {
+    void this.host.loadOverview().then((answer) => {
       if (generation !== this.generation) return;
+      // An answer about some other vault is not an answer to this question. Nothing this
+      // plugin sends names a vault the control plane could confuse, so this is a bug
+      // somewhere — reported as the failure it is rather than drawn, or left "Loading".
+      const result: OverviewResult =
+        answer.status === "loaded" && answer.overview.vault.vault_id !== this.host.vaultId
+          ? { status: "failed", reason: "overview_for_another_vault" }
+          : answer;
       if (result.status === "failed") {
         console.warn(`Ctrl Notes: could not load this vault's agents: ${result.reason}`);
       }
@@ -478,13 +549,31 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
   }
 
   /**
-   * "Pair again", beside a refused session: forget this registration locally, then start a
-   * pairing. The first half is exactly Disconnect, and needs no confirmation here — the
-   * vault has already refused this device, so there is nothing left to disconnect from.
+   * "Pair again…", beside the revoked-elsewhere refusal: forget this registration locally,
+   * then start a pairing. The first half is exactly Disconnect, **so it asks exactly as
+   * Disconnect does**. It used to skip the question on the grounds that the vault had
+   * already refused this device — but "not authorised" is also what a device pointed at the
+   * wrong vault is told (`status.ts`'s `REVOKED_ELSEWHERE_REASON`), and erasing a key that
+   * still works elsewhere is not something one click should do unasked.
+   *
+   * **No `update()` after either call.** `disconnect()` and `startPairing` both announce
+   * themselves through `onPairingChange`, which redraws the pane; `main.test.ts` holds that.
    */
-  private async pairAgain(): Promise<void> {
+  private async pairAgainAfterConfirming(): Promise<void> {
+    const yes = await this.confirm({
+      title: "Pair this device again?",
+      body: [
+        "Pairing again erases this device's key from this device and starts a new pairing " +
+          "in your browser. Your notes stay here.",
+        "The old registration stays in your device list until you remove it there, at " +
+          `${this.webApp()}.`,
+      ],
+      confirmText: "Pair again",
+      cancelText: "Cancel",
+      destructive: true,
+    });
+    if (!yes) return;
     await this.host.disconnect();
-    this.update();
     await this.host.startPairing(this.host.vaultName);
   }
 
@@ -493,7 +582,7 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
       title: "Disconnect this device?",
       body: [
         "This removes the connection on this device only, and erases its key from this " +
-          "computer. Your notes stay here.",
+          "device. Your notes stay here.",
         "It does not revoke the device. To do that, remove it from your device list at " +
           `${this.webApp()}.`,
       ],
@@ -502,24 +591,31 @@ export class CtrlNotesSettingsTab extends PluginSettingTab {
       destructive: true,
     });
     if (!yes) return;
+    // The pane redraws from `disconnect()`'s own pairing notification, as for Pair again.
     await this.host.disconnect();
     new Notice(`This device is disconnected from ${PRODUCT_NAME}.`);
-    this.update();
   }
 }
 
 type AgentsState = { readonly status: "idle" } | { readonly status: "loading" } | OverviewResult;
 
-/** The command the empty Agents list suggests. The server name matches the MCP's own. */
+/**
+ * The command the empty Agents list suggests. The server name matches the MCP's own, and
+ * the whole command matches the web app's Claude Code guide word for word — `--scope user`
+ * included, so the server is there in every project rather than only the one the user
+ * happened to run it in, and a user who has seen both is not left wondering which is right.
+ */
 export const CONNECT_CLAUDE_CODE =
-  "claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp";
+  "claude mcp add --transport http --scope user ctrlnotes https://mcp.ctrlnotes.app/mcp";
 
 const hasSkipped = (status: SyncStatus): boolean =>
   status.unsyncable + status.refused + status.unavailable > 0;
 
 /** Which buttons the Sync row carries for a status. A change here needs a new row. */
-const shapeOf = (status: SyncStatus): string =>
-  `${statusReport(status).warning}/${hasSkipped(status)}`;
+const shapeOf = (status: SyncStatus): string => {
+  const report = statusReport(status);
+  return `${report.warning}/${report.repairable}/${hasSkipped(status)}`;
+};
 
 /** `Vault ID e000 518f…`, the id in monospace. */
 function labelledId(setting: Setting, label: string, id: string): void {

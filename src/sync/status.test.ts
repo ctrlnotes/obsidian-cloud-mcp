@@ -373,6 +373,22 @@ describe("the status as a headline and short lines", () => {
     expect(statusReport({ ...IDLE_STATUS, retrying: "busy" }).warning).toBe(false);
   });
 
+  /**
+   * **Pair again erases this device's key**, so the flag that offers it is true for the
+   * revoked-elsewhere refusal alone — in the handshake's prefixed form too — and false for
+   * every other refusal, which is still a warning.
+   */
+  it("marks only the revoked-elsewhere refusal as one pairing again can fix", () => {
+    const repairable = (refusal: string) => statusReport({ ...IDLE_STATUS, refusal }).repairable;
+    expect(repairable("not authorised")).toBe(true);
+    expect(repairable('could not connect to vault "v": not authorised')).toBe(true);
+    expect(repairable("wire version 4 is not supported by this vault")).toBe(false);
+    expect(repairable("something this plugin has never heard")).toBe(false);
+    expect(statusReport({ ...IDLE_STATUS, refusal: "unknown" }).warning).toBe(true);
+    expect(statusReport(full).repairable).toBe(false);
+    expect(statusReport({ ...IDLE_STATUS, retrying: "not authorised" }).repairable).toBe(false);
+  });
+
   it("puts the revocation advice on its own line", () => {
     const report = statusReport({ ...IDLE_STATUS, refusal: "not authorised" });
     expect(report.headline).toBe("Sync was refused: not authorised.");

@@ -327,6 +327,13 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private pairingRunAborter: AbortController | null = null;
 
   /**
+   * Detaches the current run's listener from `pairingAborter`, which lives as long as the
+   * plugin does. Without it every pairing this session started left one listener — and the
+   * run's controller it closes over — on that signal until unload.
+   */
+  private releasePairingSignal: (() => void) | null = null;
+
+  /**
    * Resolves once load-time setup — the device identity, and a resumed connection if this
    * device was already paired — has finished. A seam for tests, exactly like an earlier prototype's
    * `ready`: nothing in the plugin reads it.
@@ -445,6 +452,27 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.pairingRunAborter?.abort();
   }
 
+  /**
+   * "Try again" in the pane, and "Sync now" from the palette, after a refusal ended syncing.
+   *
+   * **The one clean restart this class has is `startSyncing`**, and it is safe here for the
+   * reason it is safe at load: a terminal closing ran `disconnectSyncing`, so there is no
+   * socket, pump or fetcher left to leak or to race — exactly the state a fresh load is in.
+   * Nothing about the registration changes. If the vault refuses again, `onClosing` puts the
+   * refusal back; if it accepts, `ready` clears it.
+   *
+   * **The refusal moves to `retrying` for the wait**, so the pane and the status bar say
+   * "Reconnecting" — still quoting what the vault said last, and still with its advice when
+   * that was "not authorised" — rather than a refusal the user has just asked to be retried.
+   * `ready` clears it, and a second refusal puts `refusal` back (`disconnectSyncing` clears
+   * `retrying` on the way).
+   */
+  retrySyncing(): void {
+    if (!this.active || !this.isPaired() || this.socket !== null) return;
+    this.setStatus({ refusal: null, retrying: this.status.refusal ?? this.status.retrying });
+    void this.startSyncing();
+  }
+
   private setStatus(patch: Partial<SyncStatus>): void {
     this.status = { ...this.status, ...patch };
     for (const listener of snapshot(this.statusListeners)) listener(this.status);
@@ -542,7 +570,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /**
    * The ambient status: an icon and one word in Obsidian's status bar, the full sentence as
-   * its label, and a click that opens this plugin's settings.
+   * its label, and a click — or Enter or Space, from the keyboard — that opens this plugin's
+   * settings.
+   *
+   * **A button to assistive technology, not a span with a click handler.** `role="button"`
+   * is what makes a screen reader announce the `aria-label` as the control's name (on a bare
+   * `div` it is not reliably read at all), and `tabindex="0"` puts it in the tab order, where
+   * a keyboard user can reach something a mouse user can. The key handler is the other half
+   * of that: a focusable button that ignores Enter is worse than none.
    *
    * **Desktop only.** Obsidian's mobile app has no status bar, and a mobile user has the
    * settings pane.
@@ -555,12 +590,15 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     if (Platform.isMobile) return;
     const item = this.addStatusBarItem();
     item.addClass("mod-clickable");
+    item.setAttr("role", "button");
+    item.setAttr("tabindex", "0");
     item.setAttr("data-tooltip-position", "top");
     const icon = item.createSpan({ cls: "status-bar-item-icon" });
     // **The gap is a character, not a style.** Obsidian's own status-bar items are icon-only,
     // so nothing native spaces an icon from a word: measured in 1.13.7, the two touched
     // ("⚠Error"). With no stylesheet (above), a no-break space is the one gap that cannot
-    // collapse. Screen readers are unaffected — `aria-label` carries the whole sentence.
+    // collapse. A screen reader never reads it: with `role="button"` the `aria-label` is the
+    // item's accessible name, and it carries the whole sentence in place of icon and word.
     item.createSpan({ text: " " });
     const word = item.createSpan();
     const draw = (): void => {
@@ -573,6 +611,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.register(this.onStatusChange(draw));
     this.register(this.onPairingChange(draw));
     this.registerDomEvent(item, "click", () => this.openOwnSettings());
+    this.registerDomEvent(item, "keydown", (event: KeyboardEvent) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      // Space would otherwise scroll whatever pane is behind the status bar.
+      event.preventDefault();
+      this.openOwnSettings();
+    });
   }
 
   /**
@@ -647,15 +691,29 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private endPairingRun(run: Promise<void>): void {
     if (this.pairingRun !== run) return;
     this.pairingRun = null;
+    this.releasePairingSignal?.();
+    this.releasePairingSignal = null;
     this.notifyPairingChange();
   }
 
-  /** A fresh abort signal for one pairing run, fired by "Cancel pairing" or by unload. */
+  /**
+   * A fresh abort signal for one pairing run, fired by "Cancel pairing" or by unload. The
+   * unload half is a listener on the plugin-lifetime signal, removed again by
+   * `endPairingRun` (`releasePairingSignal`).
+   */
   private newPairingSignal(): AbortSignal {
     const run = new AbortController();
     this.pairingRunAborter = run;
-    if (this.pairingAborter.signal.aborted) run.abort();
-    else this.pairingAborter.signal.addEventListener("abort", () => run.abort(), { once: true });
+    this.releasePairingSignal?.();
+    this.releasePairingSignal = null;
+    if (this.pairingAborter.signal.aborted) {
+      run.abort();
+    } else {
+      const onUnload = (): void => run.abort();
+      const lifetime = this.pairingAborter.signal;
+      lifetime.addEventListener("abort", onUnload, { once: true });
+      this.releasePairingSignal = () => lifetime.removeEventListener("abort", onUnload);
+    }
     return run.signal;
   }
 
@@ -685,8 +743,16 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       // browser again" rebuilds the link, and its Notice says so. Every other refusal left
       // nothing to wait on.
       if (started.reason !== "browser_failed") return;
+      // Cancelled while the intent was being registered — the same case the success path
+      // handles below, and the intent is just as persisted here: `browser_failed` is the
+      // refusal that keeps it on purpose. Returning without clearing it left a live intent
+      // on disk that the next load would resume, as if Cancel had never been pressed.
+      if (signal.aborted) {
+        clearPairingState(this.app);
+        return;
+      }
       const kept = loadPairingState(this.app);
-      if (kept === null || signal.aborted) return;
+      if (kept === null) return;
       this.notifyPairingChange();
       await this.awaitAndAdopt(kept, label, signal);
       return;
@@ -945,6 +1011,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     // The status described the vault this device just left. Kept, a re-pair would open on
     // the old refusal ("Sync was refused" beside a device that has just been paired) until
     // its first `ready`, and "Show files" would list files of a vault it no longer syncs.
+    // `shadowed` with them: it is recomputed from the listing on the next scan, but until one
+    // runs "Show files" would go on listing clashes counted for the vault it left.
+    this.shadowed = [];
     this.withheld.clear();
     this.refusedFiles.clear();
     this.unavailableFiles.clear();
@@ -1389,11 +1458,16 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private watchForReturn(): void {
     // `checkCallback`, so the palette offers "Sync now" only to a device that has something
     // to sync with. It did nothing at all on an unpaired device, which reads as broken.
+    //
+    // **And to a refused one**, whose socket a terminal closing tore down: there, "Sync now"
+    // is the retry the pane's "Try again" is (`retrySyncing`). A paired device with no
+    // socket and no refusal is one still starting up, which has nothing to hurry.
     this.addCommand({
       id: "sync-now",
       name: "Sync now",
       checkCallback: (checking) => {
-        if (!this.isPaired() || this.socket === null) return false;
+        if (!this.isPaired()) return false;
+        if (this.socket === null && this.status.refusal === null) return false;
         if (!checking) this.syncNow();
         return true;
       },
@@ -1428,11 +1502,16 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   /**
    * "Sync now": what a user asks for is a connection, now. A parked device wakes; one waiting
-   * out a drop's backoff skips the rest of it; one already connected or connecting says so,
-   * because a command that visibly does nothing reads as broken.
+   * out a drop's backoff skips the rest of it; one a refusal stopped starts again
+   * (`retrySyncing`); one already connected or connecting says so, because a command that
+   * visibly does nothing reads as broken.
    */
   private syncNow(): void {
-    if (!this.active || this.socket === null) return;
+    if (!this.active) return;
+    if (this.socket === null) {
+      this.retrySyncing();
+      return;
+    }
     if (this.parked) {
       this.wake();
       return;

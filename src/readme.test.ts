@@ -115,7 +115,7 @@ describe("README.md", () => {
       if (lines.length === 0) continue;
       naming.push(file);
       expect(lines, file).toEqual([
-        '  "claude mcp add --transport http ctrlnotes https://mcp.ctrlnotes.app/mcp";',
+        '  "claude mcp add --transport http --scope user ctrlnotes https://mcp.ctrlnotes.app/mcp";',
       ]);
       expect(source, file).toMatch(/export const CONNECT_CLAUDE_CODE =\n {2}"claude mcp add/);
       // Code, not comments: the comments here discuss `requestUrl` freely.

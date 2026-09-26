@@ -16,4 +16,5 @@ export const settingsHostDefaults = () => ({
   openInBrowser: (_url: string): void => {},
   reopenPairingPage: (): boolean => true,
   cancelPairing: (): void => {},
+  retrySyncing: (): void => {},
 });
