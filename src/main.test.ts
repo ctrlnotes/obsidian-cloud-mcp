@@ -2016,6 +2016,63 @@ describe("a reconnect after a retried closing, and the manifest scan", () => {
     await settleMicrotasks(QUIET_MS + 500);
     expect(reads).toBe(2);
   });
+
+  /**
+   * A file the vault delivers while a scan is running is in the ledger by the time the scan
+   * ends, and was not in the listing the scan started from. Reading a deletion out of that
+   * listing pushed a `delete` for a file sitting on this disk; the vault removed it and the
+   * next snapshot trashed the local copy. On a 20k-note vault a scan runs for minutes, and
+   * 9,759 notes went that way on 2026-09-26.
+   *
+   * Two things hold it, and either alone does: the reconcile lists again after the scan, and
+   * `deriveChanges` stats a path before deleting it (its own test pins that half alone).
+   * **Proven able to fail** by reverting both — reading `present` from the listing taken
+   * before the scan, and dropping that `stat`: the delete for `new.md` is pushed.
+   */
+  it("does not push a delete for a file the vault delivered while the scan ran", async () => {
+    const { plugin, first } = await quietPlugin({ "note.md": "hi" });
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    let release = (): void => {};
+    readGates.set(
+      "note.md",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    first.close(); // a drop: its reconnect rescans, and the scan stalls on the held read
+    const second = await socketAt(1);
+    await bringUp(second);
+
+    const text = "from the vault\n";
+    const sha = await contentHash(text);
+    second.emit({
+      type: "event",
+      seq: 1,
+      kind: "put",
+      path: "new.md",
+      sha,
+      from: null,
+      at_ms: 0,
+    });
+    await vi.waitFor(
+      () => expect(second.upFrames().some((f) => f.type === "want")).toBe(true),
+      UNTIL,
+    );
+    const bytes = new TextEncoder().encode(text);
+    second.emit({ type: "blob", sha, bytes: bytes.byteLength });
+    second.onmessage?.({ data: bytes.buffer });
+    await vi.waitFor(
+      async () => expect(await plugin.app.vault.adapter.read("new.md")).toBe(text),
+      UNTIL,
+    );
+
+    release();
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(second.upFrames().filter((f) => f.type === "delete")).toEqual([]);
+    expect(await plugin.app.vault.adapter.read("new.md")).toBe(text);
+  });
 });
 
 /**

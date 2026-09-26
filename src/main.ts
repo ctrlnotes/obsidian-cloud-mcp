@@ -1117,7 +1117,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     // never "not on disk". Reading a deletion out of it pushed a `delete` for a file
     // sitting on this disk, and the vault propagated that to every other device. A path
     // still in the listing is still here, whatever the scan could make of it.
-    const present = new Set(listed);
+    //
+    // **A listing taken NOW, not the one the scan started from.** The scan awaits a read
+    // per file, so on a large vault it runs for minutes, and a file the vault delivers
+    // meanwhile is in the ledger by the end and absent from the old listing. This read and
+    // the ledger loop below share one synchronous stretch, so nothing lands between them.
+    const present = new Set(this.listWirePaths());
     for (const path of Object.keys(this.syncState.hashes)) {
       if (present.has(path) || !syncablePath(path, this.attachments)) continue;
       this.touched.deleted.add(path);

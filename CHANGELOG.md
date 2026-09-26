@@ -2,6 +2,15 @@
 
 Each release's section becomes its release notes. Newest first.
 
+## 0.1.1
+
+- **Fixes a bug that could delete notes from your vault. Update now.** While this device
+  checked the whole vault for changes, which takes minutes on a large vault, a note that
+  arrived from the vault in that window could be taken for one deleted here. The deletion
+  was then sent to the vault and removed the note on every device. Notes lost this way are
+  in Obsidian's trash and in your vault's history. Now a note is deleted only if it is
+  really gone from this device's disk when the deletion is sent.
+
 ## 0.1.0
 
 - **See which AI agents can reach this vault.** The settings pane now lists every agent

@@ -291,6 +291,35 @@ describe("deriveChanges", () => {
     expect(changes).toEqual([{ op: "delete", path: "a.md", base }]);
   });
 
+  /**
+   * Named deleted and NOT dirty, still on disk: what a reconcile reading a listing that
+   * trailed the disk produced — it clears `dirty` for every path it marks deleted, so
+   * `alive` never saw this one. 9,759 notes were deleted vault-wide that way on 2026-09-26.
+   *
+   * **Proven able to fail** by removing the `stat` before `deletes.push`: `changes` holds a
+   * `delete` for `a.md`.
+   */
+  it("does not delete a path it was told was deleted that is still on disk", async () => {
+    const { changes } = await deriveChanges(
+      disk({ "a.md": "still here\n" }),
+      { "a.md": await contentHash("still here\n") },
+      { ...empty, deleted: new Set(["a.md"]) },
+    );
+    expect(changes).toEqual([]);
+  });
+
+  it("does not delete a path whose presence it could not check", async () => {
+    const { changes } = await deriveChanges(
+      {
+        readBinary: () => Promise.resolve(null),
+        stat: () => Promise.reject(new Error("EACCES")),
+      },
+      { "a.md": "a".repeat(64) },
+      { ...empty, deleted: new Set(["a.md"]) },
+    );
+    expect(changes).toEqual([]);
+  });
+
   it("creates a NEW file at the path a rename just vacated", async () => {
     // regression: the rename retires hashes[from], so a fresh file at the old path is a
     // create. Quoting the retired hash emitted a replace against a base that is no longer
