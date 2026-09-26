@@ -15,6 +15,7 @@ describe("describeStatus", () => {
         refused: 0,
         unavailable: 0,
         refusal: null,
+        retrying: null,
         updating: false,
         parked: false,
       }),
@@ -33,6 +34,7 @@ describe("describeStatus", () => {
         refused: 0,
         unavailable: 0,
         refusal: "too far behind acknowledging; reconnect and resume from your last seq",
+        retrying: null,
         updating: false,
         parked: false,
       }),
@@ -56,6 +58,7 @@ describe("describeStatus", () => {
         refused: 0,
         unavailable: 0,
         refusal: null,
+        retrying: null,
         updating: false,
         parked: false,
       }),
@@ -74,6 +77,7 @@ describe("describeStatus", () => {
       refused: 0,
       unavailable: 2,
       refusal: null,
+      retrying: null,
       updating: false,
       parked: false,
     });
@@ -94,6 +98,7 @@ describe("describeStatus", () => {
       refused: 1,
       unavailable: 1,
       refusal: null,
+      retrying: null,
       updating: false,
       parked: false,
     });
@@ -110,6 +115,7 @@ describe("describeStatus", () => {
       refused: 0,
       unavailable: 0,
       refusal: null,
+      retrying: null,
       updating: false,
       parked: false,
     });
@@ -124,6 +130,7 @@ describe("describeStatus", () => {
       refused: 0,
       unavailable: 0,
       refusal: null,
+      retrying: null,
       updating: false,
       parked: false,
     });
@@ -206,12 +213,12 @@ describe("describeStatus", () => {
 
 /**
  * Design §6.3's last sentence: the refusal branch already existed and took the terminal
- * path (`not authorised` is absent from `RESUMABLE_CLOSING_REASONS`), and what was missing
+ * path (the vault sends `not authorised` with `retry: "never"`), and what was missing
  * was only the copy telling the user their device was revoked somewhere else.
  *
  * **Why this needs its own words at all**, when the rule above is "render the vault's own
  * sentence": `not authorised` is the ONE reason the vault deliberately refuses to explain.
- * `apps/vault/src/http/routes/sync.rs`'s `reason_for` collapses unknown device, revoked
+ * `apps/vault/src/http/routes/sync.rs`'s `reason_text` collapses unknown device, revoked
  * device and a signature that did not verify into one string, because distinguishing them
  * tells an attacker whether a device id exists. So on this wire it is the only refusal a
  * user cannot act on from its text — and the likeliest cause by far is the one thing they
@@ -255,5 +262,48 @@ describe("a vault restarting for an update", () => {
     expect(describeStatus({ ...IDLE_STATUS, updating: true, refusal: "teapot" })).toBe(
       "Vault updating, reconnecting.",
     );
+  });
+});
+
+/**
+ * Bulk-ingest design BI1. A closing this device is reconnecting after on its own is a clause,
+ * not a refusal: a busy vault sends one every few seconds during an import, and the pane must
+ * keep saying how much is left to send the whole time.
+ */
+describe("a device reconnecting by itself", () => {
+  it("says so after the head, and keeps the pending count on screen", () => {
+    const text = describeStatus({
+      ...IDLE_STATUS,
+      syncedCursor: 4,
+      pending: 120,
+      retrying: "busy",
+    });
+    expect(text).toBe('Syncing: 120 change(s) still to send. Reconnecting: the vault said "busy".');
+  });
+
+  it("is not rendered as a refusal", () => {
+    const text = describeStatus({ ...IDLE_STATUS, syncedCursor: 4, retrying: "busy" });
+    expect(text).not.toContain("refused");
+    expect(text.startsWith("Up to date at change 4.")).toBe(true);
+  });
+
+  /**
+   * A vault older than BI1 sends no `retry`, so its "not authorised" is retried like any
+   * other closing, and this clause is where its owner learns why nothing syncs. **Proven able
+   * to fail** by rendering the clause without the advice: the device-list match goes red.
+   */
+  it("carries the revoked-elsewhere advice when the reason is the opaque refusal", () => {
+    const text = describeStatus({
+      ...IDLE_STATUS,
+      retrying: "not authorised",
+    });
+    expect(text).toContain('Reconnecting: the vault said "not authorised".');
+    expect(text).toMatch(/device list/i);
+    expect(describeStatus({ ...IDLE_STATUS, retrying: "busy" })).not.toMatch(/device list/i);
+  });
+
+  it("a refusal still outranks it", () => {
+    const text = describeStatus({ ...IDLE_STATUS, refusal: "teapot", retrying: "busy" });
+    expect(text).toBe("Sync was refused: teapot.");
   });
 });

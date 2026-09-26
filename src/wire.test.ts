@@ -9,6 +9,8 @@ import { fixture } from "./testing/wire-fixture.ts";
 import {
   decodeDown,
   encodeUp,
+  MIN_WIRE_VERSION,
+  NO_REASON_GIVEN,
   readDownFrame,
   UnknownDownFrameError,
   WIRE_VERSION,
@@ -28,6 +30,8 @@ describe("every documented down fixture decodes", () => {
     "down.snapshot.json",
     "down.snapshot_page.json",
     "down.closing.json",
+    "down.closing_never.json",
+    "down.applied_batch.json",
   ])("%s", (name) => {
     expect(() => decodeDown(fixture(`vault-sync/${name}`))).not.toThrow();
   });
@@ -84,6 +88,122 @@ describe("a wire_version mismatch refuses and names the version", () => {
     // fix the fixture (with the vault side, per `wire/vault-sync/README.md`), not this test.
     const challenge = fixture("vault-sync/down.challenge.json") as { wire_version: number };
     expect(challenge.wire_version).toBe(WIRE_VERSION);
+  });
+});
+
+/**
+ * Bulk-ingest design BI1: 4 is this build's version, and 3 is still spoken so that a vault not
+ * yet moved to a v4 release can be reached (`MIN_WIRE_VERSION`'s doc comment).
+ */
+describe("the wire versions this build speaks", () => {
+  const challenge = (wire_version: number) => ({
+    type: "challenge",
+    wire_version,
+    challenge: "Y2hhbA",
+  });
+
+  it("is 3 to 4", () => {
+    expect([MIN_WIRE_VERSION, WIRE_VERSION]).toEqual([3, 4]);
+  });
+
+  it.each([3, 4])("accepts a challenge of %i", (v) => {
+    expect(decodeDown(challenge(v))).toMatchObject({ type: "challenge", wire_version: v });
+  });
+
+  it.each([2, 5])("refuses a challenge of %i", (v) => {
+    expect(() => decodeDown(challenge(v))).toThrow(WireVersionMismatchError);
+  });
+});
+
+/**
+ * BI1's `retry`, decoded leniently: only an explicit `never` stops this device. Anything else —
+ * absent (a v3 vault), a value from some future vault, the wrong type — is `later`, and none of
+ * them may throw, because a decode error on a frame after the handshake is terminal.
+ *
+ * **Proven able to fail** by decoding with `str(v.retry, …)`: the absent, 7 and null rows throw.
+ */
+describe("a closing's retry field", () => {
+  const retry = (extra: Record<string, unknown>) => {
+    const d = decodeDown({ type: "closing", reason: "r", ...extra });
+    return d.type === "closing" ? d.retry : null;
+  };
+
+  it("never decodes as never", () => {
+    expect(retry({ retry: "never" })).toBe("never");
+  });
+
+  it.each([
+    ["later", { retry: "later" }],
+    ["absent", {}],
+    ["an unknown value", { retry: "park" }],
+    ["a number", { retry: 7 }],
+    ["null", { retry: null }],
+  ])("%s decodes as later, without throwing", (_label, extra) => {
+    expect(retry(extra)).toBe("later");
+  });
+
+  /** A closing with no usable reason is still a closing, not a decode error — which would be
+   * terminal. **Proven able to fail** by decoding `reason` with `str` again: both rows throw. */
+  it.each([
+    ["absent", {}],
+    ["not a string", { reason: 7 }],
+  ])("a reason that is %s reads as a stand-in, and keeps its retry", (_label, extra) => {
+    const d = decodeDown({ type: "closing", retry: "later", ...extra });
+    expect(d).toEqual({ type: "closing", reason: NO_REASON_GIVEN, retry: "later" });
+  });
+});
+
+/**
+ * Bulk-ingest design BI5. A vault older than `put_batch` sends a `ready` with no limits, and
+ * that must read as "no batching", not as a malformed frame — a decode error on `ready` would
+ * fail the handshake with every vault not yet moved to a batching release.
+ */
+describe("the batch limits a ready frame carries", () => {
+  it("read as 0 and 0 when the vault sends none", () => {
+    expect(decodeDown({ type: "ready", seq: 7 })).toEqual({
+      type: "ready",
+      seq: 7,
+      max_batch_ops: 0,
+      max_batch_bytes: 0,
+    });
+  });
+
+  /** **Proven able to fail** by treating only `undefined` as absent: `null` throws. */
+  it("read as 0 when null", () => {
+    expect(
+      decodeDown({ type: "ready", seq: 7, max_batch_ops: null, max_batch_bytes: null }),
+    ).toMatchObject({ max_batch_ops: 0, max_batch_bytes: 0 });
+  });
+
+  it("are read when present", () => {
+    expect(
+      decodeDown({ type: "ready", seq: 7, max_batch_ops: 100, max_batch_bytes: 4194304 }),
+    ).toMatchObject({ max_batch_ops: 100, max_batch_bytes: 4194304 });
+  });
+
+  it("are still an error when present and not numbers", () => {
+    expect(() => decodeDown({ type: "ready", seq: 7, max_batch_ops: "100" })).toThrow();
+  });
+});
+
+describe("an applied_batch answer", () => {
+  it("needs both lists", () => {
+    expect(() => decodeDown({ type: "applied_batch", applied: [] })).toThrow(/refused/);
+    expect(() => decodeDown({ type: "applied_batch", refused: [] })).toThrow(/applied/);
+  });
+
+  it("carries a null seq and a null current_sha through", () => {
+    expect(
+      decodeDown({
+        type: "applied_batch",
+        applied: [{ path: "a.md", seq: null, sha: "s" }],
+        refused: [{ path: "b.md", reason: "r", current_sha: null }],
+      }),
+    ).toEqual({
+      type: "applied_batch",
+      applied: [{ path: "a.md", seq: null, sha: "s" }],
+      refused: [{ path: "b.md", reason: "r", current_sha: null }],
+    });
   });
 });
 

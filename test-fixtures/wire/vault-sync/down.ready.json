@@ -1,4 +1,6 @@
 {
   "type": "ready",
-  "seq": 4821
+  "seq": 4821,
+  "max_batch_ops": 100,
+  "max_batch_bytes": 4194304
 }

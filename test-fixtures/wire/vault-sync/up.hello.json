@@ -1,6 +1,6 @@
 {
   "type": "hello",
-  "wire_version": 3,
+  "wire_version": 4,
   "device_id": "dev-a1b2c3",
   "signature": "c2ln",
   "since_seq": 41

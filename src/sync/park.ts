@@ -80,11 +80,17 @@ export const MAX_IDLE_WAKES = 3;
  * counts the immediate re-wakes since the last close that found nothing outstanding (or
  * since the caller saw progress and reset it); past `MAX_IDLE_WAKES` the device parks
  * anyway and says so. Its other triggers still wake it.
+ *
+ * **A running derive is never bounded** (`deriving`): it is local work that ends on its own,
+ * not a vault that never answers, and a first sync's derive can outlast several idle closes.
+ * Parked then, the vault could suspend in the middle of that sync (BI4).
  */
 export function decideIdleWake(
   outstanding: boolean,
   idleWakes: number,
+  deriving = false,
 ): { readonly wake: boolean; readonly idleWakes: number; readonly gaveUp: boolean } {
+  if (deriving) return { wake: true, idleWakes, gaveUp: false };
   if (!outstanding) return { wake: false, idleWakes: 0, gaveUp: false };
   if (idleWakes >= MAX_IDLE_WAKES) return { wake: false, idleWakes, gaveUp: true };
   return { wake: true, idleWakes: idleWakes + 1, gaveUp: false };

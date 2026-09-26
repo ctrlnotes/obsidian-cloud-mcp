@@ -39,8 +39,27 @@
  * string treats it as terminal: it stops syncing until Obsidian restarts. No frame changed
  * shape; the bump exists so that such a build is refused at the handshake with a sentence
  * telling its user to update, instead.
+ *
+ * **4: every closing says whether to retry** (bulk-ingest design BI1), in `retry`. A v3 build
+ * reads a reason it does not know as terminal, and a v4 vault sends new ones (`busy`), so such
+ * a build is refused at the handshake instead.
  */
-export const WIRE_VERSION = 3;
+export const WIRE_VERSION = 4;
+
+/**
+ * The oldest version this build still speaks, and it answers `hello` in whichever version the
+ * vault's `challenge` named.
+ *
+ * **3 is still spoken because release-11 vaults speak it**, and the vault compares exactly
+ * (`vault::sync::pure::admit`): speaking only 4 would lock this plugin out of every vault not
+ * yet moved to a v4 release. A v3 closing carries no `retry` (decoded as `later`), and a v3
+ * `ready` no batch limits ("no batching").
+ *
+ * TODO(v3): once no v3 vault remains, delete this, the per-connection `wireVersion` in
+ * `socket.ts` (and its v3 pre-ready exemption), `optionalNum` and the v3 revoked-device advice
+ * on `status.ts`'s retrying clause.
+ */
+export const MIN_WIRE_VERSION = 3;
 
 /**
  * The largest single upload this vault will accept — pinned to
@@ -58,6 +77,16 @@ export const WIRE_VERSION = 3;
  * the upload, not a statement about how large a note or attachment may be.
  */
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
+
+/**
+ * How large one binary frame of a put's content is — and so the largest put a `put_batch`
+ * carries, since a batch entry is exactly one frame ({@link UpPutBatch}).
+ *
+ * **Not `MAX_FRAME_BYTES`.** That is the vault's wall on a WHOLE upload; this is how finely
+ * one upload is sliced on the way up, so a large attachment never holds the socket's send
+ * buffer at megabytes. The vault assembles any number of chunks (`Upload::push`).
+ */
+export const PUT_CHUNK_BYTES = 256 * 1024;
 
 // ---- Up: plugin -> vault ----
 
@@ -116,7 +145,28 @@ export interface UpWant {
   readonly shas: readonly string[];
 }
 
-export type Up = UpHello | UpAck | UpPut | UpDelete | UpRename | UpSnapshot | UpWant;
+/** One entry of a {@link UpPutBatch}: the header of a `put`, without its `type`. */
+export interface BatchPutEntry {
+  readonly path: string;
+  readonly base_sha: string | null;
+  readonly sha: string;
+  readonly bytes: number;
+}
+
+/**
+ * Several puts in one frame (bulk-ingest design BI5), answered by one {@link DownAppliedBatch}.
+ *
+ * **Exactly `puts.length` binary frames follow, one per entry, in order** — entry i's whole
+ * content in frame i, zero-length for an empty file. The vault correlates by position, so only
+ * content that fits one frame ({@link PUT_CHUNK_BYTES}) is batched. Sent only to a vault that
+ * advertised it in `ready`; one without it drops the frame in silence.
+ */
+export interface UpPutBatch {
+  readonly type: "put_batch";
+  readonly puts: readonly BatchPutEntry[];
+}
+
+export type Up = UpHello | UpAck | UpPut | UpPutBatch | UpDelete | UpRename | UpSnapshot | UpWant;
 
 /** The plugin only ever sends `Up` frames; this is the whole of that job. */
 export function encodeUp(up: Up): string {
@@ -134,6 +184,10 @@ export interface DownChallenge {
 export interface DownReady {
   readonly type: "ready";
   readonly seq: number;
+  /** The most entries, and content bytes, this vault takes in one {@link UpPutBatch} (BI5).
+   * **0 means "no batching"**: a vault older than the frame sends neither. */
+  readonly max_batch_ops: number;
+  readonly max_batch_bytes: number;
 }
 
 export interface DownEvent {
@@ -161,6 +215,29 @@ export interface DownRefused {
   readonly current_sha: string | null;
 }
 
+/** One entry of a batch that landed. `seq` is that entry's own event, or `null` when the vault
+ * already held those bytes there and wrote nothing. */
+export interface AppliedBatchEntry {
+  readonly path: string;
+  readonly seq: number | null;
+  readonly sha: string;
+}
+
+/** One entry of a batch the vault refused — the same meaning as a {@link DownRefused}. */
+export interface RefusedBatchEntry {
+  readonly path: string;
+  readonly reason: string;
+  readonly current_sha: string | null;
+}
+
+/** The one answer to a {@link UpPutBatch} (BI5): **every entry appears in exactly one of the
+ * two lists**, keyed by path. A refused entry never refuses its neighbours. */
+export interface DownAppliedBatch {
+  readonly type: "applied_batch";
+  readonly applied: readonly AppliedBatchEntry[];
+  readonly refused: readonly RefusedBatchEntry[];
+}
+
 export interface SnapshotEntry {
   readonly path: string;
   readonly sha: string;
@@ -180,9 +257,22 @@ export interface DownSnapshot {
   readonly more: boolean;
 }
 
+/**
+ * Whether a `closing` is worth reconnecting after (bulk-ingest design BI1), decided by the
+ * vault: `later` (a handshake timeout, `busy`, a restart, an idle close) is back off and
+ * reconnect; `never` (an unknown or revoked device, a version mismatch) is stop until a person
+ * acts.
+ */
+export type ClosingRetry = "later" | "never";
+
+/** What a `closing` without a usable `reason` reads as. */
+export const NO_REASON_GIVEN = "no reason given";
+
 export interface DownClosing {
   readonly type: "closing";
+  /** Free text for a human. Nothing here decides whether to retry from it. */
   readonly reason: string;
+  readonly retry: ClosingRetry;
 }
 
 /**
@@ -217,6 +307,7 @@ export type Down =
   | DownEvent
   | DownApplied
   | DownRefused
+  | DownAppliedBatch
   | DownSnapshot
   | DownBlob
   | DownNoBlob
@@ -249,7 +340,7 @@ export class WireVersionMismatchError extends Error {
   constructor(readonly serverWireVersion: number) {
     super(
       `the vault wants to speak wire version ${serverWireVersion}; this plugin build only ` +
-        `speaks version ${WIRE_VERSION}; update the plugin`,
+        `speaks versions ${MIN_WIRE_VERSION} to ${WIRE_VERSION}; update the plugin`,
     );
   }
 }
@@ -289,6 +380,19 @@ function numOrNull(v: unknown, field: string): number | null {
   return v === null ? null : num(v, field);
 }
 
+/**
+ * A count a vault older than the field does not send: absent (or `null`) is 0, which every
+ * caller reads as "not offered". Present and not a number is still an error.
+ */
+function optionalNum(v: unknown, field: string): number {
+  return v === undefined || v === null ? 0 : num(v, field);
+}
+
+function array(v: unknown, field: string): unknown[] {
+  if (!Array.isArray(v)) throw new DownDecodeError(`\`${field}\` must be an array`);
+  return v;
+}
+
 function record(v: unknown): Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     throw new DownDecodeError("a frame must be a JSON object");
@@ -308,7 +412,9 @@ export function decodeDown(raw: unknown): Down {
   switch (type) {
     case "challenge": {
       const wireVersion = num(v.wire_version, "wire_version");
-      if (wireVersion !== WIRE_VERSION) throw new WireVersionMismatchError(wireVersion);
+      if (wireVersion < MIN_WIRE_VERSION || wireVersion > WIRE_VERSION) {
+        throw new WireVersionMismatchError(wireVersion);
+      }
       return {
         type: "challenge",
         wire_version: wireVersion,
@@ -316,7 +422,12 @@ export function decodeDown(raw: unknown): Down {
       };
     }
     case "ready":
-      return { type: "ready", seq: num(v.seq, "seq") };
+      return {
+        type: "ready",
+        seq: num(v.seq, "seq"),
+        max_batch_ops: optionalNum(v.max_batch_ops, "max_batch_ops"),
+        max_batch_bytes: optionalNum(v.max_batch_bytes, "max_batch_bytes"),
+      };
     case "event":
       return {
         type: "event",
@@ -341,6 +452,26 @@ export function decodeDown(raw: unknown): Down {
         reason: str(v.reason, "reason"),
         current_sha: strOrNull(v.current_sha, "current_sha"),
       };
+    case "applied_batch":
+      return {
+        type: "applied_batch",
+        applied: array(v.applied, "applied").map((a) => {
+          const e = record(a);
+          return {
+            path: str(e.path, "path"),
+            seq: numOrNull(e.seq, "seq"),
+            sha: str(e.sha, "sha"),
+          };
+        }),
+        refused: array(v.refused, "refused").map((r) => {
+          const e = record(r);
+          return {
+            path: str(e.path, "path"),
+            reason: str(e.reason, "reason"),
+            current_sha: strOrNull(e.current_sha, "current_sha"),
+          };
+        }),
+      };
     case "snapshot": {
       const files = v.files;
       if (!Array.isArray(files)) throw new DownDecodeError("`files` must be an array");
@@ -362,7 +493,15 @@ export function decodeDown(raw: unknown): Down {
     case "no_blob":
       return { type: "no_blob", sha: str(v.sha, "sha"), reason: str(v.reason, "reason") };
     case "closing":
-      return { type: "closing", reason: str(v.reason, "reason") };
+      // **Lenient, and it must never throw.** A decode error after the handshake is terminal
+      // (`socket.ts`), so a strict decode here would turn a malformed closing into exactly the
+      // stop BI1 exists to prevent. Only an explicit `never` stops this device; a missing
+      // reason gets a stand-in.
+      return {
+        type: "closing",
+        reason: typeof v.reason === "string" ? v.reason : NO_REASON_GIVEN,
+        retry: v.retry === "never" ? "never" : "later",
+      };
     default:
       throw new UnknownDownFrameError(type);
   }

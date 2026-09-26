@@ -63,6 +63,7 @@ import {
   type SettingsHost,
 } from "./settings-tab.ts";
 import { type Applied, pullIfUnchanged, type VaultFiles } from "./sync/apply.ts";
+import { batchLimitsFrom } from "./sync/batch.ts";
 import { type Change, deriveChanges, type ReadableFiles, syncablePath } from "./sync/derive.ts";
 import { Fetcher } from "./sync/fetcher.ts";
 import { type ScannableVault, scanManifest } from "./sync/manifest-scan.ts";
@@ -201,6 +202,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private touched: Touched = emptyTouched();
   /** Guards a settle's own derive-and-push pass; re-armed rather than interleaved. */
   private syncing = false;
+  /** The derive half of that pass is running: local work that ends on its own, so an idle
+   * close during it never parks (`decideIdleWake`). */
+  private deriving = false;
 
   private odd: ReadonlyMap<string, string> = new Map();
   /** Paths the last scan skipped because another file folds onto the same wire path. */
@@ -228,12 +232,13 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    */
   private parked = false;
   /**
-   * The next `ready` ends a park, so it skips the full rescan (VS5). Set by `onIdle`, cleared
-   * by that `ready`, and deliberately NOT cleared by `wake`: a reconnect that fails and
-   * retries on the backoff is still the end of the same park, and the watchers saw every
-   * edit made during it.
+   * The next `ready` reconnects a pair whose watchers kept running, so it skips the full
+   * rescan (VS5): it ends a park (`onIdle`) or a closing the vault said to retry after
+   * (`onClosing`, BI1 — a busy import closes every few seconds). Cleared by that `ready` and
+   * by `disconnectSyncing`, not by a failed reconnect in between. A plain drop, and a closing
+   * before this pair's first `ready` (`readiedThisPair`), still rescan.
    */
-  private resumingFromPark = false;
+  private watchersRan = false;
   /**
    * A mobile device went to the background since the last `ready` (VS5's exception). A
    * backgrounded mobile app's JavaScript is suspended, so an edit made by something else in
@@ -242,6 +247,13 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * `ready` does it.
    */
   private backgroundedOnMobile = false;
+  /** This `SyncSocket`/`Pump` pair has completed a handshake at least once. Cleared by
+   * `disconnectSyncing`, with the pair. */
+  private readiedThisPair = false;
+  /** A manifest reconcile is running (`startReconcile`). */
+  private reconciling = false;
+  /** Another reconcile was asked for while one was running: run once more when it ends. */
+  private reconcileAgain = false;
   /** Consecutive idle closes answered by reconnecting at once — `park.ts`'s
    * `decideIdleWake`. Reset by a quiet close, and by any sign the vault is answering. */
   private idleWakes = 0;
@@ -785,13 +797,30 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    *
    * **The settle runs either way.** A reconcile that threw part-way through has still
    * marked real paths dirty, and nothing else is ever going to look at them.
+   *
+   * **One at a time.** A scan reads and hashes every file, so on a large vault it can outlast
+   * the gap between two reconnects. A request while one runs is served by ONE more scan when
+   * it ends — not dropped, because the running scan may have listed the vault before the edit
+   * the request exists to catch.
    */
   private startReconcile(): void {
+    if (this.reconciling) {
+      this.reconcileAgain = true;
+      return;
+    }
+    this.reconciling = true;
     void (async () => {
       try {
-        await this.reconcileManifest();
-      } catch (e) {
-        console.warn("Ctrl Notes: could not reconcile this vault against its own ledger", e);
+        do {
+          this.reconcileAgain = false;
+          try {
+            await this.reconcileManifest();
+          } catch (e) {
+            console.warn("Ctrl Notes: could not reconcile this vault against its own ledger", e);
+          }
+        } while (this.reconcileAgain && this.active);
+      } finally {
+        this.reconciling = false;
       }
       this.settler?.touch();
     })();
@@ -807,7 +836,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    *
    * Called from `onLayoutReady` (vault listing is stable and complete by then) and again on
    * every `ready` — a reconnect is the other moment this device could have missed something —
-   * except the one that ends a park, when the watchers were running throughout (VS5).
+   * except the one that ends a park (VS5) or a retried closing (BI1), when the watchers were
+   * running throughout.
    */
   private async reconcileManifest(): Promise<void> {
     const listed = this.listWirePaths();
@@ -903,6 +933,13 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         deviceId: this.cfg.deviceId ?? "",
         identity: this.identity,
         createSocket: (url) => new WebSocket(url) as unknown as SocketLike,
+        // BI4: a settle deriving or pushing, a push in flight, or an edit not yet derived —
+        // work only a connection can finish, so the vault must not sit quiet long enough to
+        // suspend in the middle of it.
+        hasWork: () =>
+          this.syncing ||
+          (this.pump?.hasOutstanding() ?? false) ||
+          hasSomethingToSend(this.touched, this.attachments),
         // The bytes following a `blob` header. They mean nothing on their own —
         // the fetcher owns the header that gives them a destination.
         onBytes: (bytes) => {
@@ -913,6 +950,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // A fresh connection (first handshake, or any reconnect): retry whatever was
             // in flight when the last one died (§11's content-addressing makes that safe),
             // and flush anything the user edited while disconnected.
+            //
+            // The batch limits first (BI5): they belong to THIS connection's vault, and the
+            // re-send `resume` makes is planned against them.
+            pump.setBatchLimits(batchLimitsFrom(down));
             pump.resume();
             this.settler?.touch();
             // A reconnect is also a relink's most likely moment — re-scan the
@@ -924,12 +965,15 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // — and it reads every file, so a large vault would pay a full scan each time a
             // phone came back to the foreground.
             //
+            // Nor after a closing the vault said to retry (BI1): see `watchersRan`.
+            //
             // A mobile device that went to the background meanwhile rescans anyway: its
             // watchers were suspended with the rest of its JavaScript.
-            const endsPark = this.resumingFromPark && !this.backgroundedOnMobile;
-            this.resumingFromPark = false;
+            const watched = this.watchersRan && !this.backgroundedOnMobile;
+            this.watchersRan = false;
             this.backgroundedOnMobile = false;
-            if (!endsPark) this.startReconcile();
+            this.readiedThisPair = true;
+            if (!watched) this.startReconcile();
             this.retryPendingPulls();
             // **Not `down.seq`.** That is the VAULT's current position, and
             // setting it here reported a device as caught up at the instant it
@@ -949,10 +993,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // documented as "cleared by the next exchange that succeeds", and until
             // 2026-09-22 nothing cleared it, so a resumable closing that had already
             // reconnected kept the pane reading "Sync was refused" until a reload.
+            // It ends the reconnect a retried closing started (BI1): `retrying` clears here.
             // And it ends a vault restart (staged rollout §5): `updating` clears here.
             this.setStatus({
               syncedCursor: this.syncState.cursor,
               refusal: null,
+              retrying: null,
               updating: false,
               parked: false,
             });
@@ -964,13 +1010,21 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           void pump.handleDown(down);
         },
         onClosing: (message, willRetry) => {
-          new Notice(`Disconnected from the Ctrl Notes vault: ${message}`);
-          this.setStatus({ refusal: message, updating: false });
           // A resumable closing (`socket.ts`'s own header) is already retrying
           // itself with backoff, on the SAME `SyncSocket`/`Pump` pair — tearing those down
           // here would abandon the very push or queue that retry is meant to resume, and
           // `startSyncing`'s only other entry point is a fresh pairing, not what this needs.
-          if (!willRetry) this.disconnectSyncing();
+          //
+          // **No `Notice` for it** (BI1): a busy vault closes every few seconds during an
+          // import and nothing is wrong. The status line says so (`status.ts`'s `retrying`).
+          if (willRetry) {
+            if (this.readiedThisPair) this.watchersRan = true;
+            this.setStatus({ retrying: message, updating: false });
+            return;
+          }
+          new Notice(`Disconnected from the Ctrl Notes vault: ${message}`);
+          this.setStatus({ refusal: message, updating: false });
+          this.disconnectSyncing();
         },
         // The vault is restarting for an update (close 1012). No `Notice`: this is routine
         // and self-healing, and a popup on every rollout would teach users to ignore the
@@ -992,7 +1046,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           const outstanding = this.syncing || pump.hasOutstanding() || fetcher.hasOutstanding();
           fetcher.reset("parked");
           this.parked = true;
-          this.resumingFromPark = true;
+          this.watchersRan = true;
           this.setStatus({ parked: true, updating: false });
           // **Not parked with work outstanding.** Nothing else would wake the device for it:
           // `touched` was drained into that push, the vault never committed it so no signal
@@ -1000,7 +1054,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           // which re-sends the head (content addressing makes that safe), and
           // `retryPendingPulls`, which asks for a failed want again. Bounded: a vault that
           // never answers would otherwise be resumed every 90 s for good (`decideIdleWake`).
-          const decided = decideIdleWake(outstanding, this.idleWakes);
+          const decided = decideIdleWake(outstanding, this.idleWakes, this.deriving);
           this.idleWakes = decided.idleWakes;
           if (decided.gaveUp) {
             console.warn(
@@ -1023,7 +1077,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     // A park belongs to the pair being torn down. The next connection is a fresh one — a
     // relink, or a reconnect after a refusal — and gets the rescan (VS5).
     this.unpark();
-    this.resumingFromPark = false;
+    this.watchersRan = false;
+    this.readiedThisPair = false;
+    // Nothing is reconnecting any more.
+    this.setStatus({ retrying: null });
     this.backgroundedOnMobile = false;
     this.idleWakes = 0;
     // Before the pump, and unconditionally: an outstanding fetch holds a promise
@@ -1195,7 +1252,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   }
 
   /** Leave the parked state. Says nothing about the rescan: `wake` keeps
-   * `resumingFromPark` for the `ready` it is waiting on, `disconnectSyncing` clears it. */
+   * `watchersRan` for the `ready` it is waiting on, `disconnectSyncing` clears it. */
   private unpark(): void {
     this.cancelWakeTimer();
     if (!this.parked) return;
@@ -1400,6 +1457,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     const touched = this.touched;
     this.touched = emptyTouched();
     this.syncing = true;
+    this.deriving = true;
     try {
       const { changes, oversize, undecodable } = await deriveChanges(
         this.readableFiles(),
@@ -1407,6 +1465,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         touched,
         { attachments: this.attachments },
       );
+      this.deriving = false;
       if (oversize.length > 0) {
         console.warn(
           `Ctrl Notes: not syncing ${oversize.length} file(s) over the size limit: ` +
@@ -1446,32 +1505,50 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         unsyncable: this.shadowed.length + this.withheld.size,
       });
 
-      for (const [i, change] of changes.entries()) {
-        const pump = this.pump;
-        if (pump === null || this.socket?.isReady !== true) {
-          // Disconnected mid-loop (unpair, a terminal closing, or unload). `change` and
-          // everything still behind it in `changes` were derived from `touched` but never
-          // sent — blocker fix: losing them here silently drops the rest of this settle's
-          // batch, not just the one change that happened to be at the front.
-          //
-          // **Or not ready yet**, which is checked again here because the derive awaits: an
-          // idle close that landed mid-derive has woken the device, and its reconnect may
-          // still be handshaking when the derive finishes. Sending then throws inside the
-          // pump; handing the changes back instead lets `ready`'s `settler.touch()` derive
-          // and send them once, on a connection that can carry them.
-          this.redirtyRemaining(changes.slice(i));
-          break;
-        }
-        try {
-          const outcome = await pump.push(change);
-          this.applyPushOutcome(outcome);
-        } catch (e) {
-          console.warn(`Ctrl Notes: could not send ${change.path}`, e);
-          // Retried on the next settle, not lost — the same blocker fix: everything from
-          // `change` onward, not only the one that threw.
-          this.redirtyRemaining(changes.slice(i));
-          break;
-        }
+      const pump = this.pump;
+      if (pump === null || this.socket?.isReady !== true) {
+        // Disconnected (unpair, a terminal closing, or unload): these changes were derived
+        // from `touched` but never sent, and losing them would drop the whole settle.
+        //
+        // **Or not ready yet**, checked here because the derive awaits: an idle close that
+        // landed mid-derive has woken the device, and its reconnect may still be handshaking.
+        // Handing the changes back lets `ready`'s `settler.touch()` send them once.
+        this.redirtyRemaining(changes);
+      } else {
+        // All queued at once, so the pump can batch them (BI5). **Each outcome applies the
+        // moment its own answer lands**: applied later, a push's ledger write would overwrite
+        // inbound events for the same path. A dropped connection keeps the pump's queue for
+        // `resume()`; an abandoned pump rejects, and a rejection is redirtied below.
+        let left = changes.length;
+        const failed: Change[] = [];
+        const settled = pump.pushAll(changes).map((sent, i) => {
+          const change = changes[i] as Change;
+          return sent
+            .then(
+              (outcome) => {
+                try {
+                  this.applyPushOutcome(outcome);
+                } catch (e) {
+                  console.warn(
+                    `Ctrl Notes: ${change.path} reached the vault, but recording its answer failed`,
+                    e,
+                  );
+                  failed.push(change);
+                }
+              },
+              (e: unknown) => {
+                console.warn(`Ctrl Notes: could not send ${change.path}`, e);
+                failed.push(change);
+              },
+            )
+            .finally(() => {
+              left--;
+              this.setStatus({ pending: left });
+            });
+        });
+        await Promise.all(settled);
+        // Retried on the next settle, not lost.
+        this.redirtyRemaining(failed);
       }
       this.setStatus({ pending: 0 });
     } catch (e) {
@@ -1484,6 +1561,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       this.settler?.touch(); // Retry the whole window rather than losing it.
     } finally {
       this.syncing = false;
+      this.deriving = false;
       // A change derived after the idle close parked this device, that then failed to send,
       // is back on `touched` with no trigger left to carry it: wake for it now.
       if (this.parked && hasSomethingToSend(this.touched, this.attachments)) this.wake();

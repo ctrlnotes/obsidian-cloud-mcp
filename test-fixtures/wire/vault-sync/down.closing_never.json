@@ -1,0 +1,5 @@
+{
+  "type": "closing",
+  "reason": "not authorised",
+  "retry": "never"
+}

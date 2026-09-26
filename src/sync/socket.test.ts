@@ -3,15 +3,18 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Down, Up } from "../wire.ts";
-import { encodeUp, WIRE_VERSION } from "../wire.ts";
+import { encodeUp, MIN_WIRE_VERSION, WIRE_VERSION } from "../wire.ts";
 import {
   IDLE_REASON,
+  MAX_RETRY_MS,
   RESTART_RECONNECT_MS,
+  retryWait,
   SERVICE_RESTART_CLOSE_CODE,
   type SocketLike,
   SyncSocket,
   type SyncSocketDeps,
   VAULT_RESTART_REASON,
+  WORK_RETRY_MAX_MS,
 } from "./socket.ts";
 
 // Fake timers leak into the next test on a failing assertion (settle.test.ts's own
@@ -123,7 +126,7 @@ async function connected(h: ReturnType<typeof harness>, seq = 0): Promise<FakeSo
   // so the socket does not exist until a microtask has run.
   await flush();
   const t = latest(h);
-  t.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+  t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
   await flush();
   t.emit({ type: "ready", seq });
   return t;
@@ -191,14 +194,14 @@ describe("SyncSocket", () => {
     h.socket.connect();
     await flush();
     const t = latest(h);
-    t.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
     await flush();
 
     expect(h.identity.signChallenge).toHaveBeenCalledWith("vault-abc", CHALLENGE_BYTES);
     const [hello] = t.upFrames();
     expect(hello).toEqual({
       type: "hello",
-      wire_version: 3,
+      wire_version: WIRE_VERSION,
       device_id: "device-1",
       signature: "sig(vault-abc,1.2.3)",
       since_seq: 41,
@@ -208,7 +211,8 @@ describe("SyncSocket", () => {
   it("a ready frame carries the cursor we resume from", async () => {
     const h = harness();
     await connected(h, 4821);
-    expect(h.frames).toEqual([{ type: "ready", seq: 4821 }]);
+    // No batch limits on the frame: a vault that does not batch, read as 0 and 0.
+    expect(h.frames).toEqual([{ type: "ready", seq: 4821, max_batch_ops: 0, max_batch_bytes: 0 }]);
   });
 
   it("a terminal closing frame is surfaced to the user, not retried forever", async () => {
@@ -222,7 +226,7 @@ describe("SyncSocket", () => {
     vi.useFakeTimers();
     const h = harness();
     const t = await connected(h);
-    t.emit({ type: "closing", reason: "this device's trust has been withdrawn" });
+    t.emit({ type: "closing", reason: "this device's trust has been withdrawn", retry: "never" });
     await flush();
 
     expect(h.closings).toEqual(["this device's trust has been withdrawn"]);
@@ -238,13 +242,14 @@ describe("SyncSocket", () => {
    * would never reconnect; a device merely over the per-device connection cap, or too far
    * behind acknowledging, was stuck exactly the same way until Obsidian restarted.
    */
-  it("a resumable closing retries with the ordinary backoff, not the user's attention", async () => {
+  it("a later closing retries with the ordinary backoff, not the user's attention", async () => {
     vi.useFakeTimers(); // before `connect()` — see the test above for why that matters.
     const h = harness();
     const t = await connected(h);
     t.emit({
       type: "closing",
       reason: "too far behind acknowledging; reconnect and resume from your last seq",
+      retry: "later",
     });
     await flush();
 
@@ -258,15 +263,219 @@ describe("SyncSocket", () => {
     expect(h.sockets).toHaveLength(2); // the retry fired, exactly like an ordinary drop
   });
 
-  it("the per-device connection cap is resumable too", async () => {
+  it("the per-device connection cap is retried too", async () => {
     vi.useFakeTimers();
     const h = harness();
     const t = await connected(h);
-    t.emit({ type: "closing", reason: "too many connections open for this device" });
+    t.emit({
+      type: "closing",
+      reason: "too many connections open for this device",
+      retry: "later",
+    });
     await flush();
 
     await vi.advanceTimersByTimeAsync(2_000);
     expect(h.sockets).toHaveLength(2);
+  });
+
+  /**
+   * Bulk-ingest design BI1: a vault older than the `retry` field sends none, and that reads as
+   * `later` — including for a reason this build used to treat as terminal. Retrying against a
+   * vault that will refuse again costs one request per backoff step; giving up against one
+   * that would have recovered costs the whole sync.
+   *
+   * **Proven able to fail** by decoding an absent `retry` as `never`: no second socket.
+   */
+  it("a closing with no retry field (an older vault) retries with backoff", async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    const t = await connected(h);
+    t.emit({ type: "closing", reason: "this device's trust has been withdrawn" });
+    await flush();
+
+    expect(h.closings).toEqual(["this device's trust has been withdrawn"]);
+    expect(t.closed).toBe(true);
+    expect(h.sockets).toHaveLength(1); // not immediate
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.sockets).toHaveLength(2);
+  });
+
+  /**
+   * The §1 case of the bulk-ingest design, exactly: a busy vault answered the hello with
+   * `handshake timed out`, this module read the text as terminal, the socket closed, and with
+   * no traffic Fly suspended the vault in the middle of a first sync that never finished.
+   *
+   * **Proven able to fail** by restoring the text-matched resumable set: the closing is
+   * terminal and no second socket opens.
+   */
+  it('"handshake timed out" with retry later retries rather than stopping', async () => {
+    vi.useFakeTimers();
+    const h = harness();
+    h.socket.connect();
+    await flush();
+    const t = latest(h);
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
+    await flush();
+    t.emit({ type: "closing", reason: "handshake timed out", retry: "later" });
+    await flush();
+
+    expect(h.closings).toEqual(["handshake timed out"]);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.sockets).toHaveLength(2);
+  });
+
+  /**
+   * A retried closing is reported in the vault's own words, even while this device waits on
+   * its hello. The pane quotes the message as what the vault said (`status.ts`), and until
+   * this was so it read `the vault said "could not connect to vault "…": handshake timed
+   * out"` — this plugin's words inside the vault's. A terminal one keeps the diagnosis: the
+   * mismatched-vault-id case below.
+   *
+   * **Proven able to fail** by passing `closingMessage(down.reason)` to `resumable` again: the
+   * message carries the vault-id prefix.
+   */
+  it("a retried closing during the handshake is reported verbatim", async () => {
+    const h = harness();
+    h.socket.connect();
+    await flush();
+    const t = latest(h);
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
+    await flush();
+    t.emit({ type: "closing", reason: "busy", retry: "later" });
+    await flush();
+
+    expect(h.closings).toEqual(["busy"]);
+  });
+
+  /**
+   * BI4: while this device has work outstanding, a reconnect waits at most
+   * `WORK_RETRY_MAX_MS`, however far the backoff has climbed — so the vault never sits quiet
+   * long enough to suspend in the middle of an upload. `random` is 1, the top of every jitter
+   * window, so an uncapped wait would be the whole `retryMs`.
+   *
+   * **Proven able to fail** by ignoring `hasWork` in `scheduleRetry`: the sixth failure waits
+   * 32 s and the socket count falls behind.
+   */
+  it("with work outstanding a reconnect waits at most 30 s", async () => {
+    vi.useFakeTimers();
+    const h = harness({ hasWork: () => true, random: () => 1 });
+    h.socket.connect();
+    await flush();
+    for (let failure = 1; failure <= 10; failure++) {
+      latest(h).drop();
+      await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
+      await flush();
+      expect(h.sockets).toHaveLength(failure + 1);
+    }
+  });
+
+  /** The control for the case above: the same ladder without work climbs past 30 s. */
+  it("without work outstanding the backoff climbs past 30 s as before", async () => {
+    vi.useFakeTimers();
+    let work = false;
+    const h = harness({ hasWork: () => work, random: () => 1 });
+    h.socket.connect();
+    await flush();
+    // 1, 2, 4, 8, 16 s: each inside the cap.
+    for (let failure = 1; failure <= 5; failure++) {
+      latest(h).drop();
+      await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
+      await flush();
+    }
+    expect(h.sockets).toHaveLength(6);
+    latest(h).drop(); // retryMs is now 32 s
+    await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
+    await flush();
+    expect(h.sockets).toHaveLength(6);
+    // The cap is read when the retry is SCHEDULED, so work arriving later does not shorten a
+    // wait already running: the next socket comes at 32 s.
+    work = true;
+    await vi.advanceTimersByTimeAsync(2_000);
+    await flush();
+    expect(h.sockets).toHaveLength(7);
+  });
+
+  /**
+   * Progress resets the ladder. A busy vault can close within `STABLE_MS` of every `ready`
+   * while applying work each time; without this, an import's retries climb to long waits.
+   *
+   * **Proven able to fail** by removing the `applied` branch in `onMessage`: the retry waits
+   * the 16 s rung and no socket opens within 1 s.
+   */
+  it("an applied answer resets the backoff, so the next busy close retries within 1 s", async () => {
+    vi.useFakeTimers();
+    const h = harness({ random: () => 1 });
+    h.socket.connect();
+    await flush();
+    // Four drops before any handshake: 1, 2, 4 and 8 s, so the rung is now 16 s.
+    for (let failure = 1; failure <= 4; failure++) {
+      latest(h).drop();
+      await vi.advanceTimersByTimeAsync(8_000);
+      await flush();
+    }
+    expect(h.sockets).toHaveLength(5);
+    const t = latest(h);
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
+    await flush();
+    t.emit({ type: "ready", seq: 0 });
+    t.emit({ type: "applied", path: "a.md", seq: 1, sha: "s" });
+    await flush();
+    t.emit({ type: "closing", reason: "busy", retry: "later" }); // well inside STABLE_MS
+    await flush();
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await flush();
+    expect(h.sockets).toHaveLength(6);
+  });
+
+  /** Climbs the ladder with a pre-ready closing on each connection, and returns the socket
+   * count after each wait of `WORK_RETRY_MAX_MS`. */
+  const preReadyClosings = async (wireVersion: number, closing: object): Promise<number[]> => {
+    const h = harness({ hasWork: () => true, random: () => 1 });
+    h.socket.connect();
+    await flush();
+    const counts: number[] = [];
+    for (let failure = 1; failure <= 8; failure++) {
+      const t = latest(h);
+      t.emit({ type: "challenge", wire_version: wireVersion, challenge: CHALLENGE_B64 });
+      await flush();
+      t.emit(closing);
+      await flush();
+      await vi.advanceTimersByTimeAsync(WORK_RETRY_MAX_MS);
+      await flush();
+      counts.push(h.sockets.length);
+    }
+    return counts;
+  };
+
+  /**
+   * A v3 vault's refusal of the hello carries no `retry` and may be a revoked device, so it
+   * keeps the ordinary five-minute ceiling even with work queued, rather than BI4's 30 s.
+   *
+   * **Proven able to fail** by passing `true` for `capForWork` unconditionally: every
+   * reconnect lands inside 30 s.
+   */
+  it("a v3 vault's pre-ready refusal is not retried faster for queued work", async () => {
+    vi.useFakeTimers();
+    const counts = await preReadyClosings(MIN_WIRE_VERSION, {
+      type: "closing",
+      reason: "not authorised",
+    });
+    // 1, 2, 4, 8 and 16 s land inside each 30 s wait; the 32 s rung does not.
+    expect(counts.slice(0, 5)).toEqual([2, 3, 4, 5, 6]);
+    expect(counts[5]).toBe(6);
+  });
+
+  /** The control: a v4 vault's pre-ready `later` (a busy vault's `handshake timed out`) keeps
+   * the cap, because a v4 vault says `never` for a device it will not admit. */
+  it("a v4 vault's pre-ready later closing keeps the work cap", async () => {
+    vi.useFakeTimers();
+    const counts = await preReadyClosings(WIRE_VERSION, {
+      type: "closing",
+      reason: "handshake timed out",
+      retry: "later",
+    });
+    expect(counts).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
   });
 
   it("never signs a vault id the server put on the challenge frame", async () => {
@@ -281,7 +490,7 @@ describe("SyncSocket", () => {
     const t = latest(h);
     t.emit({
       type: "challenge",
-      wire_version: 3,
+      wire_version: WIRE_VERSION,
       challenge: CHALLENGE_B64,
       vault_id: "vault-attacker",
     });
@@ -299,9 +508,9 @@ describe("SyncSocket", () => {
     h.socket.connect();
     await flush();
     const t = latest(h);
-    t.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
     await flush();
-    t.emit({ type: "closing", reason: "not authorised" });
+    t.emit({ type: "closing", reason: "not authorised", retry: "never" });
     await flush();
 
     expect(h.closings).toEqual(['could not connect to vault "vault-wrong": not authorised']);
@@ -322,12 +531,14 @@ describe("SyncSocket", () => {
     await flush();
     const t = latest(h);
 
-    t.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+    t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
     // Still inside the pending `signChallenge` call — nothing has awaited past it yet.
-    t.emit({ type: "closing", reason: "handshake timed out" });
+    t.emit({ type: "closing", reason: "handshake timed out", retry: "later" });
     await flush();
 
-    expect(h.closings).toEqual(['could not connect to vault "vault-mine": handshake timed out']);
+    // Verbatim, because it is retried (the verbatim case above); what matters here is that
+    // it is the vault's reason at all, not "expected a challenge first".
+    expect(h.closings).toEqual(["handshake timed out"]);
   });
 
   it("a closing frame received well after the handshake carries no vault-id framing", async () => {
@@ -336,7 +547,11 @@ describe("SyncSocket", () => {
     // and naming a vault id in that message would misdiagnose it.
     const h = harness();
     const t = await connected(h);
-    t.emit({ type: "closing", reason: "too many connections open for this device" });
+    t.emit({
+      type: "closing",
+      reason: "too many connections open for this device",
+      retry: "later",
+    });
     await flush();
 
     expect(h.closings).toEqual(["too many connections open for this device"]);
@@ -354,9 +569,29 @@ describe("SyncSocket", () => {
     // Against WIRE_VERSION rather than a literal: the number moves whenever a
     // frame changes shape, and a test that hardcodes it fails for the wrong
     // reason every time it does.
-    expect(h.closings[0]).toContain(`speaks version ${WIRE_VERSION}`);
+    expect(h.closings[0]).toContain(`speaks versions ${MIN_WIRE_VERSION} to ${WIRE_VERSION}`);
     expect(t.closed).toBe(true);
     expect(t.sent).toHaveLength(0); // never answered a version it does not speak
+  });
+
+  /**
+   * A release-11 vault speaks 3 and admits only a v3 hello (`vault::sync::pure::admit`
+   * compares exactly). Answering in this build's newest version would lock this plugin out of
+   * every vault not yet moved to a v4 release.
+   *
+   * **Proven able to fail** by sending `WIRE_VERSION` in `hello`: the frame says 4.
+   */
+  it("hello answers with the version the challenge named (3 against an older vault)", async () => {
+    const h = harness();
+    h.socket.connect();
+    await flush();
+    const t = latest(h);
+    t.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+    await flush();
+
+    const [hello] = t.upFrames();
+    expect(hello).toMatchObject({ type: "hello", wire_version: 3 });
+    expect(h.closings).toEqual([]);
   });
 
   it("a dropped socket reconnects with backoff, not immediately", async () => {
@@ -412,7 +647,7 @@ describe("SyncSocket", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     const second = latest(h);
     expect(second).not.toBe(first);
-    second.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+    second.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
     await flush();
 
     const [hello] = second.upFrames();
@@ -505,7 +740,7 @@ describe("SyncSocket", () => {
     latest(h).drop(); // an ordinary failure: waits 750ms, retryMs now 2s
     await vi.advanceTimersByTimeAsync(750);
     expect(h.sockets).toHaveLength(2);
-    latest(h).emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+    latest(h).emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
     await flush();
     latest(h).emit({ type: "ready", seq: 0 }); // up, but short of STABLE_MS
 
@@ -610,7 +845,7 @@ describe("SyncSocket", () => {
       await flush();
       const second = latest(h);
       expect(second).not.toBe(t);
-      second.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
+      second.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
       await flush();
 
       const hello = second.upFrames().find((f) => f.type === "hello");
@@ -633,5 +868,22 @@ describe("SyncSocket", () => {
       await vi.advanceTimersByTimeAsync(1);
       expect(h.sockets).toHaveLength(3); // the first backoff step
     });
+  });
+});
+
+/** BI4's cap on one rung, at its boundary. */
+describe("retryWait", () => {
+  it("jitters the ordinary rung without work, and caps it at WORK_RETRY_MAX_MS with work", () => {
+    expect(retryWait(MAX_RETRY_MS, 0, false)).toBe(MAX_RETRY_MS / 2);
+    expect(retryWait(MAX_RETRY_MS, 1, false)).toBe(MAX_RETRY_MS);
+    expect(retryWait(16_000, 0, true)).toBe(8_000); // under the cap: untouched
+    expect(retryWait(16_000, 1, true)).toBe(16_000);
+  });
+
+  /** **Proven able to fail** with the old `min(jittered, cap)`: both draws give 30 s. */
+  it("keeps its jitter under the cap: 15 to 30 s, not a fixed 30 s", () => {
+    expect(retryWait(64_000, 0, true)).toBe(WORK_RETRY_MAX_MS / 2);
+    expect(retryWait(64_000, 1, true)).toBe(WORK_RETRY_MAX_MS);
+    expect(retryWait(MAX_RETRY_MS, 0.5, true)).toBe(22_500);
   });
 });

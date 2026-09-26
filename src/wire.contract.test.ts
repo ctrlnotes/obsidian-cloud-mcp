@@ -23,7 +23,7 @@ describe("up frames: the plugin's encoder matches the fixture's shape", () => {
       fixture("vault-sync/up.hello.json"),
       encodedShape({
         type: "hello",
-        wire_version: 3,
+        wire_version: 4,
         device_id: "dev-a1b2c3",
         signature: "c2ln",
         since_seq: 41,
@@ -65,6 +65,22 @@ describe("up frames: the plugin's encoder matches the fixture's shape", () => {
   test("snapshot", () => {
     assertShape(fixture("vault-sync/up.snapshot.json"), encodedShape({ type: "snapshot" }));
   });
+
+  // Two entries, one with a base and one without: the fixture's array shape is taken from its
+  // first element, so it must be the one carrying a string `base_sha`, and the `null` in the
+  // second is what a brand-new path sends.
+  test("put_batch", () => {
+    assertShape(
+      fixture("vault-sync/up.put_batch.json"),
+      encodedShape({
+        type: "put_batch",
+        puts: [
+          { path: "projects/alpha.md", base_sha: "9f2c1a4e", sha: "1a2b3c4d", bytes: 1024 },
+          { path: "projects/beta.md", base_sha: null, sha: "2b3c4d5e", bytes: 0 },
+        ],
+      }),
+    );
+  });
 });
 
 // Minor/nit fix, folded into one: the checks below used to be one-directional — they
@@ -82,13 +98,28 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     const f = fixture("vault-sync/down.challenge.json");
     const d = decodeDown(f);
     expect(d.type).toBe("challenge");
+    expect(d.type === "challenge" && d.wire_version).toBe(4);
     assertShape(f, d as unknown as JsonValue);
   });
 
+  // The batch limits by value too: they decide whether this device batches at all, and a
+  // decoder that read both as 0 would pass the shape check while never sending a batch.
   test("ready", () => {
     const f = fixture("vault-sync/down.ready.json");
     const d = decodeDown(f);
     expect(d.type).toBe("ready");
+    expect(d.type === "ready" && [d.max_batch_ops, d.max_batch_bytes]).toEqual([100, 4194304]);
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("applied_batch", () => {
+    const f = fixture("vault-sync/down.applied_batch.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("applied_batch");
+    if (d.type === "applied_batch") {
+      expect(d.applied.length).toBeGreaterThan(0);
+      expect(d.refused.length).toBeGreaterThan(0);
+    }
     assertShape(f, d as unknown as JsonValue);
   });
 
@@ -146,10 +177,24 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     assertShape(f, d as unknown as JsonValue);
   });
 
-  test("closing", () => {
+  // `retry` is asserted by VALUE as well as by shape (bulk-ingest design BI1): it is the one
+  // field on this wire whose value decides whether this device keeps syncing, and a shape
+  // check alone would pass a decoder that read every closing as `later`.
+  test("closing (retry later)", () => {
     const f = fixture("vault-sync/down.closing.json");
     const d = decodeDown(f);
     expect(d.type).toBe("closing");
+    expect(d.type === "closing" && d.retry).toBe("later");
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  // A second fixture for the same variant, like `event_rename` and `snapshot_page`: `never`
+  // is the value that stops sync, so it is the one that must not go untested on either side.
+  test("closing (retry never)", () => {
+    const f = fixture("vault-sync/down.closing_never.json");
+    const d = decodeDown(f);
+    expect(d.type).toBe("closing");
+    expect(d.type === "closing" && d.retry).toBe("never");
     assertShape(f, d as unknown as JsonValue);
   });
 });

@@ -61,8 +61,17 @@ export interface SyncStatus {
    * restore it by touching it, and no amount of waiting here will.
    */
   readonly unavailable: number;
-  /** The code of the last refusal, cleared by the next exchange that succeeds. */
+  /**
+   * The reason of the last closing that stopped sync — `retry: "never"`, a close this device
+   * will not come back from on its own. Cleared by the next exchange that succeeds.
+   */
   readonly refusal: string | null;
+  /**
+   * The reason of the last closing this device is reconnecting after on its own (BI1).
+   * Cleared by the next `ready`, or when sync stops. **Not a refusal**: rendered as a clause
+   * after the head, so "N change(s) still to send" stays on screen through an import.
+   */
+  readonly retrying: string | null;
   /**
    * The vault closed the connection because it is restarting for an update (close code 1012
    * — staged rollout design §5), and a reconnect is scheduled. Cleared by the next `ready`,
@@ -86,6 +95,7 @@ export const IDLE_STATUS: SyncStatus = {
   refused: 0,
   unavailable: 0,
   refusal: null,
+  retrying: null,
   updating: false,
   parked: false,
 };
@@ -124,6 +134,8 @@ export function describeStatus(status: SyncStatus): string {
         : `Up to date at change ${status.syncedCursor}${status.parked ? " (idle)" : ""}.`;
 
   const clauses: string[] = [];
+  // First: it explains why the head has not moved, and the head is still true.
+  if (status.retrying !== null) clauses.push(retryingText(status.retrying));
   // Names exactly what `unsyncable` COUNTS (`main.ts`: `shadowed` plus `withheld`, which
   // is oversize plus undecodable) and nothing else. Until 2026-09-22 this also listed
   // scripts, extensionless files, unsafe names and mobile attachments — which `derive.ts`
@@ -184,9 +196,21 @@ function refusalText(reason: string): string {
 }
 
 /**
+ * The retrying clause, quoting the vault's sentence verbatim (`socket.ts` reports a retried
+ * closing without its own prefix). It carries the revoked-elsewhere advice too: a v3 vault
+ * sends no `retry`, so its "not authorised" is retried (at most every five minutes) and this
+ * clause is the only place its owner can learn why nothing is syncing.
+ * TODO(v3): drop the advice here once no v3 vault remains.
+ */
+function retryingText(reason: string): string {
+  const said = `Reconnecting: the vault said "${reason}".`;
+  return reason.endsWith(REVOKED_ELSEWHERE_REASON) ? `${said} ${REVOKED_ELSEWHERE_ADVICE}` : said;
+}
+
+/**
  * The one refusal on this wire that the vault deliberately refuses to explain.
  *
- * `apps/vault/src/http/routes/sync.rs`'s `reason_for` collapses **unknown device, revoked
+ * `apps/vault/src/http/routes/sync.rs`'s `reason_text` collapses **unknown device, revoked
  * device and a signature that did not verify** into this single string, because
  * distinguishing them tells an attacker whether a device id exists (`pure::Reject`'s own
  * doc comment says so). Every other reason on this wire is a sentence a user can act on;

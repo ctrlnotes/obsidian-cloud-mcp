@@ -16,7 +16,7 @@ import { contentHash } from "./sync/hash.ts";
 import { MAX_IDLE_WAKES, SIGNAL_POLL_MS, SIGNAL_TIMEOUT_MS } from "./sync/park.ts";
 import type { Pump } from "./sync/pump.ts";
 import { QUIET_MS } from "./sync/settle.ts";
-import { IDLE_REASON } from "./sync/socket.ts";
+import { IDLE_REASON, WORK_RETRY_MAX_MS } from "./sync/socket.ts";
 import { describeStatus, UPDATING_TEXT } from "./sync/status.ts";
 import {
   FakeWebSocket,
@@ -44,6 +44,7 @@ import {
   requestUrlHeld,
   requestUrlQueue,
 } from "./testing/fake-obsidian.ts";
+import { WIRE_VERSION } from "./wire.ts";
 
 afterEach(() => {
   unloadAll();
@@ -104,7 +105,7 @@ const untilRealClock = async (check: () => void): Promise<void> => {
 /** Answer the handshake on a freshly opened socket up through `ready` — everything Task
  * 9's `SyncSocket` needs before `main.ts` will send anything on it. */
 const bringUp = async (ws: FakeWebSocket, seq = 0): Promise<void> => {
-  ws.emit({ type: "challenge", wire_version: 3, challenge: "AAAA" });
+  ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
   // `identity.signChallenge` is a real async ed25519 call: wait for the `hello` it signs,
   // not for a guess at how long signing takes.
   await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
@@ -382,7 +383,7 @@ describe("a terminal closing during an outstanding push does not stop syncing fo
     expect(putsBefore).toHaveLength(1);
     expect(putsBefore[0]?.path).toBe("a.md");
 
-    ws0.emit({ type: "closing", reason: "this device's trust has been withdrawn" });
+    ws0.emit({ type: "closing", reason: "this device's trust has been withdrawn", retry: "never" });
     await settleMicrotasks();
 
     // Re-pairing is the only path back to `startSyncing` after a terminal closing
@@ -1043,7 +1044,7 @@ describe("nothing is adopted until a human on this device says so", () => {
     const ws = FakeWebSocket.instances[0];
     expect(ws).toBeDefined();
     if (ws === undefined) return;
-    ws.emit({ type: "challenge", wire_version: 3, challenge: "AAAA" });
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
     await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
 
     const hello = ws.upFrames().find((f) => f.type === "hello");
@@ -1100,7 +1101,7 @@ describe("re-connecting to a different vault replaces the connection", () => {
     const second = FakeWebSocket.instances[1];
     expect(second).toBeDefined();
     if (second === undefined) return;
-    second.emit({ type: "challenge", wire_version: 3, challenge: "AAAA" });
+    second.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
     await vi.waitFor(
       () => expect(second.upFrames().some((f) => f.type === "hello")).toBe(true),
       UNTIL,
@@ -1329,6 +1330,27 @@ describe("disconnecting this device", () => {
     await plugin.disconnect();
 
     expect(ws?.closed).toBe(true);
+  });
+
+  /** Nothing reconnects after a disconnect, so the pane must stop saying it does. **Proven
+   * able to fail** by leaving `retrying` out of `disconnectSyncing`: it still reads
+   * "Reconnecting…". */
+  it("stops saying it is reconnecting after a retried closing", async () => {
+    stubWebSocket();
+    const plugin = await load(
+      {},
+      { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" },
+    );
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(ws);
+    ws.emit({ type: "closing", reason: "busy", retry: "later" });
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).toBe("busy"), UNTIL);
+
+    await plugin.disconnect();
+
+    expect(plugin.syncStatus().retrying).toBeNull();
+    expect(describeStatus(plugin.syncStatus())).not.toContain("Reconnecting");
   });
 });
 
@@ -1607,7 +1629,12 @@ describe("a refusal ends where its cause ends", () => {
     expect(describeStatus(plugin.syncStatus())).toContain("refused by the server");
   });
 
-  it("clears a refused session once a resumable closing has reconnected", async () => {
+  /**
+   * A closing this device reconnects after is not a refusal at all (bulk-ingest design BI1):
+   * it says `retrying`, never `refusal`, and the next `ready` clears it. Until BI1 it set
+   * `refusal`, and until 2026-09-22 nothing cleared that either.
+   */
+  it("reports a retried closing as reconnecting, and clears it once reconnected", async () => {
     stubWebSocket();
     const plugin = await load(
       { "note.md": "hi" },
@@ -1619,8 +1646,13 @@ describe("a refusal ends where its cause ends", () => {
     if (ws0 === undefined) return;
     await bringUp(ws0);
 
-    ws0.emit({ type: "closing", reason: "too many connections open for this device" });
-    await vi.waitFor(() => expect(plugin.syncStatus().refusal).not.toBeNull(), UNTIL);
+    ws0.emit({
+      type: "closing",
+      reason: "too many connections open for this device",
+      retry: "later",
+    });
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).not.toBeNull(), UNTIL);
+    expect(plugin.syncStatus().refusal).toBeNull();
 
     // The first retry waits at most FIRST_RETRY_MS (1 s, jittered down from there).
     await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
@@ -1629,7 +1661,256 @@ describe("a refusal ends where its cause ends", () => {
     if (ws1 === undefined) return;
     await bringUp(ws1);
 
-    await vi.waitFor(() => expect(plugin.syncStatus().refusal).toBeNull(), UNTIL);
+    await vi.waitFor(() => expect(plugin.syncStatus().retrying).toBeNull(), UNTIL);
+  });
+});
+
+/**
+ * Bulk-ingest design BI1 and BI4, end to end through the shell: a closing the vault says to
+ * retry after never ends an upload, and a device with work in flight reconnects by itself,
+ * soon enough that the vault never sits quiet long enough to suspend.
+ *
+ * This is the 2026-09-25 failure. A busy vault answered `handshake timed out`, the plugin read
+ * the text as terminal and disconnected, and with no socket open Fly suspended the vault in the
+ * middle of a 20,000-file first sync that nothing then resumed.
+ */
+describe("a closing the vault says to retry after", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  /** A paired plugin whose ledger matches its files, up and quiet, then one edit put in flight
+   * and never answered. */
+  const putInFlight = async (): Promise<{ plugin: CtrlNotesPlugin; first: FakeWebSocket }> => {
+    stubWebSocket();
+    const files: Record<string, string> = { "note.md": "hi" };
+    const hashes = { "note.md": await contentHash("hi") };
+    const plugin = await load(files, {
+      ...PAIRED,
+      appOptions: {
+        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
+      },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const first = FakeWebSocket.instances[0] as FakeWebSocket;
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    files["note.md"] = "edited";
+    fireVaultEvent("modify", "note.md");
+    await vi.waitFor(
+      () => expect(first.upFrames().some((f) => f.type === "put")).toBe(true),
+      UNTIL,
+    );
+    return { plugin, first };
+  };
+
+  const putsOn = (ws: FakeWebSocket) =>
+    ws.upFrames().filter((f) => f.type === "put" && f.path === "note.md");
+
+  /** A few microtask turns — `settleMicrotasks` sleeps on `setTimeout`, which these cases fake. */
+  const microtasks = async (): Promise<void> => {
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+  };
+
+  /**
+   * **Proven able to fail** two ways: with `hasWork` left out of `SyncSocket`'s deps the
+   * sixth reconnect waits 32 s and the wait for its socket runs out; with the `Notice` put
+   * back on a retried closing the notice count moves.
+   */
+  it("a put in flight survives a later closing: the plugin reconnects by itself within 30 s, re-sends the put after ready, shows no Notice and never disconnects", async () => {
+    const { plugin, first } = await putInFlight();
+    const noticesBefore = notices.length;
+
+    // The top of every jitter window, so an uncapped wait is the whole rung.
+    vi.spyOn(Math, "random").mockReturnValue(1);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    first.emit({ type: "closing", reason: "busy", retry: "later" });
+    await microtasks();
+
+    const status = describeStatus(plugin.syncStatus());
+    expect(status).toContain("still to send"); // the import's progress stays on screen
+    expect(status).toContain('Reconnecting: the vault said "busy".');
+    expect(plugin.syncStatus().refusal).toBeNull();
+
+    // Six more failures after the closing push the uncapped rung to 64 s. Each reconnect must
+    // still land inside `WORK_RETRY_MAX_MS`: the put is outstanding the whole time.
+    for (let attempt = 1; attempt <= 7; attempt++) {
+      vi.advanceTimersByTime(WORK_RETRY_MAX_MS);
+      await untilRealClock(() => expect(FakeWebSocket.instances).toHaveLength(attempt + 1));
+      if (attempt < 7) (FakeWebSocket.instances[attempt] as FakeWebSocket).close();
+    }
+    vi.useRealTimers();
+
+    const last = FakeWebSocket.instances[7] as FakeWebSocket;
+    await bringUp(last);
+    await vi.waitFor(() => expect(putsOn(last)).toHaveLength(1), UNTIL);
+    expect(notices.length).toBe(noticesBefore);
+    expect(plugin.syncStatus().retrying).toBeNull();
+    expect(plugin.syncStatus().refusal).toBeNull();
+  });
+
+  /** A vault older than BI1 sends no `retry`, and that is `later`. **Proven able to fail** by
+   * decoding an absent field as `never`: no second socket, and a Notice. */
+  it("a closing with no retry field is retried the same way", async () => {
+    const { plugin, first } = await putInFlight();
+    const noticesBefore = notices.length;
+
+    first.emit({ type: "closing", reason: "handshake timed out" });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
+    const next = FakeWebSocket.instances[1] as FakeWebSocket;
+    await bringUp(next);
+
+    await vi.waitFor(() => expect(putsOn(next)).toHaveLength(1), UNTIL);
+    expect(notices.length).toBe(noticesBefore);
+    expect(plugin.syncStatus().refusal).toBeNull();
+  });
+
+  it("a never closing is terminal and shows a Notice", async () => {
+    const { plugin, first } = await putInFlight();
+    const noticesBefore = notices.length;
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    first.emit({ type: "closing", reason: "not authorised", retry: "never" });
+    await microtasks();
+
+    expect(notices.slice(noticesBefore).map(noticeText)).toEqual([
+      "Disconnected from the Ctrl Notes vault: not authorised",
+    ]);
+    expect(plugin.syncStatus().refusal).toBe("not authorised");
+    vi.advanceTimersByTime(10 * 60_000); // past every backoff step there is
+    vi.useRealTimers();
+    await settleMicrotasks(300); // quiet window: nothing reconnects
+    expect(FakeWebSocket.instances).toHaveLength(1);
+  });
+});
+
+/**
+ * The device-side cost of BI1. A busy vault closes every few seconds during an import, and a
+ * reconnect used to rescan the whole vault on its `ready` — reading and hashing every file,
+ * with nothing to stop the next reconnect starting another scan on top of the last. After a
+ * retried closing the watchers were running throughout, so the scan is skipped for VS5's
+ * reason; and whatever does rescan runs one scan at a time.
+ */
+describe("a reconnect after a retried closing, and the manifest scan", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  /** A paired plugin whose ledger matches its files, so a scan finds nothing unless a test
+   * changes a file behind the watchers' back. */
+  const quietPlugin = async (files: Record<string, string>) => {
+    stubWebSocket();
+    const hashes: Record<string, string> = {};
+    for (const [path, body] of Object.entries(files)) hashes[path] = await contentHash(body);
+    const plugin = await load(files, {
+      ...PAIRED,
+      appOptions: {
+        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
+      },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    return { plugin, first: FakeWebSocket.instances[0] as FakeWebSocket };
+  };
+
+  const socketAt = async (n: number): Promise<FakeWebSocket> => {
+    await vi.waitFor(() => expect(FakeWebSocket.instances[n]).toBeDefined(), UNTIL);
+    return FakeWebSocket.instances[n] as FakeWebSocket;
+  };
+
+  const putsOf = (ws: FakeWebSocket) => ws.upFrames().filter((f) => f.type === "put");
+
+  /**
+   * The file changed WITHOUT an event is how the test sees whether a rescan ran, as in the
+   * park case: only a rescan could find it. The unplanned drop afterwards is the control.
+   *
+   * **Proven able to fail** by not setting `watchersRan` in `onClosing`: the reconnect after
+   * the busy close pushes `note.md`.
+   */
+  it("does not rescan on the reconnect after a busy closing, and does after a drop", async () => {
+    const files: Record<string, string> = { "note.md": "one\n" };
+    const { first } = await quietPlugin(files);
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+    files["note.md"] = "two\n"; // no vault event: invisible to everything but a rescan
+
+    first.emit({ type: "closing", reason: "busy", retry: "later" });
+    const second = await socketAt(1);
+    await bringUp(second);
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(putsOf(second)).toEqual([]);
+
+    second.close(); // an unplanned drop: this one does rescan
+    const third = await socketAt(2);
+    await bringUp(third);
+    await vi.waitFor(() => expect(putsOf(third)).toHaveLength(1), UNTIL);
+  });
+
+  /**
+   * A closing before this pair's first `ready` skips nothing: no `ready` has rescanned yet.
+   * A fresh pairing whose first hello met a busy vault is the case — the §1 case itself.
+   *
+   * **Proven able to fail** by setting `watchersRan` without the `readiedThisPair` check: the
+   * change is never found.
+   */
+  it("still rescans on the first ready when the first handshake was closed to retry", async () => {
+    const files: Record<string, string> = { "note.md": "one\n" };
+    const { first } = await quietPlugin(files);
+    await settleMicrotasks(QUIET_MS + 500); // the load-time scan has come and gone
+    files["note.md"] = "two\n";
+
+    first.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(
+      () => expect(first.upFrames().some((f) => f.type === "hello")).toBe(true),
+      UNTIL,
+    );
+    first.emit({ type: "closing", reason: "handshake timed out", retry: "later" });
+    const second = await socketAt(1);
+    await bringUp(second);
+    await vi.waitFor(() => expect(putsOf(second)).toHaveLength(1), UNTIL);
+  });
+
+  /**
+   * A scan outlasting the gap between two reconnects no longer runs twice at once: the second
+   * request waits, and is served by one more scan when the first ends. The read of `note.md`
+   * is held open so the first scan cannot finish, and every read of it is counted.
+   *
+   * **Proven able to fail** by removing the `reconciling` guard: two reads are in flight at
+   * once.
+   */
+  it("runs one manifest scan at a time, and one more for a request made during it", async () => {
+    const { plugin, first } = await quietPlugin({ "note.md": "hi" });
+    await bringUp(first);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    const adapter = plugin.app.vault.adapter as unknown as {
+      readBinary: (path: string) => Promise<ArrayBuffer>;
+    };
+    const realRead = adapter.readBinary.bind(adapter);
+    let reads = 0;
+    adapter.readBinary = (path: string) => {
+      if (path === "note.md") reads++;
+      return realRead(path);
+    };
+    let release = (): void => {};
+    readGates.set(
+      "note.md",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+
+    first.close(); // a drop: its reconnect rescans, and the scan stalls on the held read
+    const second = await socketAt(1);
+    await bringUp(second);
+    await vi.waitFor(() => expect(reads).toBe(1), UNTIL);
+
+    second.close(); // another reconnect asks for a scan while the first is still running
+    const third = await socketAt(2);
+    await bringUp(third);
+    await settleMicrotasks(300); // quiet window: no second read starts
+    expect(reads).toBe(1);
+
+    release();
+    await vi.waitFor(() => expect(reads).toBe(2), UNTIL); // the one rerun
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(reads).toBe(2);
   });
 });
 
@@ -2439,5 +2720,157 @@ describe("a parked device", () => {
       expect(inside.wakeTimer).toBeNull();
       expect(FakeWebSocket.instances).toHaveLength(1);
     });
+  });
+});
+
+/**
+ * Bulk-ingest design BI5, end to end through the shell: a first sync against a vault that
+ * advertises batch limits in `ready` goes up a window at a time as `put_batch` frames, and one
+ * against a vault that advertises none goes exactly as it did before batching existed.
+ */
+describe("a first sync, batched when the vault takes batches", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  /**
+   * A vault on the other end that answers every upload as landed: `applied_batch` for a
+   * batch, `applied` for a single put. Answered a microtask later, as a real socket would —
+   * never from inside the `send` call, which would land an answer before the batch's binary
+   * frames had been written.
+   */
+  const acceptEverything = (ws: FakeWebSocket): void => {
+    const rawSend = ws.send.bind(ws);
+    let seq = 0;
+    ws.send = (data: string | Uint8Array) => {
+      rawSend(data);
+      if (typeof data !== "string") return;
+      const frame = JSON.parse(data) as {
+        type?: string;
+        path?: string;
+        sha?: string;
+        puts?: { path: string; sha: string }[];
+      };
+      if (frame.type === "put_batch") {
+        const applied = (frame.puts ?? []).map((p) => ({ path: p.path, seq: ++seq, sha: p.sha }));
+        queueMicrotask(() => ws.emit({ type: "applied_batch", applied, refused: [] }));
+      } else if (frame.type === "put") {
+        const answer = { type: "applied", path: frame.path, seq: ++seq, sha: frame.sha };
+        queueMicrotask(() => ws.emit(answer));
+      }
+    };
+  };
+
+  /** Load a never-synced device holding `n` small notes and bring it up with this `ready`. */
+  const firstSync = async (n: number, ready: Record<string, unknown>) => {
+    stubWebSocket();
+    const files: Record<string, string> = {};
+    for (let i = 0; i < n; i++) files[`note-${String(i).padStart(3, "0")}.md`] = `note ${i}\n`;
+    const plugin = await load(files, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    acceptEverything(ws);
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({ type: "ready", seq: 0, ...ready });
+    return { plugin, ws, paths: Object.keys(files) };
+  };
+
+  /**
+   * 250 notes against a vault taking 100 at a time: 100, 100 and 50, and nothing single.
+   *
+   * **Proven able to fail** by leaving `pushTouched` on the one-at-a-time loop: every note
+   * goes as its own `put` and no `put_batch` is sent.
+   */
+  it("sends 250 small files as 3 put_batch frames against a ready advertising 100 / 4 MiB", async () => {
+    const { plugin, ws, paths } = await firstSync(250, {
+      max_batch_ops: 100,
+      max_batch_bytes: 4194304,
+    });
+    const batched = () =>
+      ws
+        .upFrames()
+        .filter((f) => f.type === "put_batch")
+        .map((f) => (f.puts as { path: string }[]).map((p) => p.path));
+    await vi.waitFor(() => expect(batched().flat()).toHaveLength(250), UNTIL);
+    await settleMicrotasks(QUIET_MS + 500); // quiet window: nothing else goes up
+
+    expect(batched().map((b) => b.length)).toEqual([100, 100, 50]);
+    expect(new Set(batched().flat())).toEqual(new Set(paths));
+    expect(ws.upFrames().filter((f) => f.type === "put")).toEqual([]);
+    // One binary frame per entry: every note fits one.
+    expect(ws.sent.filter((d) => typeof d !== "string")).toHaveLength(250);
+    expect(plugin.syncStatus().pending).toBe(0);
+  });
+
+  /**
+   * A push's outcome reaches the ledger when its own answer does, not when the last answer in
+   * its window does. The window here is a batch of two notes and then a note too large to
+   * batch, sent singly after the batch is answered and never answered itself. The batch's
+   * ledger writes must land anyway: held back behind the large put, they would land after
+   * whatever inbound events the vault drained meanwhile, and overwrite them.
+   *
+   * **Proven able to fail** by applying outcomes after `Promise.allSettled` again: the ledger
+   * holds neither note until the large put is answered, which here is never.
+   */
+  it("applies a batch's outcomes before a later put in its window is answered", async () => {
+    stubWebSocket();
+    const files: Record<string, string> = {
+      "a.md": "a\n",
+      "b.md": "b\n",
+      "c.md": "x".repeat(300 * 1024),
+    };
+    const plugin = await load(files, PAIRED);
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    const ws = FakeWebSocket.instances[0] as FakeWebSocket;
+    // A vault that answers a batch and never answers a single put.
+    const rawSend = ws.send.bind(ws);
+    ws.send = (data: string | Uint8Array) => {
+      rawSend(data);
+      if (typeof data !== "string") return;
+      const frame = JSON.parse(data) as { type?: string; puts?: { path: string; sha: string }[] };
+      if (frame.type !== "put_batch") return;
+      const applied = (frame.puts ?? []).map((p, i) => ({ path: p.path, seq: i + 1, sha: p.sha }));
+      queueMicrotask(() => ws.emit({ type: "applied_batch", applied, refused: [] }));
+    };
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({ type: "ready", seq: 0, max_batch_ops: 100, max_batch_bytes: 4194304 });
+
+    // The large note goes up singly once the batch is answered: the window is still open.
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "c.md")).toBe(true),
+      UNTIL,
+    );
+    const ledger = () =>
+      (plugin.app.loadLocalStorage("ctrlrouter:sync-state") as { hashes?: Record<string, string> })
+        ?.hashes ?? {};
+    await vi.waitFor(() => {
+      expect(ledger()["a.md"]).toBeDefined();
+      expect(ledger()["b.md"]).toBeDefined();
+    }, UNTIL);
+    expect(ledger()["c.md"]).toBeUndefined();
+    const batched = ws.upFrames().filter((f) => f.type === "put_batch");
+    expect(batched.map((f) => (f.puts as { path: string }[]).map((p) => p.path))).toEqual([
+      ["a.md", "b.md"],
+    ]);
+  });
+
+  /** A vault older than the frame sends a `ready` with no limits: every put goes singly, which
+   * is the only thing such a vault can answer. */
+  it("sends every put as a put against a ready with no batch fields", async () => {
+    const { ws, paths } = await firstSync(5, {});
+    await vi.waitFor(
+      () => expect(ws.upFrames().filter((f) => f.type === "put")).toHaveLength(5),
+      UNTIL,
+    );
+    await settleMicrotasks(QUIET_MS + 500);
+
+    expect(ws.upFrames().filter((f) => f.type === "put_batch")).toEqual([]);
+    expect(
+      ws
+        .upFrames()
+        .filter((f) => f.type === "put")
+        .map((f) => f.path)
+        .sort(),
+    ).toEqual(paths.sort());
   });
 });
