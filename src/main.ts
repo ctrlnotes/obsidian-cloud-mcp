@@ -209,6 +209,34 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     { path: string; pushed: string; vault: string; attempts: number; timer: number | null }
   >();
   private touched: Touched = emptyTouched();
+  /**
+   * **Local changes this device has seen and not yet settled** — what `apply.ts` asks
+   * before it trashes anything (`ApplyDeps.pendingLocal`). `touched` cannot answer that: a
+   * settle swaps it out before it derives, and this plugin's own writes mark it too.
+   *
+   * - `localTouched`: marked by the watcher since the last settle took them, swapped with
+   *   `touched`;
+   * - `inflightLocal`: the running settle's, each until its answer is in (put back on
+   *   `localTouched` if it fails);
+   * - `heldUntil`: a path its settle found nothing to send for — written back with the bytes
+   *   its ledger entry names — held until the cursor reaches the highest seq this device
+   *   had RECEIVED then. A delete already on its way was committed before this device saw
+   *   the note come back, so the note is newer and is kept (design §4); a later one applies.
+   *   Released at the derive instead, the 2026-09-27 loss happens whenever a derive is quick.
+   */
+  private localTouched = new Set<string>();
+  private inflightLocal = new Set<string>();
+  private readonly heldUntil = new Map<string, number>();
+  /** The highest seq any frame from the vault has carried: `heldUntil`'s stamp. */
+  private highestSeq = 0;
+  /**
+   * This plugin's own writes, by path, with the size the file will have after it (`null`
+   * when unknown). The watcher event such a write fires is consumed here rather than marked
+   * local: counted, every download would make the next inbound delete of that path a no-op.
+   * One event per write: Obsidian 1.13.7's FileSystemAdapter reconciles inside the write's
+   * own queue task, so the later fs.watch event finds the cache already matching.
+   */
+  private readonly ownWrites = new Map<string, number | null>();
   /** Guards a settle's own derive-and-push pass; re-armed rather than interleaved. */
   private syncing = false;
   /** The derive half of that pass is running: local work that ends on its own, so an idle
@@ -1195,6 +1223,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           fetcher.onBytes(bytes);
         },
         onFrame: (down: Down) => {
+          if ("seq" in down && typeof down.seq === "number") {
+            this.highestSeq = Math.max(this.highestSeq, down.seq);
+          }
           if (down.type === "ready") {
             // A fresh connection (first handshake, or any reconnect): retry whatever was
             // in flight when the last one died (§11's content-addressing makes that safe),
@@ -1352,6 +1383,13 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.pump?.forgetSnapshotPages();
     this.pump?.abandon();
     this.pump = null;
+    // They describe this connection's vault and its seqs. Kept, a relink would hold paths
+    // against another vault's numbering. A retrying close never comes through here.
+    this.localTouched = new Set();
+    this.inflightLocal = new Set();
+    this.heldUntil.clear();
+    this.highestSeq = 0;
+    this.ownWrites.clear();
   }
 
   private pumpDeps(): PumpDeps {
@@ -1378,6 +1416,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         this.touched.dirty.add(path);
         this.settler?.touch();
       },
+      pendingLocal: (path) =>
+        this.localTouched.has(path) ||
+        this.inflightLocal.has(path) ||
+        (this.heldUntil.get(path) ?? -1) > this.syncState.cursor,
       // O3. `refusal` is deliberately NOT set: that field drives
       // `describeStatus`'s "Sync was refused" head, which outranks every
       // clause and stops the pending count being shown. A file the server
@@ -1633,6 +1675,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.syncState = { ...this.syncState, cursor: seq };
     this.persistSyncState();
     this.setStatus({ syncedCursor: seq });
+    for (const [path, until] of this.heldUntil) if (until <= seq) this.heldUntil.delete(path);
   }
 
   private persistSyncState(): void {
@@ -1686,12 +1729,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       this.registerEvent(
         vault.on("create", (f: TAbstractFile) => {
           this.noteSpelling(f.path);
+          this.markLocal(f);
           this.touched.dirty.add(toWirePath(f.path));
           this.noteTouched();
         }),
       );
       this.registerEvent(
         vault.on("modify", (f: TAbstractFile) => {
+          this.markLocal(f);
           this.touched.dirty.add(toWirePath(f.path));
           this.noteTouched();
         }),
@@ -1700,6 +1745,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         vault.on("delete", (f: TAbstractFile) => {
           const wire = toWirePath(f.path);
           this.forgetSpelling(f.path);
+          this.ownWrites.delete(wire);
           this.touched.deleted.add(wire);
           this.touched.dirty.delete(wire);
           this.noteTouched();
@@ -1709,12 +1755,33 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         vault.on("rename", (f: TAbstractFile, oldPath: string) => {
           this.forgetSpelling(oldPath);
           this.noteSpelling(f.path);
+          this.markLocal(f);
           this.touched.renamed.set(toWirePath(f.path), toWirePath(oldPath));
           this.touched.dirty.add(toWirePath(f.path));
           this.noteTouched();
         }),
       );
     });
+  }
+
+  /**
+   * A watcher event for file `f`: the echo of this plugin's own write, or a local change.
+   * **Matched by size, not only by arrival**: someone else's change to the same path, queued
+   * ahead of ours, would otherwise consume our entry, go unmarked, and leave our own echo
+   * to be marked in its place. Without a size to compare, arrival decides.
+   */
+  private markLocal(f: TAbstractFile): void {
+    if ("children" in f) return; // a folder — `mkdirp`'s own, or anyone's; nothing trashes one
+    const wire = toWirePath(f.path);
+    const expected = this.ownWrites.get(wire);
+    if (expected !== undefined) {
+      const size = (f as { stat?: { size?: number } }).stat?.size;
+      if (expected === null || size === undefined || size === expected) {
+        this.ownWrites.delete(wire);
+        return;
+      }
+    }
+    this.localTouched.add(wire);
   }
 
   /**
@@ -1743,6 +1810,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
     const touched = this.touched;
     this.touched = emptyTouched();
+    // Held until this settle knows each path's outcome, not merely until it took them: a
+    // delete replayed while they are read or pushed must still keep them.
+    const inflight = this.localTouched;
+    this.localTouched = new Set();
+    this.inflightLocal = inflight;
+    const keepHeld = (paths: Iterable<string>): void => {
+      for (const path of paths) if (inflight.has(path)) this.localTouched.add(path);
+    };
     this.syncing = true;
     this.deriving = true;
     try {
@@ -1753,6 +1828,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         { attachments: this.attachments },
       );
       this.deriving = false;
+      // Nothing to send: the file matches the ledger (or is withheld, and named below).
+      // Held until the cursor passes what has already arrived (`heldUntil`).
+      const sending = new Set(changes.map((c) => c.path));
+      const until = Math.max(this.highestSeq, this.syncState.cursor);
+      for (const path of inflight) if (!sending.has(path)) this.heldUntil.set(path, until);
       if (oversize.length > 0) {
         console.warn(
           `Ctrl Notes: not syncing ${oversize.length} file(s) over the size limit: ` +
@@ -1801,6 +1881,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         // landed mid-derive has woken the device, and its reconnect may still be handshaking.
         // Handing the changes back lets `ready`'s `settler.touch()` send them once.
         this.redirtyRemaining(changes);
+        keepHeld(changes.map((c) => c.path));
       } else {
         // All queued at once, so the pump can batch them (BI5). **Each outcome applies the
         // moment its own answer lands**: applied later, a push's ledger write would overwrite
@@ -1815,6 +1896,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
               (outcome) => {
                 try {
                   this.applyPushOutcome(outcome);
+                  // Applied, merged or refused and handled: the ledger speaks for it again.
+                  inflight.delete(change.path);
                 } catch (e) {
                   console.warn(
                     `Ctrl Notes: ${change.path} reached the vault, but recording its answer failed`,
@@ -1836,6 +1919,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         await Promise.all(settled);
         // Retried on the next settle, not lost.
         this.redirtyRemaining(failed);
+        keepHeld(failed.map((c) => c.path));
       }
       this.setStatus({ pending: 0 });
     } catch (e) {
@@ -1845,8 +1929,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       // this settle's window was lost for good rather than only whichever one caused it.
       console.warn("Ctrl Notes: could not derive this settle's changes", e);
       this.mergeTouched(touched);
+      keepHeld(inflight);
       this.settler?.touch(); // Retry the whole window rather than losing it.
     } finally {
+      if (this.inflightLocal === inflight) this.inflightLocal = new Set();
       this.syncing = false;
       this.deriving = false;
       // A change derived after the idle close parked this device, that then failed to send,
@@ -2051,6 +2137,18 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       }
     };
 
+    /** One of this plugin's own writes, recorded first: the watcher event it fires arrives
+     * inside `write` (`ownWrites`). `size` is what the file will measure after it. */
+    const own = async <T>(wire: string, size: number | null, write: () => Promise<T>) => {
+      this.ownWrites.set(wire, size);
+      try {
+        return await write();
+      } catch (e) {
+        this.ownWrites.delete(wire);
+        throw e;
+      }
+    };
+
     return {
       // **No `read`, and no `write` either.** Both of Obsidian's string accessors are
       // gone from the sync path: `adapter.read` is a non-fatal decode, and `adapter.write`
@@ -2067,11 +2165,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         await mkdirp(path);
         // `slice()` copies exactly this view's bytes — a `Uint8Array` can be a window onto a
         // larger buffer — into a buffer typed `ArrayBuffer`, which is what the adapter takes.
-        await adapter.writeBinary(path, bytes.slice().buffer);
+        await own(wire, bytes.byteLength, () => adapter.writeBinary(path, bytes.slice().buffer));
       },
       // `trashLocal`, never `remove`: a delete this device should not have applied stays
       // recoverable by the user (`apply.ts`'s own doc comment on `VaultFiles.trash`).
-      trash: (wire) => adapter.trashLocal(disk(wire)),
+      trash: (wire) => own(wire, null, () => adapter.trashLocal(disk(wire))),
       // Obsidian's own `sensitive` flag, passed through: `DataAdapter.exists`
       // resolves through the host filesystem, so on APFS and NTFS it answers
       // true for `foo.md` while only `Foo.md` is there unless told otherwise.
@@ -2080,7 +2178,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       rename: async (from, to) => {
         const target = disk(to);
         await mkdirp(target);
-        await adapter.rename(disk(from), target);
+        const size = (await adapter.stat(disk(from)))?.size ?? null;
+        await own(to, size, () => adapter.rename(disk(from), target));
       },
       // Metadata only, and it runs before any read — a device that discovers a file is
       // oversized by reading it first has already buffered the whole thing.

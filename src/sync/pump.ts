@@ -74,6 +74,8 @@ export interface PumpDeps {
   /** An inbound change left a file alone because it holds an unpushed edit —
    * `ApplyDeps.onKept`. The caller makes sure that edit is uploaded. */
   readonly onKept?: ApplyDeps["onKept"];
+  /** A local change not yet uploaded, whatever its hash — `ApplyDeps.pendingLocal`. */
+  readonly pendingLocal?: ApplyDeps["pendingLocal"];
   /** This device's own record of "the highest server change applied" (`SyncState.cursor`),
    * advanced by an inbound batch's top seq, a snapshot's seq, or this device's OWN push
    * landing (`Down::Applied.seq`) — see `handleDown`'s `applied` branch for why the last one
@@ -448,6 +450,7 @@ export class Pump {
       // Read fresh per event: an earlier event in this batch may have moved it.
       ledger: this.deps.ledger,
       onKept: this.deps.onKept,
+      pendingLocal: this.deps.pendingLocal,
     });
     this.deps.onApplied(applied);
 
@@ -540,6 +543,7 @@ export class Pump {
         onApplied: (a) => this.deps.onApplied([a]),
         onUnavailable: this.deps.onUnavailable,
         onKept: this.deps.onKept,
+        pendingLocal: this.deps.pendingLocal,
       },
       { attachments: this.deps.attachments },
       giveUp,

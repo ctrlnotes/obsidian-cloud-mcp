@@ -1701,6 +1701,383 @@ describe("an unpushed edit, end to end through the shell", () => {
   });
 });
 
+/**
+ * **A delete may not trash a file this device has seen change and not yet uploaded — even
+ * one whose bytes equal its ledger entry.** Measured 2026-09-27 on 0.1.1: a device whose
+ * cursor lagged still held hash X for 19 notes the vault had deleted; a script re-created
+ * all 19 byte-identical to X; the settle was still reading them when the catch-up replay
+ * reached the old deletes, each file hashed to its ledger entry, and all 19 went to the
+ * trash. The ledger comparison cannot see that case. The watcher did.
+ */
+describe("a note re-created with the bytes its ledger names", () => {
+  const syncedAt = async (files: Record<string, string>) => {
+    const hashes: Record<string, string> = {};
+    for (const [path, body] of Object.entries(files)) hashes[path] = await contentHash(body);
+    return {
+      controlplaneOrigin: "https://cp.test",
+      vaultId: "vault-1",
+      deviceId: "dev-1",
+      appOptions: {
+        localStorage: { "ctrlrouter:sync-state": { vaultId: "vault-1", cursor: 0, hashes } },
+      },
+    };
+  };
+
+  const deleteEvent = (seq: number, path: string) => ({
+    type: "event",
+    seq,
+    kind: "delete",
+    path,
+    sha: null,
+    from: null,
+    at_ms: 0,
+  });
+
+  const acked = (ws: FakeWebSocket, seq: number): boolean =>
+    ws.upFrames().some((f) => f.type === "ack" && f.seq === seq);
+
+  /**
+   * **Proven able to fail** by answering `pendingLocal` with `false` in `main.ts`, or by
+   * leaving `inflightLocal` empty: the delete finds the bytes equal to the ledger once the
+   * read is released, and trashes the note.
+   */
+  it("keeps it through a replayed delete that lands while the settle reads it, and uploads it", async () => {
+    stubWebSocket();
+    const body = "generated\n";
+    const plugin = await load({ "note.md": body }, await syncedAt({ "note.md": body }));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500); // the load-time scan finds nothing to send
+    ws.sent.length = 0;
+
+    const adapter = plugin.app.vault.adapter as unknown as {
+      readBinary: (path: string) => Promise<ArrayBuffer>;
+      writeBinary: (path: string, bytes: ArrayBuffer) => Promise<void>;
+    };
+    const realRead = adapter.readBinary.bind(adapter);
+    let reads = 0;
+    adapter.readBinary = (path: string) => {
+      if (path === "note.md") reads++;
+      return realRead(path);
+    };
+    let release = (): void => {};
+    readGates.set(
+      "note.md",
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+
+    // A script writes the note again, byte-identical to the ledger, and the watcher sees it.
+    await adapter.writeBinary("note.md", new TextEncoder().encode(body).buffer);
+    fireVaultEvent("create", "note.md");
+    await vi.waitFor(() => expect(reads).toBe(1), UNTIL); // the settle is deriving it
+
+    // The catch-up replay reaches a delete the vault committed before the note came back.
+    ws.emit(deleteEvent(1, "note.md"));
+    await settleMicrotasks(300);
+    release();
+    await vi.waitFor(() => expect(acked(ws, 1)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.read("note.md")).toBe(body);
+
+    // Kept is not enough: the vault holds nothing there now, so it must learn the note exists.
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "note.md")).toBe(true),
+      UNTIL,
+    );
+    const put = ws.upFrames().find((f) => f.type === "put" && f.path === "note.md");
+    expect(put?.base_sha ?? null).toBeNull(); // a new file, not an edit of the deleted one
+    expect(await plugin.app.vault.adapter.read("note.md")).toBe(body);
+
+    // Answered, it is held no longer: a later delete trashes it like any synced note.
+    ws.emit({ type: "applied", path: "note.md", seq: 2, sha: put?.sha });
+    ws.emit(deleteEvent(3, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 3)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(false);
+  });
+
+  /**
+   * The same loss with a quick derive: the settle has already found nothing to send when
+   * the backlog's delete arrives. The delete was committed before this device saw the note
+   * come back, so the note is the newer of the two. **Proven able to fail** by not stamping
+   * a path its settle found nothing to send for (`heldUntil`): the note is trashed.
+   */
+  it("keeps it through a delete from the backlog that arrives after the settle found nothing to send", async () => {
+    stubWebSocket();
+    const body = "generated\n";
+    const plugin = await load({ "note.md": body }, await syncedAt({ "note.md": body }));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws, 5); // the vault is at 5; this device has applied nothing yet
+    await settleMicrotasks(QUIET_MS + 500);
+    ws.sent.length = 0;
+
+    await plugin.app.vault.adapter.writeBinary("note.md", new TextEncoder().encode(body).buffer);
+    fireVaultEvent("create", "note.md");
+    await settleMicrotasks(QUIET_MS + 500); // derived: the bytes equal the ledger, nothing sent
+    expect(ws.upFrames().some((f) => f.type === "put")).toBe(false);
+
+    ws.emit(deleteEvent(5, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 5)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.read("note.md")).toBe(body);
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "note.md")).toBe(true),
+      UNTIL,
+    );
+
+    // Caught up and answered, it is held no longer: a newer delete applies.
+    const put = ws.upFrames().find((f) => f.type === "put" && f.path === "note.md");
+    ws.emit({ type: "applied", path: "note.md", seq: 6, sha: put?.sha });
+    ws.emit(deleteEvent(7, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 7)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(false);
+  });
+
+  /**
+   * A mark ends where its settle's outcome is known, or no delete of that note could ever
+   * apply again. **Proven able to fail** by stamping a path its settle found nothing to send
+   * for with no end (`Infinity`), and by never taking an answered path off `inflightLocal`,
+   * in turn: the first
+   * case, then the second, keeps the note.
+   */
+  it("stops holding a note once the settle found nothing to send for it", async () => {
+    stubWebSocket();
+    const body = "synced\n";
+    const plugin = await load({ "note.md": body }, await syncedAt({ "note.md": body }));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    fireVaultEvent("modify", "note.md"); // saved unchanged
+    await settleMicrotasks(QUIET_MS + 500); // derived: nothing to send
+    ws.emit(deleteEvent(1, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 1)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(false);
+  });
+
+  it("stops holding a note once its upload is answered", async () => {
+    stubWebSocket();
+    const plugin = await load({ "note.md": "v0\n" }, await syncedAt({ "note.md": "v0\n" }));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+    ws.sent.length = 0;
+
+    await plugin.app.vault.adapter.writeBinary("note.md", new TextEncoder().encode("v1\n").buffer);
+    fireVaultEvent("modify", "note.md");
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "note.md")).toBe(true),
+      UNTIL,
+    );
+    ws.emit({ type: "applied", path: "note.md", seq: 1, sha: await contentHash("v1\n") });
+    ws.emit(deleteEvent(2, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 2)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(false);
+  });
+
+  /**
+   * **Proven able to fail** by not consuming the echo in `markLocal`: the watcher event the
+   * download fires is counted as a local change, and the delete is kept.
+   */
+  it("does not count its own download as a local change: the next delete still trashes", async () => {
+    stubWebSocket();
+    const plugin = await load({}, await syncedAt({}));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    const text = "from the vault\n";
+    const sha = await contentHash(text);
+    ws.emit({ type: "event", seq: 1, kind: "put", path: "note.md", sha, from: null, at_ms: 0 });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "want")).toBe(true), UNTIL);
+    const bytes = new TextEncoder().encode(text);
+    ws.emit({ type: "blob", sha, bytes: bytes.byteLength });
+    ws.onmessage?.({ data: bytes.buffer });
+    await vi.waitFor(
+      async () => expect(await plugin.app.vault.adapter.read("note.md")).toBe(text),
+      UNTIL,
+    );
+    // The host's watcher fires for the plugin's own write, as Obsidian's does — and the
+    // delete lands inside the settle's quiet window, before any derive has looked.
+    fireVaultEvent("create", "note.md");
+    ws.emit(deleteEvent(2, "note.md"));
+
+    await vi.waitFor(() => expect(acked(ws, 2)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(false);
+  });
+
+  /**
+   * A delete newer than `ready` that has already ARRIVED when the settle finds nothing to
+   * send: the vault committed it before this device saw the note come back. **Proven able
+   * to fail** on the previous revision, which held such a path only until the cursor
+   * reached `ready.seq` (5) and trashed the note when the delete at 6 applied.
+   */
+  it("keeps it through a delete newer than ready that arrived before the settle", async () => {
+    stubWebSocket();
+    const body = "generated\n";
+    const plugin = await load({ "note.md": body }, await syncedAt({ "note.md": body }));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws, 5);
+    await settleMicrotasks(QUIET_MS + 500);
+    ws.sent.length = 0;
+
+    // The backlog's last event is a put whose content has not arrived yet, so the replay
+    // stops there; meanwhile another device deletes the note (6), and that arrives too.
+    const other = new TextEncoder().encode("other\n");
+    const otherSha = await contentHash("other\n");
+    ws.emit({
+      type: "event",
+      seq: 5,
+      kind: "put",
+      path: "o.md",
+      sha: otherSha,
+      from: null,
+      at_ms: 0,
+    });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "want")).toBe(true), UNTIL);
+    ws.emit(deleteEvent(6, "note.md"));
+
+    await plugin.app.vault.adapter.writeBinary("note.md", new TextEncoder().encode(body).buffer);
+    fireVaultEvent("create", "note.md");
+    await settleMicrotasks(QUIET_MS + 500); // derived: nothing to send
+
+    ws.emit({ type: "blob", sha: otherSha, bytes: other.byteLength });
+    ws.onmessage?.({ data: other.buffer });
+    await vi.waitFor(() => expect(acked(ws, 6)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.read("note.md")).toBe(body);
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "put" && f.path === "note.md")).toBe(true),
+      UNTIL,
+    );
+  });
+
+  /** Download `text` to `path` at `seq`, answering the fetch. No watcher event. */
+  const download = async (ws: FakeWebSocket, path: string, text: string, seq: number) => {
+    const sha = await contentHash(text);
+    const wants = ws.upFrames().filter((f) => f.type === "want").length;
+    ws.emit({ type: "event", seq, kind: "put", path, sha, from: null, at_ms: 0 });
+    await vi.waitFor(
+      () => expect(ws.upFrames().filter((f) => f.type === "want")).toHaveLength(wants + 1),
+      UNTIL,
+    );
+    const bytes = new TextEncoder().encode(text);
+    ws.emit({ type: "blob", sha, bytes: bytes.byteLength });
+    ws.onmessage?.({ data: bytes.buffer });
+    await vi.waitFor(() => expect(acked(ws, seq)).toBe(true), UNTIL);
+  };
+
+  const pendingLocalOf = (plugin: CtrlNotesPlugin, path: string): boolean =>
+    (plugin as unknown as { pumpDeps(): { pendingLocal?: (p: string) => boolean } })
+      .pumpDeps()
+      .pendingLocal?.(path) === true;
+
+  const connected = async (files: Record<string, string>) => {
+    stubWebSocket();
+    const plugin = await load(files, await syncedAt(files));
+    const ws = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[0];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+    return { plugin, ws };
+  };
+
+  /**
+   * Someone else's change to the path, queued on the adapter ahead of the plugin's own
+   * write, reaches the watcher first. Matched by arrival alone it consumed the plugin's
+   * entry and went unmarked. **Proven able to fail** by consuming the entry whatever the
+   * size: the delete trashes the note.
+   */
+  it("marks another writer's change that arrives before its own write's echo", async () => {
+    const { plugin, ws } = await connected({});
+    const text = "from the vault\n";
+    await download(ws, "note.md", text, 1);
+    fireVaultEvent("modify", "note.md", undefined, text.length + 7); // not the size we wrote
+    ws.emit(deleteEvent(2, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 2)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(true);
+  });
+
+  /** **Proven able to fail** by not consuming the echo in `markLocal`: the rename's echo
+   * marks the destination, and the delete is kept. */
+  it("does not count its own rename as a local change", async () => {
+    const body = "moved\n";
+    const { plugin, ws } = await connected({ "a.md": body });
+    ws.emit({
+      type: "event",
+      seq: 1,
+      kind: "rename",
+      path: "b.md",
+      from: "a.md",
+      sha: await contentHash(body),
+      at_ms: 0,
+    });
+    await vi.waitFor(() => expect(acked(ws, 1)).toBe(true), UNTIL);
+    fireVaultEvent("rename", "b.md", "a.md", body.length);
+    ws.emit(deleteEvent(2, "b.md"));
+    await vi.waitFor(() => expect(acked(ws, 2)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("b.md")).toBe(false);
+  });
+
+  /** A trash's echo consumes its entry, so the next real change at that path is marked.
+   * **Proven able to fail** by not consuming it in the `delete` listener. */
+  it("does not let its own trash swallow the next change at that path", async () => {
+    const body = "synced\n";
+    const { plugin, ws } = await connected({ "note.md": body });
+    ws.emit(deleteEvent(1, "note.md"));
+    await vi.waitFor(() => expect(acked(ws, 1)).toBe(true), UNTIL);
+    expect(await plugin.app.vault.adapter.exists("note.md")).toBe(false);
+    fireVaultEvent("delete", "note.md");
+    await plugin.app.vault.adapter.writeBinary("note.md", new TextEncoder().encode(body).buffer);
+    fireVaultEvent("create", "note.md", undefined, body.length);
+    expect(pendingLocalOf(plugin, "note.md")).toBe(true);
+  });
+
+  /**
+   * The marks describe one connection's vault and its seqs. **Proven able to fail** by not
+   * clearing them in `disconnectSyncing`.
+   */
+  it("forgets local marks on a terminal close, and keeps them through a retrying one", async () => {
+    const { plugin, ws } = await connected({ "note.md": "synced\n" });
+    fireVaultEvent("modify", "note.md");
+    expect(pendingLocalOf(plugin, "note.md")).toBe(true);
+    ws.emit({ type: "closing", reason: "busy", retry: "later" });
+    expect(pendingLocalOf(plugin, "note.md")).toBe(true);
+    const next = await vi.waitFor(() => {
+      const found = FakeWebSocket.instances[1];
+      expect(found).toBeDefined();
+      return found as FakeWebSocket;
+    }, UNTIL);
+    next.emit({ type: "closing", reason: "not authorised", retry: "never" });
+    expect(pendingLocalOf(plugin, "note.md")).toBe(false);
+  });
+});
+
 describe("a refusal ends where its cause ends", () => {
   // Two real settle windows' worth of real timers, like the revocation test above.
   it("counts a refused FILE without reporting the session as refused", async () => {

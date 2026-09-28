@@ -1020,6 +1020,60 @@ describe("an unpushed local edit survives inbound changes", () => {
     expect(deps.kept).toEqual([]);
   });
 
+  /**
+   * **The ledger cannot see a file re-created with the bytes it names.** Measured
+   * 2026-09-27 on 0.1.1: 19 notes the vault had deleted were re-created on disk
+   * byte-identical to their ledger entries, the replay reached the old deletes while the
+   * settle was still reading them, and all 19 went to the trash. The host knew they had
+   * changed locally and not been uploaded; `pendingLocal` is how it says so.
+   */
+  it("keeps a file an inbound delete names while a local change to it is pending, whatever its hash", async () => {
+    const vault = fakeVault({ "n.md": "synced\n" });
+    const deps: ApplyDeps & { kept: string[] } = {
+      ...withLedger({ "n.md": await contentHash("synced\n") }),
+      pendingLocal: (path) => path === "n.md",
+    };
+    const { ackThrough } = await applyReplay(
+      vault,
+      [{ type: "event", seq: 6, kind: "delete", path: "n.md", sha: null, from: null, at_ms: 0 }],
+      deps,
+    );
+    expect(vault.text("n.md")).toBe("synced\n");
+    expect(deps.kept).toEqual(["n.md"]);
+    expect(ackThrough).toBe(6);
+  });
+
+  it("keeps a file a snapshot no longer names while a local change to it is pending", async () => {
+    const vault = fakeVault({ "n.md": "synced\n" });
+    const ledger = { "n.md": await contentHash("synced\n") };
+    const deps: ApplyDeps & { kept: string[] } = {
+      ...withLedger(ledger),
+      pendingLocal: (path) => path === "n.md",
+    };
+    const { complete } = await applySnapshot(vault, ledger, [], deps);
+    expect(vault.text("n.md")).toBe("synced\n");
+    expect(deps.kept).toEqual(["n.md"]);
+    expect(complete).toBe(true);
+  });
+
+  /**
+   * A write is NOT held by a pending change whose bytes equal the ledger: that is the
+   * three-way merge's own answer (the vault's version wins), and keeping it would upload
+   * nothing — derive sees no change — so the device would stay on the old version for good.
+   */
+  it("still applies a put over a pending path whose bytes match the ledger", async () => {
+    const theirs = utf8("remote version\n");
+    const sha = await bytesHash(theirs);
+    const vault = fakeVault({ "n.md": "synced\n" });
+    const deps: ApplyDeps & { kept: string[] } = {
+      ...withLedger({ "n.md": await contentHash("synced\n") }, { [sha]: theirs }),
+      pendingLocal: () => true,
+    };
+    await applyReplay(vault, [putEvent({ path: "n.md", sha, seq: 9 })], deps);
+    expect(vault.text("n.md")).toBe("remote version\n");
+    expect(deps.kept).toEqual([]);
+  });
+
   // A rename into a path this device refuses (a top-level dot-folder) takes the file out of
   // what it syncs. Skipped, the source stayed on disk and in the ledger, and an edit to it
   // uploaded a second copy. It is a delete of the source instead, under the delete's rules.
@@ -1083,6 +1137,31 @@ describe("an unpushed local edit survives inbound changes", () => {
     );
     expect(vault.text("new.md")).toBe("local edit\n");
     expect(deps.kept).toEqual(["new.md"]);
+  });
+
+  /**
+   * A rename onto a path this device already holds trashes the source when it holds exactly
+   * what moved — the equal-bytes test that failed on 2026-09-27. Not while this device has
+   * seen the source change. **Proven able to fail** by dropping the `pendingLocal` guard from
+   * either branch: that case's source is trashed.
+   */
+  it.each([
+    ["the destination already holds what moved", "moved\n"],
+    ["the destination holds an edit of its own", "local edit\n"],
+  ])("keeps a rename's source a local change is pending on, when %s", async (_, dest) => {
+    const moved = utf8("moved\n");
+    const sha = await bytesHash(moved);
+    const vault = fakeVault({ "old.md": "moved\n", "new.md": dest });
+    const deps: ApplyDeps = {
+      ...withLedger({ "new.md": await contentHash("synced\n") }, { [sha]: moved }),
+      pendingLocal: (path) => path === "old.md",
+    };
+    await applyReplay(
+      vault,
+      [{ type: "event", seq: 7, kind: "rename", path: "new.md", sha, from: "old.md", at_ms: 0 }],
+      deps,
+    );
+    expect(vault.text("old.md")).toBe("moved\n");
   });
 
   it("keeps an edited file a snapshot would overwrite, and still completes", async () => {

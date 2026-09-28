@@ -133,6 +133,34 @@ export interface ApplyDeps {
    * against the base the device declares (`merge::ancestor_for_upload`).
    */
   onKept?(path: string): void;
+  /**
+   * **Has this device seen a local change to `path` that it has not finished uploading —
+   * whatever the file's bytes hash to?** Consulted before anything is TRASHED for the vault
+   * ({@link heldForDelete}), never before a write.
+   *
+   * The ledger comparison in {@link heldLocally} cannot see a file re-created with exactly
+   * the bytes its ledger entry names, and that is not hypothetical. Measured 2026-09-27 on
+   * 0.1.1: a device whose cursor lagged still held hash X for 19 notes the vault had
+   * deleted; a script re-created all 19 on disk byte-identical to X; the settle was still
+   * reading them when the replay reached the old deletes, every file hashed to its ledger
+   * entry, and all 19 fresh notes went to the trash. The host knows better — its watcher
+   * saw those writes, and nothing has been uploaded for them yet — so it answers here.
+   *
+   * The host must not count its OWN writes (every inbound write fires the watcher too; see
+   * {@link onApplied}), or the next delete of anything this device downloaded would be kept.
+   * Absent, nothing is held this way.
+   *
+   * What it cannot see or tell apart:
+   * - **A touch made while offline or parked** is held against a delete that may be newer
+   *   than it, and the note comes back on the next `ready`. Only comparing times would
+   *   settle it, and a snapshot carries none.
+   * - **Mobile has no filesystem watcher**, so another program writing into the vault there
+   *   is invisible; only Obsidian's own edits are seen.
+   * - **Keys are exact wire paths**, while `exists(path, false)` folds case on APFS and
+   *   NTFS: a change seen at `Notes/a.md` does not hold a delete of `notes/a.md`. Nothing
+   *   in this codebase folds case into a key, so none is invented here.
+   */
+  pendingLocal?(path: string): boolean;
 }
 
 /**
@@ -161,6 +189,21 @@ const heldLocally = async (
   const hash = await bytesHash(bytes);
   return { held: hash !== deps.ledger()[path], hash };
 };
+
+/**
+ * {@link heldLocally}, for an inbound change that would TRASH `path` — a delete, a rename
+ * out of what this device syncs, a snapshot that no longer names it. Also held while the
+ * host reports a local change it has not uploaded yet ({@link ApplyDeps.pendingLocal}),
+ * even when the bytes equal the ledger's: keeping costs an upload that brings the note
+ * back, trashing costs the note (design §4, edit beats delete).
+ *
+ * **Deletes only, on purpose.** A write over a path whose bytes equal its ledger entry is
+ * the three-way merge's own answer (base = local, so the vault's version wins), and
+ * keeping it would upload nothing — derive sees no change — leaving the device on the old
+ * version while the vault holds the new one.
+ */
+const heldForDelete = async (vault: VaultFiles, path: string, deps: ApplyDeps): Promise<boolean> =>
+  deps.pendingLocal?.(path) === true || (await heldLocally(vault, path, deps)).held;
 
 /** Leave `path` alone and make sure its local edit is uploaded. */
 const keep = (path: string, why: string, deps: ApplyDeps): void => {
@@ -362,7 +405,7 @@ const applyDelete = async (
   // **Edit beats delete** (design §4): the asymmetry of regret. The file
   // stays; the ledger learns the vault holds nothing there, so the edit
   // uploads as a new file and brings the path back.
-  if ((await heldLocally(vault, path, deps)).held) {
+  if (await heldForDelete(vault, path, deps)) {
     keep(path, "trashing it for an inbound delete", deps);
     deps.onApplied?.({ path, hash: null });
     return { status: "applied", result: { path, hash: null } };
@@ -512,7 +555,11 @@ const applyEvent = async (
           // the same way it outlives a delete (design §4), and the vault
           // holds the moved content at the destination either way.
           const source = await vault.readBinary(event.from);
-          if (source !== null && (await bytesHash(source)) === event.sha) {
+          if (
+            source !== null &&
+            (await bytesHash(source)) === event.sha &&
+            deps.pendingLocal?.(event.from) !== true
+          ) {
             await vault.trash(event.from);
           }
           deps.onApplied?.({ path: event.from, hash: null });
@@ -534,8 +581,14 @@ const applyEvent = async (
         // made. Left in place with no ledger entry, it is exactly what it is —
         // a local file the vault has never seen — and the next derive pushes
         // it.
+        // Nor if this device has seen it change: equal bytes are the test that failed on
+        // 2026-09-27 (`ApplyDeps.pendingLocal`).
         const source = await vault.readBinary(event.from);
-        if (source !== null && (await bytesHash(source)) === event.sha) {
+        if (
+          source !== null &&
+          (await bytesHash(source)) === event.sha &&
+          deps.pendingLocal?.(event.from) !== true
+        ) {
           await vault.trash(event.from);
         }
         deps.onApplied?.({ path: event.from, hash: null });
@@ -722,7 +775,7 @@ export const applySnapshot = async (
       // is never acked, its ledger entry is never cleared, and the next
       // snapshot names the same path again.
       if (await vault.exists(path, false)) {
-        if ((await heldLocally(vault, path, guarded)).held) {
+        if (await heldForDelete(vault, path, guarded)) {
           // Gone from the vault, edited here: the edit wins (design §4) and
           // uploads as a new file.
           keep(path, "trashing it for a snapshot that no longer names it", guarded);
