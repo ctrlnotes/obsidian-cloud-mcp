@@ -1282,9 +1282,9 @@ describe("pullIfUnchanged — the vault's version after a merged push", () => {
 });
 
 /**
- * A catch-up asks for many shas per round trip (`ApplyDeps.fetchMany`). Measured before
- * this: one path per round trip, ~6.5 a second, so a snapshot of ~3,600 changed paths
- * could not finish before the vault closed the connection — and it looped.
+ * A catch-up asks for many shas per round trip (`ApplyDeps.fetchMany`) rather than one:
+ * one per round trip was slow enough over the internet that a large snapshot could not
+ * finish inside one connection.
  */
 describe("a catch-up fetches many shas per round trip", () => {
   /** `fetcherFor`, plus a `fetchMany` over the same content that records every call. */
@@ -1447,7 +1447,7 @@ describe("a catch-up fetches many shas per round trip", () => {
     expect(blocked).toEqual([]);
   });
 
-  it("does not overwrite an unpushed edit in a batched replay (PL8)", async () => {
+  it("does not overwrite an unpushed edit in a batched replay, nor ask for its content (PL9)", async () => {
     const { content, files } = await notes(2);
     const [held] = files as [SnapshotEntry];
     const vault = fakeVault({ [held.path]: "my edit\n" });
@@ -1460,5 +1460,9 @@ describe("a catch-up fetches many shas per round trip", () => {
     );
     expect(vault.text(held.path)).toBe("my edit\n");
     expect(kept).toEqual([held.path]);
+    // Kept without a fetch, so the batch does not wait on content it will never write.
+    expect(b.many.flat()).not.toContain(held.sha);
+    expect(b.many).toEqual([[files[1]?.sha]]);
+    expect(b.single).toEqual([]);
   });
 });

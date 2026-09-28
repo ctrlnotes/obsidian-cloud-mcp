@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { MAX_WANT_SHAS, type Up } from "../wire.ts";
 import { Fetcher } from "./fetcher.ts";
 
@@ -239,17 +239,70 @@ describe("Fetcher.wantMany — several shas per round trip", () => {
     expect(got.get("a")).toEqual({ ok: true, bytes: new Uint8Array([1]) });
     expect(got.get("b")).toEqual({ ok: false, permanent: false, reason: "disconnected" });
   });
+});
 
-  it("times out on silence, not on a batch's length: progress re-arms the timer", async () => {
-    // Each answer lands inside the timeout, and the whole batch takes longer than it.
-    const f = make(); // timeoutMs: 50
+/**
+ * The timeout measures SILENCE: each of the three things that count as progress — a
+ * `blob` header, a binary frame, and a finished answer — restarts it on its own, so a
+ * batch that keeps arriving is never failed for its total length. Each case below spaces
+ * its answers 30 ms apart against a 50 ms timeout, and would time out if the one reset it
+ * isolates were missing.
+ */
+describe("Fetcher — the timeout measures silence", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const GAP_MS = 30; // under the 50 ms timeout; three of them are over it
+
+  it("a blob header restarts it", async () => {
+    vi.useFakeTimers();
+    const f = make();
+    const p = f.want("a");
+    await vi.advanceTimersByTimeAsync(GAP_MS);
+    f.onFrame({ type: "blob", sha: "a", bytes: 1 });
+    await vi.advanceTimersByTimeAsync(GAP_MS); // 60 ms since the want, 30 since the header
+    f.onBytes(new Uint8Array([1]));
+    await expect(p).resolves.toEqual({ ok: true, bytes: new Uint8Array([1]) });
+  });
+
+  it("a binary frame restarts it: a blob split across frames slower in total than the timeout", async () => {
+    vi.useFakeTimers();
+    const f = make();
+    const p = f.want("a");
+    f.onFrame({ type: "blob", sha: "a", bytes: 3 });
+    for (const byte of [1, 2, 3]) {
+      await vi.advanceTimersByTimeAsync(GAP_MS);
+      f.onBytes(new Uint8Array([byte]));
+    }
+    await expect(p).resolves.toEqual({ ok: true, bytes: new Uint8Array([1, 2, 3]) });
+  });
+
+  it("a finished answer restarts it: no_blob answers alone keep a batch alive", async () => {
+    vi.useFakeTimers();
+    const f = make();
     const p = f.wantMany(["a", "b", "c"]);
     for (const sha of ["a", "b", "c"]) {
-      await new Promise((r) => setTimeout(r, 30));
-      f.onFrame({ type: "blob", sha, bytes: 1 });
-      f.onBytes(new Uint8Array([1]));
+      await vi.advanceTimersByTimeAsync(GAP_MS);
+      f.onFrame({ type: "no_blob", sha, reason: "unknown" });
     }
     const got = await p;
-    expect([...got.values()].every((g) => g.ok)).toBe(true);
+    expect([...got.values()]).toEqual([
+      { ok: false, permanent: true, reason: "unknown" },
+      { ok: false, permanent: true, reason: "unknown" },
+      { ok: false, permanent: true, reason: "unknown" },
+    ]);
+  });
+
+  it("still gives up after the timeout of real silence, mid-batch", async () => {
+    vi.useFakeTimers();
+    const f = make();
+    const p = f.wantMany(["a", "b"]);
+    await vi.advanceTimersByTimeAsync(GAP_MS);
+    f.onFrame({ type: "no_blob", sha: "a", reason: "unknown" });
+    await vi.advanceTimersByTimeAsync(50);
+    const got = await p;
+    expect(got.get("a")).toMatchObject({ ok: false, permanent: true });
+    expect(got.get("b")).toEqual({ ok: false, permanent: false, reason: "timeout" });
   });
 });

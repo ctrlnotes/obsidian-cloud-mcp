@@ -66,6 +66,13 @@ describe("up frames: the plugin's encoder matches the fixture's shape", () => {
     assertShape(fixture("vault-sync/up.snapshot.json"), encodedShape({ type: "snapshot" }));
   });
 
+  test("want", () => {
+    assertShape(
+      fixture("vault-sync/up.want.json"),
+      encodedShape({ type: "want", shas: ["1a2b3c4d", "2b3c4d5e"] }),
+    );
+  });
+
   // Two entries, one with a base and one without: the fixture's array shape is taken from its
   // first element, so it must be the one carrying a string `base_sha`, and the `null` in the
   // second is what a brand-new path sends.
@@ -174,6 +181,22 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     if (d.type === "snapshot") {
       expect(d.files.length).toBeGreaterThan(0);
     }
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  test("blob", () => {
+    const f = fixture("vault-sync/down.blob.json");
+    const d = decodeDown(f);
+    expect(d.type === "blob" && d.bytes).toBe(1024);
+    assertShape(f, d as unknown as JsonValue);
+  });
+
+  // The permanent answer to a `want`: the plugin acks past it, so its shape matters as much
+  // as `blob`'s.
+  test("no_blob", () => {
+    const f = fixture("vault-sync/down.no_blob.json");
+    const d = decodeDown(f);
+    expect(d.type === "no_blob" && d.reason).toBe("unknown");
     assertShape(f, d as unknown as JsonValue);
   });
 

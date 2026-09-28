@@ -276,6 +276,11 @@ export class Pump {
     // A block from an earlier connection is still a block: ask this one for the snapshot
     // that releases it. The vault's replay from the acked cursor may also re-deliver the
     // blocked event, and whichever lands first releases it.
+    //
+    // **Deliberate on EVERY `ready` while anything is blocked**, even though the replay may
+    // make the snapshot unnecessary: it is bounded to one request per connection
+    // (`resyncRequested`), and waiting to see whether the replay clears the block is what
+    // let a device loop — each connection closed before its catch-up finished.
     this.requestResync();
   }
 
@@ -598,6 +603,12 @@ export class Pump {
     // Answered, whether or not it completed: the next block may ask again. Unless the
     // connection went while this applied — then a request on the next one is not answered
     // by this.
+    //
+    // **A snapshot whose pages all arrived, and whose apply began, before the drop still
+    // completes and acks below, on whatever connection is current.** That is correct: the
+    // list was whole (the epoch check at the top only drops pages that had not started), a
+    // complete snapshot is the vault's state at `down.seq` whichever socket carried it, and
+    // an ack is a cursor, not a reply to a particular connection.
     if (epoch === this.epoch) this.resyncRequested = false;
     // Consecutive failures only — a path that went through this time starts
     // again from nothing.

@@ -78,16 +78,38 @@ export class Fetcher {
    * {@link MAX_WANT_SHAS} per frame, one frame in flight at a time. Every sha
    * asked for has an entry in the answer; duplicates are asked for once.
    *
-   * **Batched, reversing an earlier measured choice.** One sha per request
-   * was chosen when a 250-file first sync measured 48 ms/file one at a time,
-   * while batches of 16 and 64 were slower and stalled. What stalled them was
-   * not pinned down; one candidate is gone — the timeout then bounded a whole
-   * request, and now measures silence. What has been measured since is the
-   * cost of NOT batching: a device catching up on a bulk change fetched about
-   * 3,600 paths at roughly 6.5 per second, one per round trip, so slowly that
-   * its snapshot could not finish before the vault closed the connection for
-   * 1,000 unacknowledged events — and under the ack rule (`pump.ts`'s
-   * `outstanding`) it acked nothing until a snapshot finished, so it looped.
+   * **Batched, reversing an earlier measured choice — and the old reason still
+   * stands where it applied.** One sha per request was chosen from a 250-file
+   * first sync on a local setup, where the round trip was negligible: batch 1 was
+   * 48 ms/file and completed; batch 16 was 366 ms/file and stalled at 238
+   * files; batch 64 was 443 ms/file and stalled at 190. At 48 ms/file the cost
+   * was server work, not the round trip, so batching bought nothing there and
+   * its contiguous multi-blob bursts held up the events sharing the socket.
+   *
+   * **Production goes over the internet, where the round trip dominates**, and
+   * that is why batching should now win: a device catching up on a bulk change
+   * fetched about 3,600 paths at roughly 6.5 per second, one per round trip, so
+   * slowly that its snapshot could not finish before the vault closed the
+   * connection for 1,000 unacknowledged events — and under the ack rule
+   * (`pump.ts`'s `outstanding`) it acked nothing until a snapshot finished, so
+   * it looped.
+   *
+   * **Why the old batches stalled is still unexplained.** Two candidates:
+   * - the timeout then bounded a WHOLE request at 30 s. 64 × 443 ms ≈ 28 s sits
+   *   at that edge, so it fits batch 64; 16 × 366 ms ≈ 6 s does not, so it
+   *   cannot explain batch 16. It now measures silence instead.
+   * - a device pushing its own downloads straight back up, whose upload storm
+   *   starved `want`s on the same socket into timeouts (`apply.ts`'s
+   *   `onApplied` says how that was fixed) — if the old run predates that fix.
+   *
+   * Neither is confirmed, so **a release carrying this is gated on a real bulk
+   * catch-up measured over the internet**: ms/file at batch 1, 16 and 64
+   * ({@link FetcherDeps.maxShas}).
+   *
+   * **Every chunk is queued up front**, one `want` per {@link MAX_WANT_SHAS}
+   * shas, and they go out one after another. Catch-up callers pass at most one
+   * window's worth (`apply.ts`), so this is one frame in practice; a longer list
+   * holds the queue until it is all answered.
    */
   async wantMany(shas: readonly string[]): Promise<Map<string, Fetched>> {
     const unique = [...new Set(shas)];

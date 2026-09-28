@@ -986,9 +986,9 @@ describe("Pump — put_batch", () => {
 
 /**
  * Under the ack rule a blocked seq holds the cursor until a snapshot completes, and the
- * vault closes a connection past 1,000 unacknowledged events. So a snapshot request must
- * survive the connection it was sent on — measured: a request lost with its socket stayed
- * "outstanding" forever, no later block could ask again, and the device looped.
+ * vault closes a connection with too many events unacknowledged. So a snapshot request
+ * must not die with the connection it was sent on: one that stayed "outstanding" after
+ * its socket went would stop every later block from asking again.
  */
 describe("Pump — a resync across a reconnect", () => {
   const snapshot = (
@@ -1115,5 +1115,106 @@ describe("Pump — a resync across a reconnect", () => {
     );
     expect(many).toEqual([[shaA, shaB]]);
     expect(h.cursors).toEqual([70]);
+  });
+});
+
+describe("Pump — the resync guards, one at a time", () => {
+  const snapshot = (files: Array<{ path: string; sha: string }>, seq: number): DownSnapshot => ({
+    type: "snapshot",
+    seq,
+    files,
+    more: false,
+  });
+  const snapshotRequests = (sent: readonly Up[]) => sent.filter((u) => u.type === "snapshot");
+
+  /**
+   * A snapshot from the old connection that finishes applying AFTER the next connection
+   * asked again must not clear that newer request: it did not answer it. If it did, the
+   * next block would send a second request on a connection already waiting for one.
+   */
+  it("an old connection's snapshot finishing late leaves the new connection's request standing", async () => {
+    const missing = await contentHash("missing\n");
+    const pending = await contentHash("pending\n");
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const h = harness({
+      fetchBytes: async (sha) => {
+        if (sha === pending) await gate;
+        return { ok: false as const, code: "disconnected" };
+      },
+    });
+    await h.pump.handleDown(event({ path: "a.md", sha: missing, seq: 5 }));
+    expect(snapshotRequests(h.transport.sent)).toHaveLength(1);
+
+    // The old connection's answer starts applying and waits on a fetch.
+    const applying = h.pump.handleDown(snapshot([{ path: "p.md", sha: pending }], 40));
+    await new Promise((r) => setTimeout(r, 10));
+    h.pump.connectionLost();
+    h.pump.resume();
+    const onNew = h.transport.sent.length - 1;
+    expect(snapshotRequests(h.transport.sent)).toHaveLength(2);
+
+    release();
+    await applying;
+    await h.pump.handleDown(event({ path: "b.md", sha: missing, seq: 6 }));
+    // Exactly one request on the new connection.
+    expect(snapshotRequests(h.transport.sent.slice(onNew))).toHaveLength(1);
+  });
+
+  /**
+   * A request whose send throws never reached the vault, so it must not count as asked:
+   * marking it first would leave the block unasked about for the rest of the connection.
+   */
+  it("a request whose send throws is not marked asked, so the next chance asks", async () => {
+    const missing = await contentHash("missing\n");
+    const transport = fakeTransport();
+    let failOnce = true;
+    const h = harness({
+      transport: {
+        ...transport,
+        send: (up) => {
+          if (up.type === "snapshot" && failOnce) {
+            failOnce = false;
+            throw new Error("cannot send before the sync handshake completes");
+          }
+          transport.send(up);
+        },
+      },
+    });
+    await h.pump.handleDown(event({ path: "a.md", sha: missing, seq: 5 }));
+    expect(snapshotRequests(transport.sent)).toHaveLength(0);
+    await h.pump.handleDown(event({ path: "b.md", sha: missing, seq: 6 }));
+    expect(snapshotRequests(transport.sent)).toHaveLength(1);
+  });
+
+  /** The complement of dropping a stale page: a snapshot already applying when the socket
+   * went was whole, so it completes and acks on the next connection. */
+  it("a snapshot already applying when the connection went still completes and acks", async () => {
+    const missing = await contentHash("missing\n");
+    const body = utf8("n\n");
+    const sha = await contentHash("n\n");
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const h = harness({
+      fetchBytes: async (s) => {
+        if (s !== sha) return { ok: false as const, code: "not_found" };
+        await gate;
+        return { ok: true as const, value: body };
+      },
+    });
+    await h.pump.handleDown(event({ path: "a.md", sha: missing, seq: 5 }));
+    const applying = h.pump.handleDown(snapshot([{ path: "n.md", sha }], 40));
+    await new Promise((r) => setTimeout(r, 10));
+    h.pump.connectionLost();
+    h.pump.resume();
+    release();
+    await applying;
+    expect(h.vault.text("n.md")).toBe("n\n");
+    expect(h.cursors).toEqual([40]);
+    expect(h.transport.sent).toContainEqual({ type: "ack", seq: 40 });
   });
 });

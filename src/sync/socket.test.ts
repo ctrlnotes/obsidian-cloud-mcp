@@ -916,13 +916,22 @@ describe("onDisconnected", () => {
     expect(events).toEqual(["idle", "disconnected"]);
   });
 
-  it("fires on a restart and on disconnect()", async () => {
+  it("fires on a restart, and not again for a disconnect() with nothing open", async () => {
     const { h, events } = counting();
     const t = await connected(h);
     t.closeWith(SERVICE_RESTART_CLOSE_CODE);
     expect(events).toEqual(["disconnected"]);
     h.socket.disconnect(); // nothing open any more: nothing to report
     expect(events).toEqual(["disconnected"]);
+  });
+
+  it("fires on disconnect() of an open socket", async () => {
+    const { h, events } = counting();
+    const t = await connected(h);
+    h.socket.disconnect();
+    t.drop(); // the close event that follows is detached: nothing more is reported
+    expect(events).toEqual(["disconnected"]);
+    expect(t.closed).toBe(true);
   });
 
   it("does not fire when no socket was ever opened", async () => {

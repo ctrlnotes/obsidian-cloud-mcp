@@ -9,6 +9,7 @@ import { fixture } from "./testing/wire-fixture.ts";
 import {
   decodeDown,
   encodeUp,
+  MAX_WANT_SHAS,
   MIN_WIRE_VERSION,
   NO_REASON_GIVEN,
   readDownFrame,
@@ -32,6 +33,8 @@ describe("every documented down fixture decodes", () => {
     "down.closing.json",
     "down.closing_never.json",
     "down.applied_batch.json",
+    "down.blob.json",
+    "down.no_blob.json",
   ])("%s", (name) => {
     expect(() => decodeDown(fixture(`vault-sync/${name}`))).not.toThrow();
   });
@@ -229,5 +232,14 @@ describe("a put's byte count and sha are carried exactly", () => {
     ) as Record<string, unknown>;
     expect(encoded.base_sha).toBeNull();
     expect("base_sha" in encoded).toBe(true);
+  });
+});
+
+describe("the most shas one want may name", () => {
+  // Pinned by value: the vault CLOSES a connection whose `want` names more than this — it
+  // does not truncate — and nothing advertises the number, so raising it here without the
+  // vault would turn every large catch-up into a dropped connection.
+  it("is the vault's own bound, 64", () => {
+    expect(MAX_WANT_SHAS).toBe(64);
   });
 });

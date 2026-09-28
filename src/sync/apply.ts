@@ -72,10 +72,18 @@ export type FetchResult =
 const FETCH_WINDOW = MAX_WANT_SHAS;
 
 /**
- * Whether a path's content is worth asking for alongside others. **Notes only.** Nothing
- * says how large a blob is before it arrives, and an attachment may be as large as the
- * vault's frame bound: a window of them would hold hundreds of megabytes before the first
- * was written. An attachment is fetched alone, when its turn comes, as it always was.
+ * Whether a path's content is worth asking for alongside others. **Notes only.**
+ *
+ * **Bounded by count, not by bytes, and that is an accepted risk rather than an oversight.**
+ * Nothing on the wire says how large a blob is before its `blob` header arrives — a
+ * snapshot entry and an event carry a path and a sha, no size — so there is no size to
+ * bound a batch by. What bounds memory is the window ({@link FETCH_WINDOW}) and the kind of
+ * path. An attachment may be as large as the vault's frame bound (8 MiB), so a window of
+ * them could hold hundreds of megabytes before the first was written; attachments are
+ * fetched alone, when their turn comes, as they always were. Notes are batched: a window of
+ * 64 is as large as its 64 largest notes, which for ordinary notes is small, and for a
+ * vault of multi-megabyte notes is the cost accepted here. If the wire grows a size, this
+ * is where to bound by it.
  */
 const batchable = (path: string): boolean => classifyPath(path) === "text";
 
