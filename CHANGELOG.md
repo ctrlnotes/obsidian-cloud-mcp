@@ -2,6 +2,17 @@
 
 Each release's section becomes its release notes. Newest first.
 
+## 0.1.2
+
+- **Fixes a way a note could be moved to the trash.** If a note was deleted on another
+  device and then re-created here with exactly the content it had before — by a script, a
+  template, or restoring a copy — this device could move the new note to Obsidian's trash
+  when it caught up with the deletion, because it could not tell the new note from the old
+  one. Now a note that changes while Obsidian is open is not trashed by a deletion made
+  before this device caught up, whatever it contains: it is kept and uploaded, so it comes
+  back on your other devices too. A note moved to the trash this way before this update is
+  still in Obsidian's trash and in your vault's history.
+
 ## 0.1.1
 
 - **Fixes a bug that could delete notes from your vault. Update now.** While this device
