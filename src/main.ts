@@ -209,6 +209,41 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     { path: string; pushed: string; vault: string; attempts: number; timer: number | null }
   >();
   private touched: Touched = emptyTouched();
+  /**
+   * **Paths with a local change this device has seen and not yet finished uploading**, each
+   * with the number of the watcher event that marked it last — what `apply.ts` asks before
+   * it trashes anything (`ApplyDeps.pendingLocal`).
+   *
+   * `touched` cannot answer that on its own: a settle swaps it for an empty set before it
+   * derives, so a path it is reading or pushing right now is in neither, and an inbound
+   * write of this plugin's own marks paths in it too. So a mark lives here from the watcher
+   * event until the settle that took it knows the outcome — the push answered, or nothing
+   * to send and this device caught up (`unsentMarks`) — and survives a settle that fails,
+   * because the retry takes it again. A path marked AGAIN mid-settle keeps its newer mark
+   * (`releaseLocal`).
+   */
+  private readonly localChanges = new Map<string, number>();
+  private localMarks = 0;
+  /**
+   * Marks whose settle found nothing to send — a file written back with the bytes its
+   * ledger entry names — held until this device has caught up with the vault
+   * (`releaseCaughtUp`).
+   *
+   * **Released at the derive, the 2026-09-27 loss still happens whenever the derive is
+   * quick.** A delete waiting in the replay backlog was committed before this device saw
+   * the note come back, so the note is the newer of the two and must be kept (design §4);
+   * a delete arriving once this device is caught up is newer than the note, and applies.
+   */
+  private readonly unsentMarks = new Map<string, number>();
+  /** The vault's position when the current connection became ready (`ready.seq`): what
+   * "caught up" means for `unsentMarks`. */
+  private readyHead: number | null = null;
+  /**
+   * Paths this plugin is writing, trashing or renaming itself. The watcher event such a
+   * write fires is consumed here rather than marked in `localChanges`: counted, every
+   * download would make the next inbound delete of that path a no-op.
+   */
+  private readonly ownWrites = new Set<string>();
   /** Guards a settle's own derive-and-push pass; re-armed rather than interleaved. */
   private syncing = false;
   /** The derive half of that pass is running: local work that ends on its own, so an idle
@@ -1203,6 +1238,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
             // The batch limits first (BI5): they belong to THIS connection's vault, and the
             // re-send `resume` makes is planned against them.
             pump.setBatchLimits(batchLimitsFrom(down));
+            this.readyHead = down.seq;
+            this.releaseCaughtUp();
             pump.resume();
             this.settler?.touch();
             // A reconnect is also a relink's most likely moment — re-scan the
@@ -1378,6 +1415,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         this.touched.dirty.add(path);
         this.settler?.touch();
       },
+      pendingLocal: (path) => this.localChanges.has(path),
       // O3. `refusal` is deliberately NOT set: that field drives
       // `describeStatus`'s "Sync was refused" head, which outranks every
       // clause and stops the pending count being shown. A file the server
@@ -1633,6 +1671,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.syncState = { ...this.syncState, cursor: seq };
     this.persistSyncState();
     this.setStatus({ syncedCursor: seq });
+    this.releaseCaughtUp();
   }
 
   private persistSyncState(): void {
@@ -1686,12 +1725,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       this.registerEvent(
         vault.on("create", (f: TAbstractFile) => {
           this.noteSpelling(f.path);
+          this.markLocal(toWirePath(f.path));
           this.touched.dirty.add(toWirePath(f.path));
           this.noteTouched();
         }),
       );
       this.registerEvent(
         vault.on("modify", (f: TAbstractFile) => {
+          this.markLocal(toWirePath(f.path));
           this.touched.dirty.add(toWirePath(f.path));
           this.noteTouched();
         }),
@@ -1700,6 +1741,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         vault.on("delete", (f: TAbstractFile) => {
           const wire = toWirePath(f.path);
           this.forgetSpelling(f.path);
+          this.ownWrites.delete(wire);
           this.touched.deleted.add(wire);
           this.touched.dirty.delete(wire);
           this.noteTouched();
@@ -1709,12 +1751,52 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         vault.on("rename", (f: TAbstractFile, oldPath: string) => {
           this.forgetSpelling(oldPath);
           this.noteSpelling(f.path);
+          this.ownWrites.delete(toWirePath(oldPath));
+          this.markLocal(toWirePath(f.path));
           this.touched.renamed.set(toWirePath(f.path), toWirePath(oldPath));
           this.touched.dirty.add(toWirePath(f.path));
           this.noteTouched();
         }),
       );
     });
+  }
+
+  /** A watcher event at `wire`: the echo of this plugin's own write, or a local change. */
+  private markLocal(wire: string): void {
+    if (this.ownWrites.delete(wire)) return;
+    this.localMarks += 1;
+    this.localChanges.set(wire, this.localMarks);
+  }
+
+  /** The `localChanges` marks of every path in `touched`, as a settle takes it. */
+  private localMarksOf(touched: Touched): Map<string, number> {
+    const marks = new Map<string, number>();
+    const paths = [...touched.dirty, ...touched.deleted, ...touched.renamed.keys()];
+    for (const path of paths) {
+      const mark = this.localChanges.get(path);
+      if (mark !== undefined) marks.set(path, mark);
+    }
+    return marks;
+  }
+
+  /** `unsentMarks` let go once this device has applied everything the vault held when this
+   * connection became ready. Not ready is not caught up: a reconnect may bring a backlog. */
+  private releaseCaughtUp(): void {
+    if (this.unsentMarks.size === 0 || this.socket?.isReady !== true) return;
+    if (this.readyHead === null || this.syncState.cursor < this.readyHead) return;
+    this.releaseLocal(this.unsentMarks.keys(), this.unsentMarks);
+    this.unsentMarks.clear();
+  }
+
+  /** The settle that took `marks` knows what became of `paths`: no longer held, unless the
+   * watcher has marked one again since. */
+  private releaseLocal(paths: Iterable<string>, marks: ReadonlyMap<string, number>): void {
+    for (const path of paths) {
+      const mark = marks.get(path);
+      if (mark !== undefined && this.localChanges.get(path) === mark) {
+        this.localChanges.delete(path);
+      }
+    }
   }
 
   /**
@@ -1743,6 +1825,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
     const touched = this.touched;
     this.touched = emptyTouched();
+    // Held (`localChanges`) until this settle knows each path's outcome, not merely until
+    // it took them: a delete replayed while they are read or pushed must still keep them.
+    const marks = this.localMarksOf(touched);
     this.syncing = true;
     this.deriving = true;
     try {
@@ -1753,6 +1838,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         { attachments: this.attachments },
       );
       this.deriving = false;
+      // Nothing to send for a path is its outcome once this device is caught up: the file
+      // matches the ledger (or is withheld, and named below). Every path that IS sent stays
+      // held until it is answered.
+      const sending = new Set(changes.map((c) => c.path));
+      for (const [path, mark] of marks) {
+        if (!sending.has(path)) this.unsentMarks.set(path, mark);
+      }
+      this.releaseCaughtUp();
       if (oversize.length > 0) {
         console.warn(
           `Ctrl Notes: not syncing ${oversize.length} file(s) over the size limit: ` +
@@ -1815,6 +1908,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
               (outcome) => {
                 try {
                   this.applyPushOutcome(outcome);
+                  // Uploaded and answered — applied, merged or refused and handled — so the
+                  // ledger speaks for this path again.
+                  this.releaseLocal([change.path], marks);
                 } catch (e) {
                   console.warn(
                     `Ctrl Notes: ${change.path} reached the vault, but recording its answer failed`,
@@ -2051,6 +2147,18 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       }
     };
 
+    /** One of this plugin's own writes, marked first so the watcher event it fires — which
+     * may arrive before `write` resolves — is not taken for a local change. */
+    const own = async <T>(paths: readonly string[], write: () => Promise<T>): Promise<T> => {
+      for (const path of paths) this.ownWrites.add(path);
+      try {
+        return await write();
+      } catch (e) {
+        for (const path of paths) this.ownWrites.delete(path);
+        throw e;
+      }
+    };
+
     return {
       // **No `read`, and no `write` either.** Both of Obsidian's string accessors are
       // gone from the sync path: `adapter.read` is a non-fatal decode, and `adapter.write`
@@ -2067,11 +2175,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
         await mkdirp(path);
         // `slice()` copies exactly this view's bytes — a `Uint8Array` can be a window onto a
         // larger buffer — into a buffer typed `ArrayBuffer`, which is what the adapter takes.
-        await adapter.writeBinary(path, bytes.slice().buffer);
+        await own([wire], () => adapter.writeBinary(path, bytes.slice().buffer));
       },
       // `trashLocal`, never `remove`: a delete this device should not have applied stays
       // recoverable by the user (`apply.ts`'s own doc comment on `VaultFiles.trash`).
-      trash: (wire) => adapter.trashLocal(disk(wire)),
+      trash: (wire) => own([wire], () => adapter.trashLocal(disk(wire))),
       // Obsidian's own `sensitive` flag, passed through: `DataAdapter.exists`
       // resolves through the host filesystem, so on APFS and NTFS it answers
       // true for `foo.md` while only `Foo.md` is there unless told otherwise.
@@ -2080,7 +2188,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       rename: async (from, to) => {
         const target = disk(to);
         await mkdirp(target);
-        await adapter.rename(disk(from), target);
+        await own([from, to], () => adapter.rename(disk(from), target));
       },
       // Metadata only, and it runs before any read — a device that discovers a file is
       // oversized by reading it first has already buffered the whole thing.
