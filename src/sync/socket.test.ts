@@ -871,6 +871,84 @@ describe("SyncSocket", () => {
   });
 });
 
+/**
+ * `onDisconnected`: what was tied to a socket — a `want`, a `snapshot` request, half a
+ * snapshot — is never answered once it goes, so the caller is told once per socket,
+ * whatever the reason and whether or not a retry follows.
+ */
+describe("onDisconnected", () => {
+  const counting = () => {
+    const events: string[] = [];
+    const h = harness({
+      onDisconnected: () => events.push("disconnected"),
+      onClosing: (_m, retry) => events.push(retry ? "closing:retry" : "closing:never"),
+      onIdle: () => events.push("idle"),
+    });
+    return { h, events };
+  };
+
+  it("fires once on an ordinary drop, which then reconnects", async () => {
+    vi.useFakeTimers();
+    const { h, events } = counting();
+    const t = await connected(h);
+    t.drop();
+    t.drop(); // a second close event for the same socket reports nothing more
+    expect(events).toEqual(["disconnected"]);
+    await vi.advanceTimersByTimeAsync(PAST_EVERY_RETRY_CEILING_MS);
+    expect(h.sockets.length).toBeGreaterThan(1);
+  });
+
+  it("fires after a resumable closing's own callback", async () => {
+    const { h, events } = counting();
+    const t = await connected(h);
+    t.emit({ type: "closing", reason: "too many unacknowledged events", retry: "later" });
+    await flush();
+    t.drop();
+    expect(events).toEqual(["closing:retry", "disconnected"]);
+  });
+
+  it("fires after onIdle, which reads what was outstanding before anything is reset", async () => {
+    const { h, events } = counting();
+    const t = await connected(h);
+    t.emit({ type: "closing", reason: IDLE_REASON });
+    await flush();
+    t.closeWith(1000);
+    expect(events).toEqual(["idle", "disconnected"]);
+  });
+
+  it("fires on a restart, and not again for a disconnect() with nothing open", async () => {
+    const { h, events } = counting();
+    const t = await connected(h);
+    t.closeWith(SERVICE_RESTART_CLOSE_CODE);
+    expect(events).toEqual(["disconnected"]);
+    h.socket.disconnect(); // nothing open any more: nothing to report
+    expect(events).toEqual(["disconnected"]);
+  });
+
+  it("fires on disconnect() of an open socket", async () => {
+    const { h, events } = counting();
+    const t = await connected(h);
+    h.socket.disconnect();
+    t.drop(); // the close event that follows is detached: nothing more is reported
+    expect(events).toEqual(["disconnected"]);
+    expect(t.closed).toBe(true);
+  });
+
+  it("does not fire when no socket was ever opened", async () => {
+    vi.useFakeTimers();
+    const events: string[] = [];
+    const h = harness({
+      url: () => Promise.reject(new Error("no identity yet")),
+      onDisconnected: () => events.push("disconnected"),
+      warn: () => {},
+    });
+    h.socket.connect();
+    await flush();
+    expect(events).toEqual([]);
+    h.socket.disconnect();
+  });
+});
+
 /** BI4's cap on one rung, at its boundary. */
 describe("retryWait", () => {
   it("jitters the ordinary rung without work, and caps it at WORK_RETRY_MAX_MS with work", () => {

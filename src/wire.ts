@@ -79,6 +79,16 @@ export const MIN_WIRE_VERSION = 3;
 export const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 /**
+ * The most shas one {@link UpWant} may name — pinned to the vault's own bound.
+ *
+ * **Not advertised in `ready`, and exceeding it is not a soft refusal**: the
+ * vault closes the connection rather than truncate the list. The vault answers
+ * a `want` from the same loop that delivers events, so the bound is also how
+ * long one catch-up batch may hold that loop.
+ */
+export const MAX_WANT_SHAS = 64;
+
+/**
  * How large one binary frame of a put's content is — and so the largest put a `put_batch`
  * carries, since a batch entry is exactly one frame ({@link UpPutBatch}).
  *
@@ -136,9 +146,8 @@ export interface UpSnapshot {
  * obtains bytes it does not already hold. The vault answers each entry in
  * order with a `blob` header plus its binary frames, or a `no_blob`.
  *
- * The list is on the wire from the start even though slice one always sends
- * exactly one entry — batching later is then a change of call pattern rather
- * than of protocol.
+ * At most {@link MAX_WANT_SHAS} entries, and one `want` outstanding at a time:
+ * the answers carry no request id, so they are told apart by position alone.
  */
 export interface UpWant {
   readonly type: "want";

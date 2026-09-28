@@ -215,6 +215,15 @@ export interface SyncSocketDeps {
    * `onRestarting`: a caller without it simply stays disconnected until it next connects.
    */
   readonly onIdle?: () => void;
+  /**
+   * The open socket is gone, for any reason — a drop, a `closing` of any kind, a restart, an
+   * idle close or `disconnect()` — called once per socket, after that reason's own callback
+   * (`onClosing`, `onRestarting`, `onIdle`).
+   * Whatever was tied to that socket (a `want` awaiting its answer, a `snapshot` request,
+   * half a snapshot) will never be answered on it. Not called when no socket was open, such
+   * as a failure to build the URL.
+   */
+  readonly onDisconnected?: () => void;
   /** Whether this device has work outstanding (BI4), read each time a retry is scheduled.
    * Optional: without it every retry takes the ordinary backoff. */
   readonly hasWork?: () => boolean;
@@ -304,6 +313,7 @@ export class SyncSocket {
     if (socket === null) return;
     this.detach(socket);
     socket.close();
+    this.deps.onDisconnected?.();
   }
 
   /**
@@ -538,14 +548,11 @@ export class SyncSocket {
    * stops — seeing `wanted` false, `handleClose`'s own retry path does nothing further. */
   private terminal(socket: SocketLike, message: string): void {
     this.clearTimers();
-    if (this.socket === socket) {
-      this.detach(socket);
-      this.socket = null;
-      this.ready = false;
-    }
+    const wasOpen = this.release(socket);
     this.wanted = false;
     socket.close();
     this.deps.onClosing(message, false);
+    if (wasOpen) this.deps.onDisconnected?.();
   }
 
   /**
@@ -555,13 +562,10 @@ export class SyncSocket {
    */
   private resumable(socket: SocketLike, message: string, capForWork: boolean): void {
     this.clearTimers();
-    if (this.socket === socket) {
-      this.detach(socket);
-      this.socket = null;
-      this.ready = false;
-    }
+    const wasOpen = this.release(socket);
     socket.close();
     this.deps.onClosing(message, true);
+    if (wasOpen) this.deps.onDisconnected?.();
     this.scheduleRetry(capForWork);
   }
 
@@ -576,18 +580,16 @@ export class SyncSocket {
    */
   private restarting(socket: SocketLike): void {
     this.clearTimers();
-    if (this.socket === socket) {
-      this.detach(socket);
-      this.socket = null;
-      this.ready = false;
-    }
+    const wasOpen = this.release(socket);
     socket.close();
-    if (!this.wanted) return;
-    this.deps.onRestarting?.();
-    this.timer = window.setTimeout(() => {
-      this.timer = null;
-      if (this.wanted) this.open();
-    }, RESTART_RECONNECT_MS);
+    if (this.wanted) {
+      this.deps.onRestarting?.();
+      this.timer = window.setTimeout(() => {
+        this.timer = null;
+        if (this.wanted) this.open();
+      }, RESTART_RECONNECT_MS);
+    }
+    if (wasOpen) this.deps.onDisconnected?.();
   }
 
   /**
@@ -598,25 +600,36 @@ export class SyncSocket {
    */
   private parked(socket: SocketLike): void {
     this.clearTimers();
-    if (this.socket === socket) {
-      this.detach(socket);
-      this.socket = null;
-      this.ready = false;
-    }
+    const wasOpen = this.release(socket);
     this.wanted = false;
     socket.close();
+    // `onIdle` first: it reads what was outstanding on this socket before anything that
+    // `onDisconnected` resets (`main.ts`).
     this.deps.onIdle?.();
+    if (wasOpen) this.deps.onDisconnected?.();
   }
 
   private handleClose(): void {
     this.clearTimers();
+    const wasOpen = this.socket !== null;
     if (this.socket !== null) this.detach(this.socket);
     this.socket = null;
     this.ready = false;
+    if (wasOpen) this.deps.onDisconnected?.();
     if (!this.wanted) return; // `disconnect()` or `terminal()` already gave this up on purpose.
     // A drop before the handshake even reached `ready` gets the same "try again shortly"
     // treatment as one after — the retry policy does not distinguish them.
     this.scheduleRetry();
+  }
+
+  /** Stop listening to `socket` and forget it, if it is the current one. Returns whether it
+   * was — the one case in which a close has anything to report. */
+  private release(socket: SocketLike): boolean {
+    if (this.socket !== socket) return false;
+    this.detach(socket);
+    this.socket = null;
+    this.ready = false;
+    return true;
   }
 
   private scheduleRetry(capForWork = true): void {

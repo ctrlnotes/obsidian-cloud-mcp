@@ -3786,3 +3786,55 @@ describe("a first sync, batched when the vault takes batches", () => {
     ).toEqual(paths.sort());
   });
 });
+
+/**
+ * The shell's half of catch-up (issue #16): `main.ts` must hand the pump a batched fetch,
+ * and must tell it and the fetcher when a socket goes. The pump and fetcher tests cannot see
+ * either wire — each case here fails with its wiring removed.
+ */
+describe("catching up, through the shell", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+
+  const socketAt = async (n: number): Promise<FakeWebSocket> => {
+    await vi.waitFor(() => expect(FakeWebSocket.instances[n]).toBeDefined(), UNTIL);
+    return FakeWebSocket.instances[n] as FakeWebSocket;
+  };
+  const wants = (ws: FakeWebSocket) => ws.upFrames().filter((f) => f.type === "want");
+  const snapshots = (ws: FakeWebSocket) => ws.upFrames().filter((f) => f.type === "snapshot");
+
+  it("asks for a snapshot's notes in one multi-sha want", async () => {
+    stubWebSocket();
+    await load({}, PAIRED);
+    const ws = await socketAt(0);
+    await bringUp(ws);
+    const files = await Promise.all(
+      ["a", "b", "c"].map(async (n) => ({ path: `${n}.md`, sha: await contentHash(`${n}\n`) })),
+    );
+    ws.emit({ type: "snapshot", seq: 9, files, more: false });
+    await vi.waitFor(() => expect(wants(ws)).toHaveLength(1), UNTIL);
+    expect(wants(ws)[0]?.shas).toEqual(files.map((f) => f.sha));
+    // Answered, so nothing is left outstanding when the case ends.
+    for (const f of files) ws.emit({ type: "no_blob", sha: f.sha, reason: "unknown" });
+    await vi.waitFor(() => expect(ws.upFrames()).toContainEqual({ type: "ack", seq: 9 }), UNTIL);
+  });
+
+  it("asks for the snapshot again on the next connection when the socket that asked drops", async () => {
+    stubWebSocket();
+    await load({}, PAIRED);
+    const first = await socketAt(0);
+    await bringUp(first);
+
+    // An event whose content arrives corrupt: blocked, so the pump asks for a snapshot.
+    const sha = await contentHash("theirs\n");
+    first.emit({ type: "event", seq: 3, kind: "put", path: "n.md", sha, from: null, at_ms: 0 });
+    await vi.waitFor(() => expect(wants(first)).toHaveLength(1), UNTIL);
+    first.emit({ type: "blob", sha, bytes: 3 });
+    first.onmessage?.({ data: new Uint8Array([1, 2, 3]) });
+    await vi.waitFor(() => expect(snapshots(first)).toHaveLength(1), UNTIL);
+
+    first.close(); // dropped before the vault answered
+    const second = await socketAt(1);
+    await bringUp(second);
+    await vi.waitFor(() => expect(snapshots(second)).toHaveLength(1), UNTIL);
+  });
+});
