@@ -21,9 +21,17 @@ export const manifest = {
  * writing into private state directly. */
 export const vaultListeners = new Map<string, ((...args: unknown[]) => void)[]>();
 
-/** Fire one, as Obsidian's watcher would. `oldPath` is `rename`'s second argument. */
-export const fireVaultEvent = (event: string, path: string, oldPath?: string): void => {
-  for (const cb of vaultListeners.get(event) ?? []) cb({ path }, oldPath);
+/** Fire one, as Obsidian's watcher would. `oldPath` is `rename`'s second argument; `size`
+ * becomes the file's `stat.size`, which a real `TFile` always carries and this omits unless
+ * a case needs it. */
+export const fireVaultEvent = (
+  event: string,
+  path: string,
+  oldPath?: string,
+  size?: number,
+): void => {
+  const file = size === undefined ? { path } : { path, stat: { size } };
+  for (const cb of vaultListeners.get(event) ?? []) cb(file, oldPath);
 };
 
 export interface FakeAppOptions {

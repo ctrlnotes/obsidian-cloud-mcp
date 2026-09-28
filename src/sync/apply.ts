@@ -149,6 +149,16 @@ export interface ApplyDeps {
    * The host must not count its OWN writes (every inbound write fires the watcher too; see
    * {@link onApplied}), or the next delete of anything this device downloaded would be kept.
    * Absent, nothing is held this way.
+   *
+   * What it cannot see or tell apart:
+   * - **A touch made while offline or parked** is held against a delete that may be newer
+   *   than it, and the note comes back on the next `ready`. Only comparing times would
+   *   settle it, and a snapshot carries none.
+   * - **Mobile has no filesystem watcher**, so another program writing into the vault there
+   *   is invisible; only Obsidian's own edits are seen.
+   * - **Keys are exact wire paths**, while `exists(path, false)` folds case on APFS and
+   *   NTFS: a change seen at `Notes/a.md` does not hold a delete of `notes/a.md`. Nothing
+   *   in this codebase folds case into a key, so none is invented here.
    */
   pendingLocal?(path: string): boolean;
 }
@@ -545,7 +555,11 @@ const applyEvent = async (
           // the same way it outlives a delete (design §4), and the vault
           // holds the moved content at the destination either way.
           const source = await vault.readBinary(event.from);
-          if (source !== null && (await bytesHash(source)) === event.sha) {
+          if (
+            source !== null &&
+            (await bytesHash(source)) === event.sha &&
+            deps.pendingLocal?.(event.from) !== true
+          ) {
             await vault.trash(event.from);
           }
           deps.onApplied?.({ path: event.from, hash: null });
@@ -567,8 +581,14 @@ const applyEvent = async (
         // made. Left in place with no ledger entry, it is exactly what it is —
         // a local file the vault has never seen — and the next derive pushes
         // it.
+        // Nor if this device has seen it change: equal bytes are the test that failed on
+        // 2026-09-27 (`ApplyDeps.pendingLocal`).
         const source = await vault.readBinary(event.from);
-        if (source !== null && (await bytesHash(source)) === event.sha) {
+        if (
+          source !== null &&
+          (await bytesHash(source)) === event.sha &&
+          deps.pendingLocal?.(event.from) !== true
+        ) {
           await vault.trash(event.from);
         }
         deps.onApplied?.({ path: event.from, hash: null });

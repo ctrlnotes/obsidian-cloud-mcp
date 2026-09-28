@@ -1139,6 +1139,31 @@ describe("an unpushed local edit survives inbound changes", () => {
     expect(deps.kept).toEqual(["new.md"]);
   });
 
+  /**
+   * A rename onto a path this device already holds trashes the source when it holds exactly
+   * what moved — the equal-bytes test that failed on 2026-09-27. Not while this device has
+   * seen the source change. **Proven able to fail** by dropping the `pendingLocal` guard from
+   * either branch: that case's source is trashed.
+   */
+  it.each([
+    ["the destination already holds what moved", "moved\n"],
+    ["the destination holds an edit of its own", "local edit\n"],
+  ])("keeps a rename's source a local change is pending on, when %s", async (_, dest) => {
+    const moved = utf8("moved\n");
+    const sha = await bytesHash(moved);
+    const vault = fakeVault({ "old.md": "moved\n", "new.md": dest });
+    const deps: ApplyDeps = {
+      ...withLedger({ "new.md": await contentHash("synced\n") }, { [sha]: moved }),
+      pendingLocal: (path) => path === "old.md",
+    };
+    await applyReplay(
+      vault,
+      [{ type: "event", seq: 7, kind: "rename", path: "new.md", sha, from: "old.md", at_ms: 0 }],
+      deps,
+    );
+    expect(vault.text("old.md")).toBe("moved\n");
+  });
+
   it("keeps an edited file a snapshot would overwrite, and still completes", async () => {
     const theirs = utf8("vault version\n");
     const sha = await bytesHash(theirs);
