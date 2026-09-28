@@ -42,6 +42,14 @@ describe("batchLimitsFrom", () => {
 
   /** Past 100 the vault closes the connection for good, whatever it advertised.
    * **Proven able to fail** by dropping the cap: `maxDeleteOps` reads 500. */
+  /** **Proven able to fail** by dropping either `Math.floor`: 2.5 would let a third in. */
+  it("takes whole entries from a fractional limit", () => {
+    expect(batchLimitsFrom(ready(2.5, 4194304, 2.5))).toMatchObject({
+      maxOps: 2,
+      maxDeleteOps: 2,
+    });
+  });
+
   it("never takes more than 100 deletes, whatever the vault says", () => {
     expect(batchLimitsFrom(ready(100, 4194304, 500))?.maxDeleteOps).toBe(100);
   });
@@ -94,6 +102,21 @@ describe("planBatch, for deletes", () => {
   it("sends single deletes to a vault that did not advertise delete_batch", () => {
     expect(planBatch(deletes(3), { ...LIMITS, maxDeleteOps: 0 })).toBe(1);
     expect(planBatch(deletes(3), null)).toBe(1);
+  });
+
+  /** A vault that advertised `delete_batch` and not `put_batch`. **Proven able to fail** by
+   * letting the put run ignore a limit of 0: the empty puts go as one batch of 3. */
+  it("batches deletes and sends puts singly for a vault that batches deletes only", () => {
+    const only = batchLimitsFrom(ready(0, 0, 100));
+    const empty = (path: string): Change => ({
+      op: "put",
+      path,
+      base: null,
+      content: new Uint8Array(0),
+      hash: "h",
+    });
+    expect(planBatch([empty("a.md"), empty("b.md"), empty("c.md")], only)).toBe(1);
+    expect(planBatch(deletes(3), only)).toBe(3);
   });
 
   it("sends a lone delete as a plain delete", () => {

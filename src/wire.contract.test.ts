@@ -136,6 +136,18 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     assertShape(f, d as unknown as JsonValue);
   });
 
+  // A vault that batches puts and predates `delete_batch`: no delete batching, by value.
+  test("ready (put batching only)", () => {
+    const f = fixture("vault-sync/down.ready_put_only.json");
+    const d = decodeDown(f);
+    expect(
+      d.type === "ready" && [d.max_batch_ops, d.max_batch_bytes, d.max_delete_batch_ops],
+    ).toEqual([100, 4194304, 0]);
+    // The decoder adds the field the fixture lacks, so the shape is checked without it.
+    const { max_delete_batch_ops: _absent, ...rest } = d as { max_delete_batch_ops: number };
+    assertShape(f, rest);
+  });
+
   test("applied_batch", () => {
     const f = fixture("vault-sync/down.applied_batch.json");
     const d = decodeDown(f);

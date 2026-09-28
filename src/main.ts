@@ -187,10 +187,28 @@ const PULL_RETRY_MAX_MS = 300_000;
 /** "Sync now" on a device that already has a connection, or is making one. */
 const ALREADY_SYNCING = `${PRODUCT_NAME} is already syncing.`;
 
+/** A loaded state with a ledger this instance owns, since the ledger is updated in place: a
+ * loaded record may be shared (`EMPTY_STATE`'s is). */
+const ownLedger = (state: SyncState): SyncState => ({
+  cursor: state.cursor,
+  hashes: { ...state.hashes },
+});
+
 export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private cfg: Settings = DEFAULT_SETTINGS;
   private identity: DeviceIdentity | null = null;
   private syncState: SyncState = { cursor: 0, hashes: {} };
+  /**
+   * The ledger or cursor changed since {@link syncState} was last persisted.
+   *
+   * **The ledger is updated in place and persisted once per unit of work, not per entry.**
+   * Copying and re-serialising a 20,000-entry ledger costs ~25 ms, and doing it for every
+   * settled change and every echoed event capped bulk sync at a few dozen files a second.
+   * The unit is one inbound flush or snapshot (the pump's `persist`, always before its ack)
+   * and one burst of push answers ({@link scheduleCommit}).
+   */
+  private ledgerDirty = false;
+  private commitScheduled = false;
 
   /**
    * `onunload`, not a registration made during load. `onload` awaits the device identity
@@ -574,7 +592,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
     if (this.cfg.vaultId !== "") {
       adoptUnstampedState(this.app, this.cfg.vaultId);
-      this.syncState = loadSyncState(this.app, this.cfg.vaultId);
+      this.syncState = ownLedger(loadSyncState(this.app, this.cfg.vaultId));
+      this.ledgerDirty = false;
     }
 
     this.addSettingTab(new CtrlNotesSettingsTab(this.app, this));
@@ -995,7 +1014,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private async adoptVault(vaultId: string, deviceId: string): Promise<void> {
     this.cfg = { ...this.cfg, vaultId, deviceId };
     await this.saveData(this.cfg);
-    this.syncState = loadSyncState(this.app, vaultId);
+    this.syncState = ownLedger(loadSyncState(this.app, vaultId));
+    this.ledgerDirty = false;
     // The `seq`s it remembers were another vault's, and would hold this one's back.
     this.signalMemory = FRESH_SIGNAL_MEMORY;
   }
@@ -1414,6 +1434,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       ledger: () => this.syncState.hashes,
       onApplied: (applied) => this.recordApplied(applied),
       onCursor: (seq) => this.advanceCursor(seq),
+      persist: () => this.commitLedger(),
       // No `onRefused` here. Every refusal answers a `pump.push` whose outcome carries it
       // to `applyPushOutcome`, which already calls `handleRefusal`; wiring this too handled
       // each refusal twice, so one refused file counted as two (found 2026-09-22 by the
@@ -1701,8 +1722,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   private advanceCursor(seq: number): void {
     if (seq <= this.syncState.cursor) return;
+    // Persisted by the pump's `persist`, which it calls after this and before the ack: the
+    // cursor and the ledger it describes become durable together, in one write.
     this.syncState = { ...this.syncState, cursor: seq };
-    this.persistSyncState();
+    this.ledgerDirty = true;
     this.setStatus({ syncedCursor: seq });
     for (const [path, until] of this.heldUntil) if (until <= seq) this.heldUntil.delete(path);
   }
@@ -1710,6 +1733,31 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   private persistSyncState(): void {
     if (this.cfg.vaultId === "") return;
     saveSyncState(this.app, this.cfg.vaultId, this.syncState);
+    this.ledgerDirty = false;
+  }
+
+  /** Persist the ledger and cursor if anything changed since they were last written. */
+  private commitLedger(): void {
+    if (this.ledgerDirty) this.persistSyncState();
+  }
+
+  /**
+   * Persist once, after every push answer that has already landed has been applied. A
+   * batch's answer resolves all its entries' promises at once, so their handlers run back to
+   * back before this microtask: a 100-entry `applied_batch` is one write, not 100.
+   */
+  private scheduleCommit(): void {
+    if (this.commitScheduled) return;
+    this.commitScheduled = true;
+    queueMicrotask(() => {
+      this.commitScheduled = false;
+      this.commitLedger();
+    });
+  }
+
+  /** The ledger as the mutable map it is — owned by this instance ({@link ownLedger}). */
+  private get ledger(): Record<string, string> {
+    return this.syncState.hashes;
   }
 
   private handleRefusal(refused: DownRefused): void {
@@ -1718,9 +1766,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       // `retry.ts`'s own contract: correct the ledger to what the vault reports as
       // current, and mark the path dirty for the NEXT settle to re-derive and re-push —
       // never a fabricated wire frame built here.
-      const hashes = { ...this.syncState.hashes, [r.path]: r.currentSha };
-      this.syncState = { ...this.syncState, hashes };
-      this.persistSyncState();
+      this.ledger[r.path] = r.currentSha;
+      this.ledgerDirty = true;
+      this.scheduleCommit();
       this.touched.dirty.add(r.path);
       this.settler?.touch();
     }
@@ -1850,9 +1898,12 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     this.syncing = true;
     this.deriving = true;
     try {
+      // A copy: the ledger is updated in place, and a derive awaits reads while inbound events
+      // land, so without one it would compare some files against a different ledger than
+      // others.
       const { changes, oversize, undecodable } = await deriveChanges(
         this.readableFiles(),
-        this.syncState.hashes,
+        { ...this.syncState.hashes },
         touched,
         { attachments: this.attachments },
       );
@@ -2005,23 +2056,26 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   private applyPushOutcome(outcome: ResultOutcome): void {
     this.idleWakes = 0; // the vault answered: whatever `decideIdleWake` was counting is over
-    const hashes = { ...this.syncState.hashes, ...outcome.hashes };
-    for (const forgotten of outcome.forget) delete hashes[forgotten];
-    this.syncState = { ...this.syncState, hashes };
-    this.persistSyncState();
+    Object.assign(this.ledger, outcome.hashes);
+    for (const forgotten of outcome.forget) delete this.ledger[forgotten];
+    this.ledgerDirty = true;
+    this.scheduleCommit();
     if (outcome.refused !== null) this.handleRefusal(outcome.refused);
     for (const p of outcome.pull) void this.pullVaultVersion(p);
   }
 
-  /** Every inbound write lands in the ledger through here. */
+  /**
+   * Every inbound write lands in the ledger through here — in memory, at once, so the host's
+   * watcher never mistakes this device's own write for an edit. **Not persisted here**: the
+   * caller commits ({@link commitLedger}) once its unit of work is done, and the pump always
+   * does before it acks.
+   */
   private recordApplied(applied: readonly Applied[]): void {
-    const hashes = { ...this.syncState.hashes };
     for (const a of applied) {
-      if (a.hash === null) delete hashes[a.path];
-      else hashes[a.path] = a.hash;
+      if (a.hash === null) delete this.ledger[a.path];
+      else this.ledger[a.path] = a.hash;
     }
-    this.syncState = { ...this.syncState, hashes };
-    this.persistSyncState();
+    if (applied.length > 0) this.ledgerDirty = true;
   }
 
   /**
@@ -2070,7 +2124,10 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     try {
       outcome = await pullIfUnchanged(this.vaultFiles(), p.path, p.pushed, p.vault, {
         fetchBytes: (sha) => this.fetchBytes(sha),
-        onApplied: (a) => this.recordApplied([a]),
+        onApplied: (a) => {
+          this.recordApplied([a]);
+          this.commitLedger();
+        },
       });
     } catch (e) {
       console.warn(`Ctrl Notes: could not bring ${p.path} to the vault's version`, e);

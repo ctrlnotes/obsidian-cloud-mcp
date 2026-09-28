@@ -3788,6 +3788,131 @@ describe("a first sync, batched when the vault takes batches", () => {
 });
 
 /**
+ * The ledger is persisted once per unit of work, never per entry: a 20,000-entry ledger costs
+ * ~25 ms to copy and serialise, and a write per settled change or echoed event capped bulk
+ * sync at a few dozen files a second. And never acked past: the state an ack claims is on
+ * disk before the ack leaves.
+ */
+describe("the sync ledger, persisted once per unit of work", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+  const KEY = "ctrlrouter:sync-state";
+  const PATHS = Array.from({ length: 100 }, (_, i) => `note-${String(i).padStart(3, "0")}.md`);
+
+  interface Stored {
+    cursor: number;
+    hashes: Record<string, string>;
+  }
+
+  /** Load a device whose ledger names every path in `PATHS`, holding `files` on disk, and
+   * count every write of its sync state from here on. */
+  const synced = async (files: Record<string, string>) => {
+    stubWebSocket();
+    const sha = await contentHash("body\n");
+    const hashes = Object.fromEntries(PATHS.map((p) => [p, sha]));
+    const plugin = await load(files, {
+      ...PAIRED,
+      appOptions: { localStorage: { [KEY]: { vaultId: "vault-1", cursor: 0, hashes } } },
+    });
+    const writes: Stored[] = [];
+    const save = plugin.app.saveLocalStorage.bind(plugin.app);
+    plugin.app.saveLocalStorage = (key: string, value: unknown) => {
+      if (key === KEY) writes.push(structuredClone(value) as Stored);
+      save(key, value);
+    };
+    const stored = () => plugin.app.loadLocalStorage(KEY) as Stored;
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    return { plugin, ws: FakeWebSocket.instances[0] as FakeWebSocket, writes, stored };
+  };
+
+  /**
+   * 100 deletes go up as one `delete_batch`, and its one `applied_batch` answer is one write.
+   * **Proven able to fail** by persisting in `applyPushOutcome` again: 100 writes.
+   */
+  it("persists a 100-entry delete_batch answer once", async () => {
+    const { ws, writes, stored } = await synced({}); // every ledger path is gone from disk
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({
+      type: "ready",
+      seq: 0,
+      max_batch_ops: 100,
+      max_batch_bytes: 4194304,
+      max_delete_batch_ops: 100,
+    });
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "delete_batch")).toBe(true),
+      UNTIL,
+    );
+    const batch = ws.upFrames().find((f) => f.type === "delete_batch");
+    const named = (batch?.deletes ?? []) as { path: string }[];
+    expect(named.map((d) => d.path).sort()).toEqual(PATHS);
+    expect(ws.upFrames().filter((f) => f.type === "delete")).toEqual([]);
+
+    writes.length = 0;
+    ws.emit({
+      type: "applied_batch",
+      applied: PATHS.map((path, i) => ({ path, seq: i + 1, sha: "" })),
+      refused: [],
+    });
+    await vi.waitFor(() => expect(stored().hashes).toEqual({}), UNTIL);
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(writes).toHaveLength(1);
+  });
+
+  /**
+   * A vault that batches puts and predates `delete_batch` (its `ready` has no delete field)
+   * gets single deletes: it would drop the unknown frame and the pump would wait for good.
+   */
+  it("sends single deletes to a vault whose ready batches puts only", async () => {
+    const { ws } = await synced({});
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({ type: "ready", seq: 0, max_batch_ops: 100, max_batch_bytes: 4194304 });
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "delete")).toBe(true),
+      UNTIL,
+    );
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(ws.upFrames().filter((f) => f.type === "delete_batch")).toEqual([]);
+    expect(ws.upFrames().filter((f) => f.type === "delete")).toHaveLength(1); // one in flight
+  });
+
+  /**
+   * 100 inbound deletes arriving together are one flush and one write, and the ack for them
+   * leaves only after that write: at the moment it is sent, the stored cursor is 100 and the
+   * stored ledger no longer names a path the flush deleted. **Proven able to fail** by
+   * persisting after the ack (the state stored at the ack still holds cursor 0), or per event
+   * (100 writes).
+   */
+  it("persists a 100-event flush once, before its ack", async () => {
+    const files = Object.fromEntries(PATHS.map((p) => [p, "body\n"]));
+    const { ws, writes, stored } = await synced(files);
+    const atAck: Stored[] = [];
+    const send = ws.send.bind(ws);
+    ws.send = (data: string | Uint8Array) => {
+      if (typeof data === "string" && (JSON.parse(data) as { type?: string }).type === "ack") {
+        atAck.push(stored());
+      }
+      send(data);
+    };
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500); // nothing to push: disk matches the ledger
+
+    writes.length = 0;
+    for (const [i, path] of PATHS.entries()) {
+      ws.emit({ type: "event", seq: i + 1, kind: "delete", path, sha: null, at_ms: 0 });
+    }
+    await vi.waitFor(() => expect(atAck).toHaveLength(1), UNTIL);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    expect(ws.upFrames().filter((f) => f.type === "ack")).toEqual([{ type: "ack", seq: 100 }]);
+    expect(atAck[0]).toMatchObject({ cursor: 100, hashes: {} });
+    expect(writes).toHaveLength(1);
+    expect(stored()).toMatchObject({ cursor: 100, hashes: {} });
+  });
+});
+
+/**
  * The shell's half of catch-up (issue #16): `main.ts` must hand the pump a batched fetch,
  * and must tell it and the fetcher when a socket goes. The pump and fetcher tests cannot see
  * either wire — each case here fails with its wiring removed.

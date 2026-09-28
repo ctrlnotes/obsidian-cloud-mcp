@@ -32,8 +32,12 @@ export interface BatchLimits {
  * the connection for good, whatever it advertised.
  */
 export function batchLimitsFrom(ready: DownReady): BatchLimits | null {
-  const maxOps = Math.max(0, ready.max_batch_ops);
-  const maxDeleteOps = Math.max(0, Math.min(ready.max_delete_batch_ops, MAX_DELETE_BATCH_OPS));
+  // Whole entries: an advertised 2.5 is 2, never a third entry the vault did not offer.
+  const maxOps = Math.max(0, Math.floor(ready.max_batch_ops));
+  const maxDeleteOps = Math.max(
+    0,
+    Math.floor(Math.min(ready.max_delete_batch_ops, MAX_DELETE_BATCH_OPS)),
+  );
   if (maxOps === 0 && maxDeleteOps === 0) return null;
   return { maxOps, maxBytes: ready.max_batch_bytes, maxDeleteOps };
 }

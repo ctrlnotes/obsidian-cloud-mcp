@@ -1,6 +1,7 @@
 // SyncPump's tests.
 
 import { describe, expect, it, type Mock, vi } from "vitest";
+import { fixture } from "../testing/wire-fixture.ts";
 import type {
   DownApplied,
   DownAppliedBatch,
@@ -11,7 +12,7 @@ import type {
   UpDeleteBatch,
   UpPutBatch,
 } from "../wire.ts";
-import { MAX_FRAME_BYTES, PUT_CHUNK_BYTES } from "../wire.ts";
+import { decodeDown, MAX_FRAME_BYTES, PUT_CHUNK_BYTES } from "../wire.ts";
 import type { ApplyDeps, VaultFiles } from "./apply.ts";
 import { type BatchLimits, batchLimitsFrom } from "./batch.ts";
 import type { Change } from "./derive.ts";
@@ -128,13 +129,67 @@ function harness(overrides: Partial<PumpDeps> = {}) {
 }
 
 const event = (
-  over: Partial<DownEvent> & { path: string; sha: string; seq: number },
+  over: Partial<DownEvent> & { path: string; sha: string | null; seq: number },
 ): DownEvent => ({
   type: "event",
   kind: "put",
   from: null,
   at_ms: 0,
   ...over,
+});
+
+/**
+ * What must be durable before an ack. The pump records per file (`onApplied`) and persists
+ * once per flush or snapshot (`persist`), after the cursor moves and before the ack is sent:
+ * an ack past unpersisted state is a resume point a crash cannot back up, and a write per
+ * file is what capped bulk sync.
+ */
+describe("Pump — persisting before the ack", () => {
+  const ordered = () => {
+    const log: string[] = [];
+    const h = harness({
+      onApplied: (a) => log.push(`applied:${a.length}`),
+      onCursor: (seq) => log.push(`cursor:${seq}`),
+      persist: () => log.push("persist"),
+    });
+    const send = h.transport.send.bind(h.transport);
+    h.transport.send = (up) => {
+      log.push(up.type === "ack" ? `ack:${up.seq}` : up.type);
+      send(up);
+    };
+    return { h, log };
+  };
+
+  /** **Proven able to fail** by persisting per `onApplied` again (101 writes), or by
+   * persisting after the ack (the ack precedes it in the log). */
+  it("persists a 100-event flush once, after the cursor moves and before the ack", async () => {
+    const { h, log } = ordered();
+    let last: Promise<void> = Promise.resolve();
+    for (let seq = 1; seq <= 100; seq++) {
+      last = h.pump.handleDown(event({ seq, kind: "delete", path: `gone-${seq}.md`, sha: null }));
+    }
+    await last;
+
+    expect(log.filter((l) => l === "persist")).toHaveLength(1);
+    expect(log.filter((l) => l.startsWith("ack"))).toEqual(["ack:100"]);
+    expect(log.slice(-3)).toEqual(["cursor:100", "persist", "ack:100"]);
+  });
+
+  it("persists a flush that acks nothing, too", async () => {
+    const { h, log } = ordered();
+    h.pump.setBatchLimits(null);
+    // An event it cannot apply: its content never arrives, so nothing is acked.
+    await h.pump.handleDown(event({ seq: 1, path: "n.md", sha: "missing" }));
+    expect(log.filter((l) => l === "persist")).toHaveLength(1);
+    expect(log.some((l) => l.startsWith("ack"))).toBe(false);
+  });
+
+  it("persists a complete snapshot once, before its ack", async () => {
+    const { h, log } = ordered();
+    await h.pump.handleDown({ type: "snapshot", seq: 9, files: [], more: false });
+    expect(log.slice(-3)).toEqual(["cursor:9", "persist", "ack:9"]);
+    expect(log.filter((l) => l === "persist")).toHaveLength(1);
+  });
 });
 
 describe("Pump — inbound", () => {
@@ -1097,17 +1152,13 @@ describe("Pump — delete_batch", () => {
   });
 
   /** An older vault drops the unknown frame in silence, and the pump would wait for good.
-   * **Proven able to fail** by reading `max_delete_batch_ops`'s absence as the wire's cap. */
+   * **Proven able to fail** by reading `max_delete_batch_ops`'s absence as the wire's cap, or
+   * as `max_batch_ops` in the decoder. */
   it("sends no delete_batch when ready lacks max_delete_batch_ops", async () => {
-    const h = batching(
-      batchLimitsFrom({
-        type: "ready",
-        seq: 0,
-        max_batch_ops: 100,
-        max_batch_bytes: 4194304,
-        max_delete_batch_ops: 0,
-      }),
-    );
+    // Decoded from the wire, as `main.ts` gets it: the fixture has no delete field at all.
+    const ready = decodeDown(fixture("vault-sync/down.ready_put_only.json"));
+    if (ready.type !== "ready") throw new Error("the fixture is a ready frame");
+    const h = batching(batchLimitsFrom(ready));
     const done = h.pump.pushAll([del("a.md"), del("b.md")]);
     expect(types(h)).toEqual(["delete"]);
     void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: "" });
@@ -1128,7 +1179,7 @@ describe("Pump — delete_batch", () => {
     const [a, b, c] = h.pump.pushAll(changes);
     const stale = {
       path: "c.md",
-      reason: "the file changed since this device last saw it",
+      reason: "that path changed since you last saw it",
       current_sha: "cur-c",
     };
     void h.pump.handleDown({
@@ -1176,6 +1227,17 @@ describe("Pump — delete_batch", () => {
     const outcomes = await Promise.all(done);
     expect(outcomes.map((o) => o.forget)).toEqual([["a.md"], ["b.md"], ["c.md"]]);
     expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  /** `planBatch` never mixes kinds; if a batch ever did, an entry dropped from the frame
+   * would wait for an answer that never names it. **Proven able to fail** by removing the
+   * check: the put is dropped and a two-entry `delete_batch` goes out. */
+  it("refuses to send a batch of mixed kinds rather than drop an entry", () => {
+    const h = batching();
+    const inside = h.pump as unknown as { sendBatch(changes: readonly Change[]): void };
+    expect(() => inside.sendBatch([del("a.md"), put("b.md"), del("c.md")])).toThrow(/put/);
+    expect(() => inside.sendBatch([put("a.md"), del("b.md")])).toThrow(/delete/);
+    expect(h.transport.sent).toEqual([]);
   });
 
   it("a reconnect to a vault without delete_batch re-sends the in-flight batch as single deletes", async () => {

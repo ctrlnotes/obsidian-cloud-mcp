@@ -31,7 +31,8 @@ const change: fc.Arbitrary<Change> = fc
   });
 const queue = fc.array(change, { maxLength: 30 });
 const limits: fc.Arbitrary<BatchLimits> = fc.record({
-  maxOps: fc.integer({ min: 2, max: 12 }),
+  // 0 is a vault that batches deletes only.
+  maxOps: fc.oneof(fc.constant(0), fc.integer({ min: 2, max: 12 })),
   maxBytes: fc.integer({ min: 1, max: 2 * PUT_CHUNK_BYTES }),
   // 0 is a vault that batches puts and predates `delete_batch`.
   maxDeleteOps: fc.oneof(fc.constant(0), fc.integer({ min: 2, max: 12 })),
@@ -49,6 +50,7 @@ const fits = (taken: readonly Change[], c: Change, l: BatchLimits): boolean => {
   if (c.op === "delete") return l.maxDeleteOps >= 2;
   return (
     c.op === "put" &&
+    l.maxOps >= 2 &&
     c.content.byteLength <= PUT_CHUNK_BYTES &&
     taken.reduce((sum, t) => sum + bytesOf(t), 0) + c.content.byteLength <= l.maxBytes
   );

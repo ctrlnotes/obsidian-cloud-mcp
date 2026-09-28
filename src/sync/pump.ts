@@ -85,6 +85,14 @@ export interface PumpDeps {
    * landing (`Down::Applied.seq`) — see `handleDown`'s `applied` branch for why the last one
    * counts too: the vault will not send this device's own write back as a further event. */
   readonly onCursor: (seq: number) => void;
+  /**
+   * Make everything `onApplied` and `onCursor` recorded durable, now. Called **once** per
+   * inbound flush or snapshot — after its last `onApplied` and its `onCursor`, and **before
+   * its ack is sent** — so an ack never claims a position this device has not persisted, and
+   * a batch of events costs one write rather than one per file. Absent, nothing is persisted
+   * here (the caller persists as it records).
+   */
+  readonly persist?: () => void;
   /** A push came back refused — `retry.ts` is what classifies it; this file only reports it. */
   readonly onRefused?: (refused: DownRefused) => void;
   readonly attachments?: DeriveOptions["attachments"];
@@ -362,7 +370,15 @@ export class Pump {
    * fit one frame.
    */
   private sendBatch(changes: readonly Change[]): void {
-    if (changes[0]?.op === "delete") {
+    // Never drop an entry in silence: one of another kind would be left in flight with no
+    // answer ever naming it. `planBatch` never mixes kinds, so this is a bug if it throws —
+    // and `trySend` rejects every head rather than send part of them.
+    const kind = changes[0]?.op;
+    const stray = changes.find((c) => c.op !== kind);
+    if (stray !== undefined) {
+      throw new Error(`Ctrl Notes: a ${kind ?? "empty"} batch cannot carry a ${stray.op}`);
+    }
+    if (kind === "delete") {
       const deletes = changes.flatMap((c) => (c.op === "delete" ? [c] : []));
       this.deps.transport.send({
         type: "delete_batch",
@@ -528,10 +544,12 @@ export class Pump {
     // Never at or past an event still outstanding, however well this batch
     // went. `outstanding`'s own comment says what acking past one costs.
     const floor = this.outstanding.size === 0 ? null : Math.min(...this.outstanding);
-    if (ackThrough !== null && (floor === null || ackThrough < floor)) {
-      this.deps.onCursor(ackThrough);
-      this.ack(ackThrough);
-    }
+    const acking = ackThrough !== null && (floor === null || ackThrough < floor);
+    if (acking) this.deps.onCursor(ackThrough);
+    // Once for the whole flush, and before the ack: an ack past what is persisted is a
+    // resume point a crash cannot back up.
+    this.deps.persist?.();
+    if (acking) this.ack(ackThrough);
     this.requestResync();
   }
 
@@ -602,7 +620,9 @@ export class Pump {
     );
     const { applied, complete, threw } = await applySnapshot(
       this.deps.vault,
-      this.deps.ledger(),
+      // A copy: the ledger is updated in place as paths apply, and the snapshot is planned
+      // and guarded against the ledger as it stood when it began.
+      { ...this.deps.ledger() },
       files,
       {
         fetchBytes: this.deps.fetchBytes,
@@ -645,8 +665,10 @@ export class Pump {
       this.outstanding.clear();
       for (const path of giveUp) this.localFailures.delete(path);
       this.deps.onCursor(down.seq);
-      this.ack(down.seq);
     }
+    // `flushEvents`' rule: one write, before the ack.
+    this.deps.persist?.();
+    if (complete) this.ack(down.seq);
   }
 
   private ack(seq: number): void {
