@@ -65,7 +65,7 @@ import {
   PRODUCT_NAME,
   type SettingsHost,
 } from "./settings-tab.ts";
-import { type Applied, pullIfUnchanged, type VaultFiles } from "./sync/apply.ts";
+import { type Applied, type FetchResult, pullIfUnchanged, type VaultFiles } from "./sync/apply.ts";
 import { batchLimitsFrom } from "./sync/batch.ts";
 import { type Change, deriveChanges, type ReadableFiles, syncablePath } from "./sync/derive.ts";
 import { Fetcher } from "./sync/fetcher.ts";
@@ -1348,6 +1348,14 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
           }
           if (decided.wake) this.wake();
         },
+        // Any socket going away, whatever the reason and however it retries. Its `want`s and
+        // its `snapshot` request will never be answered: fail the fetches as transient now
+        // rather than at their silence timeout, and let the pump ask for a snapshot again on
+        // the next `ready` — a request lost with its socket used to block every later one.
+        onDisconnected: () => {
+          fetcher.reset("disconnected");
+          pump.connectionLost();
+        },
       },
       this.syncState.cursor,
     );
@@ -1402,6 +1410,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       transport,
       vault: this.vaultFiles(),
       fetchBytes: (sha) => this.fetchBytes(sha),
+      fetchMany: (shas) => this.fetchMany(shas),
       ledger: () => this.syncState.hashes,
       onApplied: (applied) => this.recordApplied(applied),
       onCursor: (seq) => this.advanceCursor(seq),
@@ -1668,6 +1677,26 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     return got.ok
       ? { ok: true, value: got.bytes }
       : { ok: false, code: got.reason, permanent: got.permanent };
+  }
+
+  /** {@link fetchBytes} for several shas, as few `want`s as the wire allows (`Fetcher.wantMany`). */
+  private async fetchMany(shas: readonly string[]): Promise<ReadonlyMap<string, FetchResult>> {
+    const answers = new Map<string, FetchResult>();
+    const fetcher = this.fetcher;
+    if (fetcher === null) {
+      for (const sha of shas)
+        answers.set(sha, { ok: false, code: "no_connection", permanent: false });
+      return answers;
+    }
+    for (const [sha, got] of await fetcher.wantMany(shas)) {
+      answers.set(
+        sha,
+        got.ok
+          ? { ok: true, value: got.bytes }
+          : { ok: false, code: got.reason, permanent: got.permanent },
+      );
+    }
+    return answers;
   }
 
   private advanceCursor(seq: number): void {

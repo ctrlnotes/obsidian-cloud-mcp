@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { Up } from "../wire.ts";
+import { MAX_WANT_SHAS, type Up } from "../wire.ts";
 import { Fetcher } from "./fetcher.ts";
 
 const sent: Up[] = [];
@@ -143,12 +143,113 @@ describe("Fetcher", () => {
   });
 
   it("never sends more shas than the protocol allows in one want", () => {
-    // Slice one sends one at a time; this pins that the call shape cannot
-    // silently grow past the wire's own bound.
+    // The vault closes a connection whose `want` names more than this, rather
+    // than truncating — so the bound is enforced here, not trusted.
     const f = make();
-    void f.want("only");
+    void f.wantMany(Array.from({ length: MAX_WANT_SHAS * 2 + 5 }, (_, i) => `s${i}`));
     const [first] = sent;
-    expect(first?.type).toBe("want");
-    expect(first?.type === "want" && first.shas.length).toBeLessThanOrEqual(64);
+    expect(first?.type === "want" && first.shas.length).toBe(MAX_WANT_SHAS);
+  });
+});
+
+describe("Fetcher.wantMany — several shas per round trip", () => {
+  /** Answer the want at the head of `sent`: bytes for a sha in `have`, `no_blob` otherwise. */
+  const answer = (f: Fetcher, want: Up | undefined, have: Record<string, number[]>) => {
+    if (want?.type !== "want") throw new Error(`expected a want, got ${want?.type}`);
+    for (const sha of want.shas) {
+      const bytes = have[sha];
+      if (bytes === undefined) {
+        f.onFrame({ type: "no_blob", sha, reason: "unknown" });
+        continue;
+      }
+      f.onFrame({ type: "blob", sha, bytes: bytes.length });
+      if (bytes.length > 0) f.onBytes(new Uint8Array(bytes));
+    }
+  };
+
+  it("asks for every sha in one want, and maps each answer back to its sha", async () => {
+    const f = make();
+    const p = f.wantMany(["a", "gone", "b", "empty"]);
+    expect(sent).toEqual([{ type: "want", shas: ["a", "gone", "b", "empty"] }]);
+    answer(f, sent[0], { a: [1], b: [2, 3], empty: [] });
+    const got = await p;
+    expect(got.get("a")).toEqual({ ok: true, bytes: new Uint8Array([1]) });
+    expect(got.get("b")).toEqual({ ok: true, bytes: new Uint8Array([2, 3]) });
+    expect(got.get("empty")).toEqual({ ok: true, bytes: new Uint8Array(0) });
+    // A sha the vault does not have is an answer, and a PERMANENT one.
+    expect(got.get("gone")).toEqual({ ok: false, permanent: true, reason: "unknown" });
+    expect(got.size).toBe(4);
+  });
+
+  it("splits a long list into bounded wants, one outstanding at a time", async () => {
+    const f = new Fetcher({
+      send: (up) => {
+        sent.push(up);
+        return true;
+      },
+      timeoutMs: 50,
+      maxShas: 2,
+    });
+    sent.length = 0;
+    const p = f.wantMany(["a", "b", "c", "d", "e"]);
+    // Only the first is sent: the answers carry no id, so two in flight could not be told apart.
+    expect(sent).toEqual([{ type: "want", shas: ["a", "b"] }]);
+    answer(f, sent[0], { a: [1], b: [2] });
+    await Promise.resolve();
+    expect(sent[1]).toEqual({ type: "want", shas: ["c", "d"] });
+    answer(f, sent[1], { c: [3] });
+    await Promise.resolve();
+    expect(sent[2]).toEqual({ type: "want", shas: ["e"] });
+    answer(f, sent[2], { e: [5] });
+    const got = await p;
+    expect([...got.keys()].sort()).toEqual(["a", "b", "c", "d", "e"]);
+    expect(got.get("d")).toMatchObject({ ok: false, permanent: true });
+    expect(got.get("e")).toEqual({ ok: true, bytes: new Uint8Array([5]) });
+  });
+
+  it("never asks past the wire's bound, whatever it is configured with", () => {
+    sent.length = 0;
+    const f = new Fetcher({
+      send: (up) => {
+        sent.push(up);
+        return true;
+      },
+      maxShas: 10_000,
+    });
+    void f.wantMany(Array.from({ length: 500 }, (_, i) => `s${i}`));
+    expect(sent[0]?.type === "want" && sent[0].shas.length).toBe(MAX_WANT_SHAS);
+    f.reset();
+  });
+
+  it("asks for a repeated sha once", async () => {
+    const f = make();
+    const p = f.wantMany(["a", "a", "b"]);
+    expect(sent).toEqual([{ type: "want", shas: ["a", "b"] }]);
+    answer(f, sent[0], { a: [1], b: [2] });
+    expect((await p).size).toBe(2);
+  });
+
+  it("fails what is unanswered as TRANSIENT on a disconnect, keeping what already arrived", async () => {
+    const f = make();
+    const p = f.wantMany(["a", "b"]);
+    f.onFrame({ type: "blob", sha: "a", bytes: 1 });
+    f.onBytes(new Uint8Array([1]));
+    f.reset("disconnected");
+    const got = await p;
+    expect(got.get("a")).toEqual({ ok: true, bytes: new Uint8Array([1]) });
+    expect(got.get("b")).toEqual({ ok: false, permanent: false, reason: "disconnected" });
+  });
+
+  it("times out on silence, not on a batch's length: progress re-arms the timer", async () => {
+    // Each answer lands inside the timeout, and the whole batch takes longer than it.
+    const f = make(); // timeoutMs: 50
+    const p = f.wantMany(["a", "b", "c"]);
+    for (const sha of ["a", "b", "c"]) {
+      await new Promise((r) => setTimeout(r, 30));
+      f.onFrame({ type: "blob", sha, bytes: 1 });
+      f.onBytes(new Uint8Array([1]));
+    }
+    const got = await p;
+    expect([...got.values()].every((g) => g.ok)).toBe(true);
   });
 });

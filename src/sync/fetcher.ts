@@ -13,6 +13,7 @@
 // `apply.ts` for what each one does to the cursor.
 
 import type { Down, Up } from "../wire.ts";
+import { MAX_WANT_SHAS } from "../wire.ts";
 
 /** What one fetch produced. */
 export type Fetched =
@@ -43,8 +44,14 @@ interface Pending {
 export interface FetcherDeps {
   /** Send one `Up` frame. Returns false when there is no live socket. */
   readonly send: (up: Up) => boolean;
-  /** Milliseconds before an unanswered request gives up. */
+  /**
+   * Milliseconds of SILENCE before an outstanding request gives up: re-armed by
+   * every header and binary frame the request consumes, so a long batch that
+   * is still arriving is never failed for its length alone.
+   */
   readonly timeoutMs?: number;
+  /** The most shas one `want` names. Defaults to, and may not exceed, {@link MAX_WANT_SHAS}. */
+  readonly maxShas?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -54,27 +61,47 @@ export class Fetcher {
   private queue: Array<{ start: () => void; fail: (reason: string) => void }> = [];
   private timer: number | null = null;
 
-  constructor(private readonly deps: FetcherDeps) {}
+  private readonly maxShas: number;
+
+  constructor(private readonly deps: FetcherDeps) {
+    this.maxShas = Math.max(1, Math.min(deps.maxShas ?? MAX_WANT_SHAS, MAX_WANT_SHAS));
+  }
+
+  /** Ask for one sha — {@link wantMany} with a list of one. */
+  async want(sha: string): Promise<Fetched> {
+    const answers = await this.wantMany([sha]);
+    return answers.get(sha) ?? { ok: false, permanent: false, reason: "no_answer" };
+  }
 
   /**
-   * Ask for one sha.
+   * Ask for several shas, as few `want` frames as the wire allows: at most
+   * {@link MAX_WANT_SHAS} per frame, one frame in flight at a time. Every sha
+   * asked for has an entry in the answer; duplicates are asked for once.
    *
-   * **One sha per request, and that is a measured choice rather than a
-   * simplification.** The wire takes a list (`MAX_WANT_SHAS`) and this could
-   * batch. Measured 2026-08-28 against a 250-file first sync: batch 1 was
-   * **48 ms/file and completed**; batch 16 was 366 ms/file and STALLED at 238
-   * files; batch 64 was 443 ms/file and stalled at 190. Batching made it nearly
-   * ten times slower and stopped it finishing at all.
-   *
-   * The reason is the one §7.3 measured: at 48 ms/file the round trip is not
-   * the bottleneck — per-file cost is server work — so batching buys nothing
-   * and costs contiguous multi-blob bursts that block the event flow sharing
-   * that socket. The list stays on the wire because it is free and because a
-   * future transport may want it; nothing sends more than one today.
+   * **Batched, reversing an earlier measured choice.** One sha per request
+   * was chosen when a 250-file first sync measured 48 ms/file one at a time,
+   * while batches of 16 and 64 were slower and stalled. What stalled them was
+   * not pinned down; one candidate is gone — the timeout then bounded a whole
+   * request, and now measures silence. What has been measured since is the
+   * cost of NOT batching: a device catching up on a bulk change fetched about
+   * 3,600 paths at roughly 6.5 per second, one per round trip, so slowly that
+   * its snapshot could not finish before the vault closed the connection for
+   * 1,000 unacknowledged events — and under the ack rule (`pump.ts`'s
+   * `outstanding`) it acked nothing until a snapshot finished, so it looped.
    */
-  async want(sha: string): Promise<Fetched> {
-    const answers = await this.request([sha]);
-    return answers.get(sha) ?? { ok: false, permanent: false, reason: "no_answer" };
+  async wantMany(shas: readonly string[]): Promise<Map<string, Fetched>> {
+    const unique = [...new Set(shas)];
+    const answers = new Map<string, Fetched>();
+    const requests: Promise<Map<string, Fetched>>[] = [];
+    for (let at = 0; at < unique.length; at += this.maxShas) {
+      // Queued together, sent one after another: `request` holds one `want`
+      // outstanding and starts the next when the last answer lands.
+      requests.push(this.request(unique.slice(at, at + this.maxShas)));
+    }
+    for (const got of await Promise.all(requests)) {
+      for (const [sha, fetched] of got) answers.set(sha, fetched);
+    }
+    return answers;
   }
 
   /** One `want` naming `shas`, resolved when every one has been answered. */
@@ -97,18 +124,7 @@ export class Fetcher {
           got: new Map(),
           settle: resolve,
         };
-        this.timer = window.setTimeout(() => {
-          const p = this.pending;
-          this.clearTimer();
-          this.pending = null;
-          if (p !== null) {
-            for (const s of p.expect) {
-              p.got.set(s, { ok: false, permanent: false, reason: "timeout" });
-            }
-            p.settle(p.got);
-          }
-          this.next();
-        }, this.deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+        this.armTimer();
       };
       if (this.pending === null) start();
       else this.queue.push({ start, fail });
@@ -137,6 +153,7 @@ export class Fetcher {
       return true;
     }
     p.current = { sha: down.sha, want: down.bytes, chunks: [], got: 0 };
+    this.armTimer();
     return true;
   }
 
@@ -149,7 +166,10 @@ export class Fetcher {
     const c = p.current;
     c.chunks.push(bytes);
     c.got += bytes.byteLength;
-    if (c.got < c.want) return true;
+    if (c.got < c.want) {
+      this.armTimer();
+      return true;
+    }
 
     p.expect.shift();
     p.current = null;
@@ -202,7 +222,11 @@ export class Fetcher {
 
   private maybeDone(): void {
     const p = this.pending;
-    if (p === null || p.expect.length > 0) return;
+    if (p === null) return;
+    if (p.expect.length > 0) {
+      this.armTimer(); // An answer landed: progress, so the silence starts again.
+      return;
+    }
     this.clearTimer();
     this.pending = null;
     p.settle(p.got);
@@ -212,6 +236,23 @@ export class Fetcher {
   private next(): void {
     const n = this.queue.shift();
     if (n !== undefined) n.start();
+  }
+
+  /** (Re)start the silence timer for the outstanding request. */
+  private armTimer(): void {
+    this.clearTimer();
+    this.timer = window.setTimeout(() => {
+      const p = this.pending;
+      this.timer = null;
+      this.pending = null;
+      if (p !== null) {
+        for (const s of p.expect) {
+          p.got.set(s, { ok: false, permanent: false, reason: "timeout" });
+        }
+        p.settle(p.got);
+      }
+      this.next();
+    }, this.deps.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   }
 
   private clearTimer(): void {

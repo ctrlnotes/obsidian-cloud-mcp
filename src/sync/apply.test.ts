@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { DownEvent, SnapshotEntry } from "../wire.ts";
+import { type DownEvent, MAX_WANT_SHAS, type SnapshotEntry } from "../wire.ts";
 import {
   type ApplyDeps,
   applyReplay,
@@ -1278,5 +1278,187 @@ describe("pullIfUnchanged — the vault's version after a merged push", () => {
     );
     expect(r).toBe("moved-on");
     expect(vault.text("n.md")).toBe("edited again\n");
+  });
+});
+
+/**
+ * A catch-up asks for many shas per round trip (`ApplyDeps.fetchMany`). Measured before
+ * this: one path per round trip, ~6.5 a second, so a snapshot of ~3,600 changed paths
+ * could not finish before the vault closed the connection — and it looped.
+ */
+describe("a catch-up fetches many shas per round trip", () => {
+  /** `fetcherFor`, plus a `fetchMany` over the same content that records every call. */
+  const batching = (content: Record<string, Uint8Array>) => {
+    const single: string[] = [];
+    const many: string[][] = [];
+    const answer = (sha: string) => {
+      const value = content[sha];
+      return value
+        ? { ok: true as const, value }
+        : { ok: false as const, code: "unknown", permanent: true };
+    };
+    const deps: ApplyDeps = {
+      fetchBytes: (sha) => {
+        single.push(sha);
+        return Promise.resolve(answer(sha));
+      },
+      fetchMany: (shas) => {
+        many.push([...shas]);
+        return Promise.resolve(new Map(shas.map((s) => [s, answer(s)])));
+      },
+    };
+    return { deps, single, many };
+  };
+
+  const notes = async (n: number) => {
+    const content: Record<string, Uint8Array> = {};
+    const files: SnapshotEntry[] = [];
+    for (let i = 0; i < n; i++) {
+      const bytes = utf8(`note ${i}\n`);
+      const sha = await bytesHash(bytes);
+      content[sha] = bytes;
+      files.push({ path: `n/${String(i).padStart(4, "0")}.md`, sha });
+    }
+    return { content, files };
+  };
+
+  it("asks for a snapshot's notes in one want, not one per path, and writes each byte-exact", async () => {
+    const { content, files } = await notes(10);
+    const vault = fakeVault();
+    const b = batching(content);
+    const { applied, complete } = await applySnapshot(vault, {}, files, b.deps);
+    expect(b.many).toHaveLength(1);
+    expect(new Set(b.many[0])).toEqual(new Set(files.map((f) => f.sha)));
+    expect(b.single).toEqual([]);
+    expect(complete).toBe(true);
+    for (const f of files) {
+      expect(await bytesHash(vault.files.get(f.path) as Uint8Array)).toBe(f.sha);
+    }
+    expect(applied).toHaveLength(10);
+  });
+
+  it("never asks for more than one want's worth at a time", async () => {
+    const { content, files } = await notes(MAX_WANT_SHAS * 2 + 3);
+    const b = batching(content);
+    const { complete } = await applySnapshot(fakeVault(), {}, files, b.deps);
+    expect(complete).toBe(true);
+    expect(b.many.map((m) => m.length)).toEqual([MAX_WANT_SHAS, MAX_WANT_SHAS, 3]);
+  });
+
+  it("maps a sha the vault does not have back to its path, and still completes", async () => {
+    const { content, files } = await notes(3);
+    const lost = { path: "lost.md", sha: "e".repeat(64) };
+    const unavailable: [string, string][] = [];
+    const b = batching(content);
+    const { complete } = await applySnapshot(fakeVault(), {}, [...files, lost], {
+      ...b.deps,
+      onUnavailable: (p, r) => unavailable.push([p, r]),
+    });
+    expect(unavailable).toEqual([["lost.md", "unknown"]]);
+    expect(complete).toBe(true);
+    expect(b.single).toEqual([]);
+  });
+
+  it("asks only for what the disk lacks: a path already in step is not fetched", async () => {
+    const { content, files } = await notes(3);
+    const [held] = files as [SnapshotEntry];
+    const vault = fakeVault();
+    vault.files.set(held.path, content[held.sha] as Uint8Array);
+    const b = batching(content);
+    await applySnapshot(vault, { [held.path]: held.sha }, files, b.deps);
+    expect(b.many[0]).not.toContain(held.sha);
+    expect(b.many[0]).toHaveLength(2);
+  });
+
+  it("fetches an attachment alone, since nothing says how large it is", async () => {
+    const img = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const imgSha = await bytesHash(img);
+    const { content, files } = await notes(2);
+    const b = batching({ ...content, [imgSha]: img });
+    const { complete } = await applySnapshot(
+      fakeVault(),
+      {},
+      [...files, { path: "a/img.png", sha: imgSha }],
+      b.deps,
+      { attachments: true },
+    );
+    expect(complete).toBe(true);
+    expect(b.many.flat()).not.toContain(imgSha);
+    expect(b.single).toEqual([imgSha]);
+  });
+
+  it("still refuses batched bytes that do not hash to their sha", async () => {
+    const { content, files } = await notes(2);
+    const [bad] = files as [SnapshotEntry];
+    const vault = fakeVault();
+    const b = batching({ ...content, [bad.sha]: utf8("not what was asked for\n") });
+    const { complete } = await applySnapshot(vault, {}, files, b.deps);
+    expect(vault.files.has(bad.path)).toBe(false);
+    expect(complete).toBe(false);
+  });
+
+  it("keeps a save made while the batch was in flight (PL9), and uploads it", async () => {
+    const { content, files } = await notes(3);
+    const [edited] = files as [SnapshotEntry];
+    const vault = fakeVault();
+    const kept: string[] = [];
+    const b = batching(content);
+    const deps: ApplyDeps = {
+      ...b.deps,
+      fetchMany: async (shas) => {
+        // The user creates the file while the batch is on the wire.
+        await vault.writeBinary(edited.path, utf8("mine\n"));
+        return (b.deps.fetchMany as NonNullable<ApplyDeps["fetchMany"]>)(shas);
+      },
+      ledger: () => ({}),
+      onKept: (p) => kept.push(p),
+    };
+    const { complete } = await applySnapshot(vault, {}, files, deps);
+    expect(vault.text(edited.path)).toBe("mine\n");
+    expect(kept).toEqual([edited.path]);
+    expect(complete).toBe(true);
+  });
+
+  it("falls back to one fetch per path when the batch itself throws", async () => {
+    const { content, files } = await notes(3);
+    const b = batching(content);
+    const { complete } = await applySnapshot(fakeVault(), {}, files, {
+      ...b.deps,
+      fetchMany: () => Promise.reject(new Error("socket gone")),
+    });
+    expect(complete).toBe(true);
+    expect(b.single).toHaveLength(3);
+  });
+
+  it("asks for a replay's puts in one want, skipping one the ledger already names", async () => {
+    const { content, files } = await notes(4);
+    const [echo] = files as [SnapshotEntry];
+    const vault = fakeVault();
+    vault.files.set(echo.path, content[echo.sha] as Uint8Array);
+    const b = batching(content);
+    const { ackThrough, blocked } = await applyReplay(
+      vault,
+      files.map((f, i) => putEvent({ path: f.path, sha: f.sha, seq: i + 1 })),
+      { ...b.deps, ledger: () => ({ [echo.path]: echo.sha }) },
+    );
+    expect(b.many).toEqual([files.slice(1).map((f) => f.sha)]);
+    expect(b.single).toEqual([]);
+    expect(ackThrough).toBe(4);
+    expect(blocked).toEqual([]);
+  });
+
+  it("does not overwrite an unpushed edit in a batched replay (PL8)", async () => {
+    const { content, files } = await notes(2);
+    const [held] = files as [SnapshotEntry];
+    const vault = fakeVault({ [held.path]: "my edit\n" });
+    const kept: string[] = [];
+    const b = batching(content);
+    await applyReplay(
+      vault,
+      files.map((f, i) => putEvent({ path: f.path, sha: f.sha, seq: i + 1 })),
+      { ...b.deps, ledger: () => ({ [held.path]: "0".repeat(64) }), onKept: (p) => kept.push(p) },
+    );
+    expect(vault.text(held.path)).toBe("my edit\n");
+    expect(kept).toEqual([held.path]);
   });
 });

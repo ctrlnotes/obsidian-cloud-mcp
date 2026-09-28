@@ -1,4 +1,5 @@
 import type { DownEvent, SnapshotEntry } from "../wire.ts";
+import { MAX_WANT_SHAS } from "../wire.ts";
 import type { DeriveOptions } from "./derive.ts";
 import { bytesHash } from "./hash.ts";
 import { planSnapshot } from "./reconcile.ts";
@@ -59,6 +60,50 @@ export interface Applied {
   readonly hash: string | null;
 }
 
+/** One fetch's answer: the bytes, or why not and whether waiting could change that. */
+export type FetchResult =
+  | { ok: true; value: Uint8Array }
+  | { ok: false; code: string; permanent?: boolean };
+
+/**
+ * How many paths a catch-up works through per window, and so the most shas one prefetch
+ * asks for — one `want` frame's worth. It also bounds what a window holds in memory.
+ */
+const FETCH_WINDOW = MAX_WANT_SHAS;
+
+/**
+ * Whether a path's content is worth asking for alongside others. **Notes only.** Nothing
+ * says how large a blob is before it arrives, and an attachment may be as large as the
+ * vault's frame bound: a window of them would hold hundreds of megabytes before the first
+ * was written. An attachment is fetched alone, when its turn comes, as it always was.
+ */
+const batchable = (path: string): boolean => classifyPath(path) === "text";
+
+/**
+ * `deps`, with `shas` already asked for in one round trip: its `fetchBytes` answers from
+ * that reply and asks the vault only for what the reply lacks. Unchanged when there is
+ * nothing to ask for, or no `fetchMany` to ask with. A prefetch that throws is logged and
+ * ignored — every fetch then goes out singly, exactly as without it.
+ */
+const withPrefetched = async (deps: ApplyDeps, shas: readonly string[]): Promise<ApplyDeps> => {
+  const unique = [...new Set(shas)];
+  if (deps.fetchMany === undefined || unique.length === 0) return deps;
+  let got: ReadonlyMap<string, FetchResult>;
+  try {
+    got = await deps.fetchMany(unique);
+  } catch (e) {
+    console.warn("Ctrl Notes: a batched fetch failed; fetching one at a time", e);
+    return deps;
+  }
+  return {
+    ...deps,
+    fetchBytes: (sha) => {
+      const hit = got.get(sha);
+      return hit === undefined ? deps.fetchBytes(sha) : Promise.resolve(hit);
+    },
+  };
+};
+
 /**
  * How the bytes a `sha` names are obtained.
  *
@@ -77,9 +122,15 @@ export interface ApplyDeps {
    * abandons content it could still have had, and BOTH failure modes are ones
    * this file's ack boundary would otherwise turn into a stuck cursor.
    */
-  fetchBytes(
-    sha: string,
-  ): Promise<{ ok: true; value: Uint8Array } | { ok: false; code: string; permanent?: boolean }>;
+  fetchBytes(sha: string): Promise<FetchResult>;
+  /**
+   * {@link fetchBytes} for several shas in one round trip — an answer for every sha asked
+   * for, with the same meaning. **Optional, and only ever an optimisation**: a catch-up
+   * asks for a window's content up front through this, and every write still goes through
+   * {@link fetchAndWrite} — the hash check, the last-moment re-read and the keep rules
+   * unchanged — which falls back to `fetchBytes` for anything the answer lacks.
+   */
+  fetchMany?(shas: readonly string[]): Promise<ReadonlyMap<string, FetchResult>>;
   /**
    * One file has landed on disk. Called IMMEDIATELY, not at the end of the batch.
    *
@@ -676,30 +727,51 @@ export const applyReplay = async (
   const blocked: number[] = [];
   const threw = new Map<number, string>();
 
-  for (const event of events) {
-    let outcome: EventOutcome;
-    try {
-      outcome = await applyEvent(vault, event, deps);
-    } catch (e) {
-      console.warn(`Ctrl Notes: could not apply an inbound ${event.kind} at ${event.path}`, e);
-      isBlocked = true;
-      blocked.push(event.seq);
-      threw.set(event.seq, event.path);
-      continue;
+  for (let at = 0; at < events.length; at += FETCH_WINDOW) {
+    const slice = events.slice(at, at + FETCH_WINDOW);
+    // Ask for the window's content up front, one round trip instead of one per event.
+    // A prediction, not a decision: `applyEvent` still decides every event exactly as it
+    // would without it, and a sha asked for and not used costs only bandwidth. Left out:
+    // a path that already holds the sha (most often this device's own write echoed back)
+    // and one holding an unpushed edit, which is kept without any fetch — asking for
+    // either would make that event wait on a round trip it never needed.
+    const wanted: string[] = [];
+    for (const e of slice) {
+      if (e.kind !== "put" || e.sha === null || !batchable(e.path)) continue;
+      try {
+        const local = await heldLocally(vault, e.path, deps);
+        if (local.hash !== e.sha && !local.held) wanted.push(e.sha);
+      } catch {
+        // Unreadable now: `applyEvent` meets the same refusal and reports it.
+      }
     }
-    if (outcome.status === "applied") {
-      applied.push(outcome.result);
-      if (outcome.also !== undefined) applied.push(outcome.also);
+    const windowDeps = await withPrefetched(deps, wanted);
+
+    for (const event of slice) {
+      let outcome: EventOutcome;
+      try {
+        outcome = await applyEvent(vault, event, windowDeps);
+      } catch (e) {
+        console.warn(`Ctrl Notes: could not apply an inbound ${event.kind} at ${event.path}`, e);
+        isBlocked = true;
+        blocked.push(event.seq);
+        threw.set(event.seq, event.path);
+        continue;
+      }
+      if (outcome.status === "applied") {
+        applied.push(outcome.result);
+        if (outcome.also !== undefined) applied.push(outcome.also);
+      }
+      if (outcome.status === "unavailable") {
+        isBlocked = true;
+        blocked.push(event.seq);
+        continue;
+      }
+      // `"gone"` deliberately does NOT block. See `EventOutcome`: the content is
+      // unrecoverable, so withholding the ack stalls this device forever rather
+      // than buying a later retry that could succeed.
+      if (!isBlocked) ackThrough = event.seq;
     }
-    if (outcome.status === "unavailable") {
-      isBlocked = true;
-      blocked.push(event.seq);
-      continue;
-    }
-    // `"gone"` deliberately does NOT block. See `EventOutcome`: the content is
-    // unrecoverable, so withholding the ack stalls this device forever rather
-    // than buying a later retry that could succeed.
-    if (!isBlocked) ackThrough = event.seq;
   }
 
   return { applied, ackThrough, blocked, threw };
@@ -790,42 +862,63 @@ export const applySnapshot = async (
     }
   }
 
-  for (const path of fetch) {
-    const sha = shaOf.get(path);
-    if (sha === undefined) continue; // planSnapshot only ever names a path `files` has.
-    try {
-      const local = await heldLocally(vault, path, guarded);
-      if (local.hash === sha) {
-        // Already holds exactly this version — only the ledger was behind.
-        const same = { path, hash: sha };
-        deps.onApplied?.(same);
-        applied.push(same);
-        continue;
+  for (let at = 0; at < fetch.length; at += FETCH_WINDOW) {
+    // Per window of paths, in three steps: what each path holds now, one round trip for
+    // everything the window must fetch, then the writes. **Each write still re-reads its
+    // path at the last moment** (`fetchAndWrite`'s `expect`), so a save made anywhere in
+    // this window — before, during or after the batched fetch — is kept, never overwritten.
+    const toFetch: { path: string; sha: string; hash: OnDisk }[] = [];
+    for (const path of fetch.slice(at, at + FETCH_WINDOW)) {
+      const sha = shaOf.get(path);
+      if (sha === undefined) continue; // planSnapshot only ever names a path `files` has.
+      try {
+        const local = await heldLocally(vault, path, guarded);
+        if (local.hash === sha) {
+          // Already holds exactly this version — only the ledger was behind.
+          const same = { path, hash: sha };
+          deps.onApplied?.(same);
+          applied.push(same);
+          continue;
+        }
+        if (local.held) {
+          // Its ledger entry stays the base it was edited from, so the upload
+          // merges against exactly that — never "incomplete": waiting cannot
+          // change it, and the upload is what resolves it.
+          keep(path, "overwriting it with a snapshot's version", guarded);
+          continue;
+        }
+        toFetch.push({ path, sha, hash: local.hash });
+      } catch (e) {
+        console.warn(`Ctrl Notes: could not apply the snapshot's content for ${path}`, e);
+        refused(path, e);
       }
-      if (local.held) {
-        // Its ledger entry stays the base it was edited from, so the upload
-        // merges against exactly that — never "incomplete": waiting cannot
-        // change it, and the upload is what resolves it.
-        keep(path, "overwriting it with a snapshot's version", guarded);
-        continue;
+    }
+
+    const windowDeps = await withPrefetched(
+      deps,
+      toFetch.filter((f) => batchable(f.path)).map((f) => f.sha),
+    );
+
+    for (const { path, sha, hash } of toFetch) {
+      try {
+        const result = await fetchAndWrite(vault, path, sha, windowDeps, hash);
+        if (result === "moved-on") {
+          keep(path, "overwriting a save made while the snapshot's version was fetched", guarded);
+          continue;
+        }
+        if (result === "gone") {
+          // Permanently absent. `complete` means "this device matches the
+          // snapshot as well as it ever can", and a blob the vault says is gone
+          // is matched: withholding the ack here is what turns one lost file
+          // into a device that re-snapshots forever. `fetchAndWrite` has already
+          // told `onUnavailable` which path it was (O3).
+          console.warn(`Ctrl Notes: the vault will never supply ${path}; continuing without it`);
+        } else if (result !== null) applied.push(result);
+        else complete = false; // Fetched nothing — this device does not match the snapshot yet.
+      } catch (e) {
+        console.warn(`Ctrl Notes: could not apply the snapshot's content for ${path}`, e);
+        refused(path, e);
       }
-      const result = await fetchAndWrite(vault, path, sha, deps, local.hash);
-      if (result === "moved-on") {
-        keep(path, "overwriting a save made while the snapshot's version was fetched", guarded);
-        continue;
-      }
-      if (result === "gone") {
-        // Permanently absent. `complete` means "this device matches the
-        // snapshot as well as it ever can", and a blob the vault says is gone
-        // is matched: withholding the ack here is what turns one lost file
-        // into a device that re-snapshots forever. `fetchAndWrite` has already
-        // told `onUnavailable` which path it was (O3).
-        console.warn(`Ctrl Notes: the vault will never supply ${path}; continuing without it`);
-      } else if (result !== null) applied.push(result);
-      else complete = false; // Fetched nothing — this device does not match the snapshot yet.
-    } catch (e) {
-      console.warn(`Ctrl Notes: could not apply the snapshot's content for ${path}`, e);
-      refused(path, e);
     }
   }
 

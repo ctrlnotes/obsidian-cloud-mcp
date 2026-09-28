@@ -61,6 +61,8 @@ export interface PumpDeps {
   readonly transport: SyncTransport;
   readonly vault: VaultFiles;
   readonly fetchBytes: ApplyDeps["fetchBytes"];
+  /** Several shas per round trip, for a catch-up — `ApplyDeps.fetchMany`. */
+  readonly fetchMany?: ApplyDeps["fetchMany"];
   /** The CURRENT ledger, read fresh every time — a snapshot arriving mid-session must diff
    * against whatever this device believes right now, not a copy taken at construction. */
   readonly ledger: () => Readonly<Record<string, string>>;
@@ -136,8 +138,20 @@ export class Pump {
    * snapshot (`requestResync`).
    */
   private readonly outstanding = new Set<number>();
-  /** A `snapshot` request is out and not yet answered — at most one at a time. */
+  /**
+   * A `snapshot` request is out on THIS connection and not yet answered — at most one at a
+   * time. **Cleared when the connection goes** ({@link connectionLost}): a request lost with
+   * its socket is never answered, and before this was cleared there it stayed set, so no
+   * later block could ask again and the blocked seqs held the cursor until a snapshot
+   * happened to arrive for some other reason.
+   */
   private resyncRequested = false;
+  /**
+   * Which connection this is, counted by {@link connectionLost}. A snapshot frame carries the
+   * epoch it arrived in, so one from a connection that has since gone neither answers a
+   * request sent on the next ({@link resyncRequested}) nor joins its pages.
+   */
+  private epoch = 0;
   /**
    * How many snapshots running a path has thrown in. Past
    * {@link Pump.MAX_LOCAL_FAILURES} it is given up on and reported, because a
@@ -179,16 +193,19 @@ export class Pump {
         this.eventQueue.push(down);
         this.scheduleFlush();
         return this.flushDone;
-      case "snapshot":
+      case "snapshot": {
         // Through the same chain as event flushes, so a snapshot never applies
         // beside a flush that is still writing — `scheduleFlush` says why
-        // overlap is unsafe.
+        // overlap is unsafe. The epoch is the one it ARRIVED in, not the one
+        // current when the chain reaches it.
+        const epoch = this.epoch;
         this.flushDone = this.flushDone
-          .then(() => this.applySnapshotFrame(down))
+          .then(() => this.applySnapshotFrame(down, epoch))
           .catch((e: unknown) => {
             console.warn("Ctrl Notes: applying a snapshot failed", e);
           });
         return this.flushDone;
+      }
       case "applied":
       case "refused":
         this.settlePush(down);
@@ -256,6 +273,22 @@ export class Pump {
   resume(): void {
     this.inFlight = 0;
     this.trySend();
+    // A block from an earlier connection is still a block: ask this one for the snapshot
+    // that releases it. The vault's replay from the acked cursor may also re-deliver the
+    // blocked event, and whichever lands first releases it.
+    this.requestResync();
+  }
+
+  /**
+   * The connection this pump was driving is gone — any close, resumable or not; call it
+   * before the next `ready`. A snapshot request sent on it will never be answered, so it no
+   * longer counts as outstanding, and a half-received snapshot is dropped
+   * ({@link forgetSnapshotPages}). `resume()` on the next connection asks again.
+   */
+  connectionLost(): void {
+    this.epoch += 1;
+    this.resyncRequested = false;
+    this.snapshotPages = null;
   }
 
   /**
@@ -433,8 +466,14 @@ export class Pump {
    * connection, to get past an event this device could not apply. */
   private requestResync(): void {
     if (this.resyncRequested || this.outstanding.size === 0) return;
+    try {
+      this.deps.transport.send({ type: "snapshot" });
+    } catch (e) {
+      // No connection to ask on. Not marked requested, so the next `ready`'s `resume()` asks.
+      console.warn("Ctrl Notes: could not ask the vault for a snapshot", e);
+      return;
+    }
     this.resyncRequested = true;
-    this.deps.transport.send({ type: "snapshot" });
   }
 
   private async flushEvents(): Promise<void> {
@@ -444,6 +483,7 @@ export class Pump {
 
     const { applied, ackThrough, blocked } = await applyReplay(this.deps.vault, batch, {
       fetchBytes: this.deps.fetchBytes,
+      fetchMany: this.deps.fetchMany,
       // Per file, so the ledger is current before the host's watcher can turn
       // this device's own write into an outbound push. See `ApplyDeps`.
       onApplied: (a) => this.deps.onApplied([a]),
@@ -499,7 +539,12 @@ export class Pump {
     this.snapshotPages = null;
   }
 
-  private async applySnapshotFrame(down: DownSnapshot): Promise<void> {
+  private async applySnapshotFrame(down: DownSnapshot, epoch: number): Promise<void> {
+    // **A page from a connection that has gone is dropped, whatever it says.** Its earlier
+    // pages went with {@link connectionLost}, so a last page applied now would be a
+    // truncated authoritative list — the deletion `snapshotPages` exists to prevent. The
+    // next connection asks again (`resume`).
+    if (epoch !== this.epoch) return;
     // A page for a different `seq` supersedes whatever was being collected: the
     // two describe the vault at different moments, and a list assembled from
     // both names neither.
@@ -540,6 +585,7 @@ export class Pump {
       files,
       {
         fetchBytes: this.deps.fetchBytes,
+        fetchMany: this.deps.fetchMany,
         onApplied: (a) => this.deps.onApplied([a]),
         onUnavailable: this.deps.onUnavailable,
         onKept: this.deps.onKept,
@@ -549,8 +595,10 @@ export class Pump {
       giveUp,
     );
     this.deps.onApplied(applied);
-    // Answered, whether or not it completed: the next block may ask again.
-    this.resyncRequested = false;
+    // Answered, whether or not it completed: the next block may ask again. Unless the
+    // connection went while this applied — then a request on the next one is not answered
+    // by this.
+    if (epoch === this.epoch) this.resyncRequested = false;
     // Consecutive failures only — a path that went through this time starts
     // again from nothing.
     const failedNow = new Set(threw);
