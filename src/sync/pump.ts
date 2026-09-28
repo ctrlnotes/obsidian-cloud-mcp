@@ -13,7 +13,9 @@
 //
 // **A `put_batch` is still one frame and one answer** (bulk-ingest design BI5): consecutive
 // small puts at the head of the queue go together (`batch.ts`'s `planBatch`), and one
-// `Down::AppliedBatch` answers them all, keyed by their distinct paths.
+// `Down::AppliedBatch` answers them all, keyed by their distinct paths. **So is a
+// `delete_batch`**: consecutive deletes at the head go together, answered by the same frame
+// and settled by the same code, each entry exactly as a single `delete` would be.
 //
 // **§11: content addressing makes a retry a no-op.** A change is never removed from the
 // outbound queue until its own reply names it done — a connection dropping mid-upload
@@ -168,10 +170,10 @@ export class Pump {
 
   private readonly pending: QueuedPush[] = [];
   /** How many entries at the head of `pending` the one outstanding frame carries: 0 when
-   * nothing is in flight, 1 for a single frame, n ≥ 2 for a `put_batch` (`planBatch` never
-   * plans a batch of one). */
+   * nothing is in flight, 1 for a single frame, n ≥ 2 for a `put_batch` or `delete_batch`
+   * (`planBatch` never plans a batch of one). */
   private inFlight = 0;
-  /** What this connection's vault accepts in one `put_batch`, or `null` for no batching. Set
+  /** What this connection's vault accepts in one batch, or `null` for no batching. Set
    * from each `ready`, because a reconnect may land on a vault with different limits. */
   private limits: BatchLimits | null = null;
 
@@ -252,7 +254,7 @@ export class Pump {
   }
 
   /**
-   * What this connection's vault accepts in one `put_batch` (`batch.ts`'s `batchLimitsFrom`).
+   * What this connection's vault accepts in one batch (`batch.ts`'s `batchLimitsFrom`).
    * Call from each `ready`, BEFORE `resume()`, so the re-send of whatever was in flight is
    * planned against the vault that is actually there.
    */
@@ -353,9 +355,21 @@ export class Pump {
     }
   }
 
-  /** The header, then exactly one binary frame per entry, in order (`wire.ts`'s
-   * `UpPutBatch`) — `planBatch` admits only puts that fit one frame. */
+  /**
+   * One batch frame for `changes`, all of the head's kind (`planBatch` never mixes them). A
+   * `delete_batch` is its header alone; a `put_batch` is the header, then exactly one binary
+   * frame per entry, in order (`wire.ts`'s `UpPutBatch`) — `planBatch` admits only puts that
+   * fit one frame.
+   */
   private sendBatch(changes: readonly Change[]): void {
+    if (changes[0]?.op === "delete") {
+      const deletes = changes.flatMap((c) => (c.op === "delete" ? [c] : []));
+      this.deps.transport.send({
+        type: "delete_batch",
+        deletes: deletes.map((c) => ({ path: c.path, base_sha: c.base })),
+      });
+      return;
+    }
     const puts = changes.flatMap((c) => (c.op === "put" ? [c] : []));
     this.deps.transport.send({
       type: "put_batch",
@@ -420,9 +434,11 @@ export class Pump {
   }
 
   /**
-   * Settle every entry of the batch in flight from its one answer, by path. **An entry the
-   * answer does not name is rejected**, not left to hold the queue for good; `main.ts`
-   * redirties it. A refused entry behaves as a single `refused` does.
+   * Settle every entry of the batch in flight from its one answer, by path — a `put_batch`'s
+   * or a `delete_batch`'s alike. **An entry the answer does not name is rejected**, not left
+   * to hold the queue for good; `main.ts` redirties it. A refused entry behaves as a single
+   * `refused` does, so a delete refused over a stale base (an edit beat it) is handled as a
+   * single delete's refusal is.
    */
   private settleBatch(down: DownAppliedBatch): void {
     if (this.inFlight < 2) return; // Not an answer to anything outstanding — ignore it.

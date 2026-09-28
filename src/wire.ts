@@ -98,6 +98,13 @@ export const MAX_WANT_SHAS = 64;
  */
 export const PUT_CHUNK_BYTES = 256 * 1024;
 
+/**
+ * The most entries any `delete_batch` may carry, whatever a vault advertises: the vault's own
+ * wall, past which it closes the connection for good. {@link DownReady.max_delete_batch_ops}
+ * is the limit actually obeyed; this only caps it.
+ */
+export const MAX_DELETE_BATCH_OPS = 100;
+
 // ---- Up: plugin -> vault ----
 
 export interface UpHello {
@@ -175,7 +182,38 @@ export interface UpPutBatch {
   readonly puts: readonly BatchPutEntry[];
 }
 
-export type Up = UpHello | UpAck | UpPut | UpPutBatch | UpDelete | UpRename | UpSnapshot | UpWant;
+/** One entry of a {@link UpDeleteBatch}: exactly what a single `delete` carries, without its
+ * `type`. */
+export interface BatchDeleteEntry {
+  readonly path: string;
+  readonly base_sha: string | null;
+}
+
+/**
+ * Several deletes in one frame, answered by one {@link DownAppliedBatch} keyed by path. **Each
+ * entry stands alone**, with the same answer a single `delete` would get: a stale base is
+ * refused with the current sha, a path already gone is applied with a `null` seq.
+ *
+ * **1 to {@link MAX_DELETE_BATCH_OPS} entries, to distinct paths, and never more than the
+ * vault's `ready` advertised** — the vault closes the connection over a malformed one, for
+ * good (`retry: never`). Sent only to a vault that advertised it; one without it drops the
+ * frame in silence.
+ */
+export interface UpDeleteBatch {
+  readonly type: "delete_batch";
+  readonly deletes: readonly BatchDeleteEntry[];
+}
+
+export type Up =
+  | UpHello
+  | UpAck
+  | UpPut
+  | UpPutBatch
+  | UpDelete
+  | UpDeleteBatch
+  | UpRename
+  | UpSnapshot
+  | UpWant;
 
 /** The plugin only ever sends `Up` frames; this is the whole of that job. */
 export function encodeUp(up: Up): string {
@@ -197,6 +235,9 @@ export interface DownReady {
    * **0 means "no batching"**: a vault older than the frame sends neither. */
   readonly max_batch_ops: number;
   readonly max_batch_bytes: number;
+  /** The most entries this vault takes in one {@link UpDeleteBatch}. **0 means "send single
+   * deletes"**: a vault older than the frame does not send it, and drops the frame unread. */
+  readonly max_delete_batch_ops: number;
 }
 
 export interface DownEvent {
@@ -239,8 +280,8 @@ export interface RefusedBatchEntry {
   readonly current_sha: string | null;
 }
 
-/** The one answer to a {@link UpPutBatch} (BI5): **every entry appears in exactly one of the
- * two lists**, keyed by path. A refused entry never refuses its neighbours. */
+/** The one answer to a {@link UpPutBatch} (BI5) or a {@link UpDeleteBatch}: **every entry
+ * appears in exactly one of the two lists**, keyed by path. A refused entry never refuses its neighbours. */
 export interface DownAppliedBatch {
   readonly type: "applied_batch";
   readonly applied: readonly AppliedBatchEntry[];
@@ -436,6 +477,7 @@ export function decodeDown(raw: unknown): Down {
         seq: num(v.seq, "seq"),
         max_batch_ops: optionalNum(v.max_batch_ops, "max_batch_ops"),
         max_batch_bytes: optionalNum(v.max_batch_bytes, "max_batch_bytes"),
+        max_delete_batch_ops: optionalNum(v.max_delete_batch_ops, "max_delete_batch_ops"),
       };
     case "event":
       return {

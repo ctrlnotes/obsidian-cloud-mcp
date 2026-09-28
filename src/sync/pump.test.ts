@@ -8,13 +8,16 @@ import type {
   DownRefused,
   DownSnapshot,
   Up,
+  UpDeleteBatch,
   UpPutBatch,
 } from "../wire.ts";
 import { MAX_FRAME_BYTES, PUT_CHUNK_BYTES } from "../wire.ts";
 import type { ApplyDeps, VaultFiles } from "./apply.ts";
+import { type BatchLimits, batchLimitsFrom } from "./batch.ts";
 import type { Change } from "./derive.ts";
 import { contentHash } from "./hash.ts";
 import { Pump, type PumpDeps, type SyncTransport } from "./pump.ts";
+import { applyResult } from "./results.ts";
 import { planRetry } from "./retry.ts";
 
 const utf8 = (s: string) => new TextEncoder().encode(s);
@@ -771,7 +774,7 @@ describe("Pump — an unpushed edit is handed back, not overwritten", () => {
  * concurrency.
  */
 describe("Pump — put_batch", () => {
-  const LIMITS = { maxOps: 100, maxBytes: 4 * 1024 * 1024 };
+  const LIMITS = { maxOps: 100, maxBytes: 4 * 1024 * 1024, maxDeleteOps: 100 };
   const put = (path: string, size = 3): Change => ({
     op: "put",
     path,
@@ -981,6 +984,215 @@ describe("Pump — put_batch", () => {
     expect(() => h.pump.pushAll([put("a.md"), huge, put("b.md")])).toThrow(/MAX_FRAME_BYTES/);
     expect(h.transport.sent).toEqual([]);
     expect(h.pump.hasOutstanding()).toBe(false);
+  });
+});
+
+/**
+ * Consecutive deletes at the head of the queue leave as one `delete_batch`, against a vault
+ * whose `ready` advertised `max_delete_batch_ops`, and one `applied_batch` settles each by
+ * path exactly as a single delete's answer would. A put or a rename ends the run.
+ */
+describe("Pump — delete_batch", () => {
+  const LIMITS = { maxOps: 100, maxBytes: 4 * 1024 * 1024, maxDeleteOps: 100 };
+  const del = (path: string): Change => ({ op: "delete", path, base: `base-${path}` });
+  const put = (path: string): Change => ({
+    op: "put",
+    path,
+    base: null,
+    content: new Uint8Array(3),
+    hash: `sha-${path}`,
+  });
+  const batching = (limits: BatchLimits | null = LIMITS) => {
+    const h = harness();
+    h.pump.setBatchLimits(limits);
+    return h;
+  };
+  const deleteBatches = (h: ReturnType<typeof harness>): UpDeleteBatch[] =>
+    h.transport.sent.filter((u): u is UpDeleteBatch => u.type === "delete_batch");
+  const types = (h: ReturnType<typeof harness>) => h.transport.sent.map((u) => u.type);
+  /** Every path of the batch in flight applied, as a deletion that wrote one event each. */
+  const applyAll = (h: ReturnType<typeof harness>, paths: readonly string[], seq0 = 1) =>
+    h.pump.handleDown({
+      type: "applied_batch",
+      applied: paths.map((path, i) => ({ path, seq: seq0 + i, sha: "" })),
+      refused: [],
+    });
+
+  it("sends a run of deletes as one delete_batch, header only, each entry as a delete carries it", () => {
+    const h = batching();
+    void h.pump.pushAll([del("a.md"), del("b.md"), del("c.md")]);
+    expect(h.transport.sent).toEqual([
+      {
+        type: "delete_batch",
+        deletes: [
+          { path: "a.md", base_sha: "base-a.md" },
+          { path: "b.md", base_sha: "base-b.md" },
+          { path: "c.md", base_sha: "base-c.md" },
+        ],
+      },
+    ]);
+    expect(h.transport.binary).toEqual([]);
+  });
+
+  /** **Proven able to fail** by ignoring `maxDeleteOps` in the delete run: one batch of 250. */
+  it("never puts more entries in one batch than the vault advertised", async () => {
+    const h = batching({ ...LIMITS, maxDeleteOps: 100 });
+    const paths = Array.from({ length: 250 }, (_, i) => `n${i}.md`);
+    const done = h.pump.pushAll(paths.map(del));
+    for (let sent = 0; sent < 3; sent++) {
+      const batch = deleteBatches(h)[sent];
+      expect(batch).toBeDefined();
+      void applyAll(h, batch?.deletes.map((d) => d.path) ?? [], sent * 100);
+    }
+    await Promise.all(done);
+    expect(deleteBatches(h).map((b) => b.deletes.length)).toEqual([100, 100, 50]);
+    expect(types(h)).toEqual(["delete_batch", "delete_batch", "delete_batch"]);
+    expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  /** A delete or rename between puts may be what gives the next put its meaning, so a put or a
+   * rename ends a run. **Proven able to fail** by letting any non-rename ride a delete run. */
+  it("ends a run at a put or a rename, which go as their own frames", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([
+      del("a.md"),
+      del("b.md"),
+      put("c.md"),
+      del("d.md"),
+      del("e.md"),
+      { op: "rename", path: "z.md", from: "y.md", base: "by" },
+      del("f.md"),
+    ]);
+    void applyAll(h, ["a.md", "b.md"]);
+    await Promise.all(done.slice(0, 2));
+    void h.pump.handleDown({ type: "applied", path: "c.md", seq: 3, sha: "sha-c.md" });
+    await done[2];
+    void applyAll(h, ["d.md", "e.md"], 4);
+    await Promise.all(done.slice(3, 5));
+    void h.pump.handleDown({ type: "applied", path: "z.md", seq: 6, sha: "sz" });
+    await done[5];
+    void h.pump.handleDown({ type: "applied", path: "f.md", seq: 7, sha: "" });
+    await done[6];
+
+    // A lone delete at the tail is a plain delete, not a batch of one.
+    expect(types(h)).toEqual(["delete_batch", "put", "delete_batch", "rename", "delete"]);
+    expect(deleteBatches(h).map((b) => b.deletes.map((d) => d.path))).toEqual([
+      ["a.md", "b.md"],
+      ["d.md", "e.md"],
+    ]);
+  });
+
+  /** The vault closes a `delete_batch` naming one path twice, for good. */
+  it("never names one path twice in a batch", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([del("a.md"), del("b.md"), del("a.md")]);
+    expect(deleteBatches(h)[0]?.deletes.map((d) => d.path)).toEqual(["a.md", "b.md"]);
+    void applyAll(h, ["a.md", "b.md"]);
+    await Promise.all(done.slice(0, 2));
+    expect(h.transport.sent[h.transport.sent.length - 1]).toEqual({
+      type: "delete",
+      path: "a.md",
+      base_sha: "base-a.md",
+    });
+  });
+
+  /** An older vault drops the unknown frame in silence, and the pump would wait for good.
+   * **Proven able to fail** by reading `max_delete_batch_ops`'s absence as the wire's cap. */
+  it("sends no delete_batch when ready lacks max_delete_batch_ops", async () => {
+    const h = batching(
+      batchLimitsFrom({
+        type: "ready",
+        seq: 0,
+        max_batch_ops: 100,
+        max_batch_bytes: 4194304,
+        max_delete_batch_ops: 0,
+      }),
+    );
+    const done = h.pump.pushAll([del("a.md"), del("b.md")]);
+    expect(types(h)).toEqual(["delete"]);
+    void h.pump.handleDown({ type: "applied", path: "a.md", seq: 1, sha: "" });
+    await done[0];
+    expect(types(h)).toEqual(["delete", "delete"]);
+    void h.pump.handleDown({ type: "applied", path: "b.md", seq: 2, sha: "" });
+    await done[1];
+  });
+
+  /**
+   * Each entry's answer settles its own change, exactly as a single delete's would: applied
+   * (one event), applied with a null seq (already gone), and refused over a stale base — an
+   * edit beat the delete — which reaches `onRefused` and `retry.ts` with its current sha.
+   */
+  it("settles each delete by path: applied, already gone, refused over a stale base", async () => {
+    const h = batching();
+    const changes = [del("a.md"), del("b.md"), del("c.md")];
+    const [a, b, c] = h.pump.pushAll(changes);
+    const stale = {
+      path: "c.md",
+      reason: "the file changed since this device last saw it",
+      current_sha: "cur-c",
+    };
+    void h.pump.handleDown({
+      type: "applied_batch",
+      // Out of order on purpose: the answer is keyed by path, never by position.
+      applied: [
+        { path: "b.md", seq: null, sha: "" },
+        { path: "a.md", seq: 41, sha: "" },
+      ],
+      refused: [stale],
+    });
+
+    await expect(a).resolves.toEqual({ hashes: {}, forget: ["a.md"], refused: null, pull: [] });
+    await expect(b).resolves.toEqual({ hashes: {}, forget: ["b.md"], refused: null, pull: [] });
+    // The same outcome a single `refused` answer to a single `delete` gives.
+    await expect(c).resolves.toEqual(
+      applyResult(changes[2] as Change, { type: "refused", ...stale }),
+    );
+    expect(h.refusals).toEqual([{ type: "refused", ...stale }]);
+    expect(planRetry(h.refusals).redirty).toEqual([{ path: "c.md", currentSha: "cur-c" }]);
+    expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  /**
+   * §11 for a delete batch: a drop leaves every entry at the head of the queue, and `resume()`
+   * sends the same batch again. That is safe because a delete of a path already gone is
+   * applied, not refused — the vault may have applied the first send before the drop.
+   */
+  it("a drop mid-batch plus resume() re-sends it, and gone paths settle as applied", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([del("a.md"), del("b.md"), del("c.md")]);
+    expect(deleteBatches(h)).toHaveLength(1);
+
+    h.pump.connectionLost();
+    h.pump.resume();
+    expect(deleteBatches(h)).toHaveLength(2);
+    expect(deleteBatches(h)[1]).toEqual(deleteBatches(h)[0]);
+
+    // The first send landed before the drop: every path is gone now.
+    void h.pump.handleDown({
+      type: "applied_batch",
+      applied: ["a.md", "b.md", "c.md"].map((path) => ({ path, seq: null, sha: "" })),
+      refused: [],
+    });
+    const outcomes = await Promise.all(done);
+    expect(outcomes.map((o) => o.forget)).toEqual([["a.md"], ["b.md"], ["c.md"]]);
+    expect(h.pump.hasOutstanding()).toBe(false);
+  });
+
+  it("a reconnect to a vault without delete_batch re-sends the in-flight batch as single deletes", async () => {
+    const h = batching();
+    const done = h.pump.pushAll([del("a.md"), del("b.md")]);
+    h.pump.connectionLost();
+    h.pump.setBatchLimits({ ...LIMITS, maxDeleteOps: 0 });
+    h.pump.resume();
+    expect(types(h)).toEqual(["delete_batch", "delete"]);
+    // A stray batch answer now names nothing in flight.
+    void applyAll(h, ["a.md", "b.md"]);
+    expect(h.pump.hasOutstanding()).toBe(true);
+    for (const [i, path] of ["a.md", "b.md"].entries()) {
+      void h.pump.handleDown({ type: "applied", path, seq: i + 1, sha: "" });
+      await done[i];
+    }
+    expect(types(h)).toEqual(["delete_batch", "delete", "delete"]);
   });
 });
 
