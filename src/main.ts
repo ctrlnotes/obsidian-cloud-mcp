@@ -187,6 +187,9 @@ const PULL_RETRY_MAX_MS = 300_000;
 /** "Sync now" on a device that already has a connection, or is making one. */
 const ALREADY_SYNCING = `${PRODUCT_NAME} is already syncing.`;
 
+/** The longest the stored ledger trails an inbound write (`ledgerDirty`'s comment). */
+export const LEDGER_WRITE_MS = 500;
+
 /** A loaded state with a ledger this instance owns, since the ledger is updated in place: a
  * loaded record may be shared (`EMPTY_STATE`'s is). */
 const ownLedger = (state: SyncState): SyncState => ({
@@ -206,9 +209,19 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
    * settled change and every echoed event capped bulk sync at a few dozen files a second.
    * The unit is one inbound flush or snapshot (the pump's `persist`, always before its ack)
    * and one burst of push answers ({@link scheduleCommit}).
+   *
+   * **The stored ledger may run ahead of the stored cursor, never behind the disk for long.**
+   * A flush can write files for minutes (a catch-up awaits content window by window), and a
+   * mobile app can be killed with no unload. A ledger that still named a path this device
+   * had since deleted would send that delete again with a stale base after a restart, and
+   * one missing a file just written would push it back as new — resurrecting what another
+   * device deleted. So an inbound write also arms {@link ledgerTimer}: the ledger alone
+   * (with the cursor as it stands, which moves only at the flush's end) is written within
+   * {@link LEDGER_WRITE_MS} of it.
    */
   private ledgerDirty = false;
   private commitScheduled = false;
+  private ledgerTimer: number | null = null;
 
   /**
    * `onunload`, not a registration made during load. `onload` awaits the device identity
@@ -565,6 +578,7 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
 
   override onunload(): void {
     this.active = false;
+    this.flushLedger();
     this.pairingAborter.abort();
   }
 
@@ -1384,6 +1398,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
   }
 
   private disconnectSyncing(): void {
+    // Whatever landed is written before the pair goes: an unpair or relink may load another
+    // vault's state next, and an unload may be the last chance.
+    this.flushLedger();
     this.socket?.disconnect();
     this.socket = null;
     // A park belongs to the pair being torn down. The next connection is a fresh one — a
@@ -1400,6 +1417,11 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     // latch `syncing` exactly as an abandoned push once did.
     this.fetcher?.reset();
     this.fetcher = null;
+    // TODO: an abandoned pump's flush that is still awaiting content keeps running after
+    // this, and its `onApplied`/`onCursor` write into whatever `syncState` is current then —
+    // a newly adopted vault's, if a relink lands mid-flush. Its epoch should be checked, or
+    // its callbacks cut, before it records anything.
+    //
     // `abandon()` BEFORE dropping the reference (blocker fix): a `Pump` discarded with a
     // push still outstanding left that push's promise unsettled forever, and `pushTouched`
     // awaits it directly — `this.syncing` latched `true` for the rest of this instance's
@@ -1741,6 +1763,27 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     if (this.ledgerDirty) this.persistSyncState();
   }
 
+  /** {@link commitLedger} now, and disarm {@link ledgerTimer}: unload and teardown. */
+  private flushLedger(): void {
+    if (this.ledgerTimer !== null) window.clearTimeout(this.ledgerTimer);
+    this.ledgerTimer = null;
+    this.commitLedger();
+  }
+
+  /**
+   * Write the ledger within {@link LEDGER_WRITE_MS} of an inbound write, however long the
+   * flush it belongs to runs — at most one write per period, so a bulk catch-up pays for a
+   * handful of writes rather than one per file. A flush that ends sooner persists first and
+   * this finds nothing to write.
+   */
+  private armLedgerTimer(): void {
+    if (this.ledgerTimer !== null) return;
+    this.ledgerTimer = window.setTimeout(() => {
+      this.ledgerTimer = null;
+      this.commitLedger();
+    }, LEDGER_WRITE_MS);
+  }
+
   /**
    * Persist once, after every push answer that has already landed has been applied. A
    * batch's answer resolves all its entries' promises at once, so their handlers run back to
@@ -1766,9 +1809,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       // `retry.ts`'s own contract: correct the ledger to what the vault reports as
       // current, and mark the path dirty for the NEXT settle to re-derive and re-push —
       // never a fabricated wire frame built here.
+      // Persisted with the rest of this answer: `applyPushOutcome`, the only caller, has
+      // already marked the ledger dirty and scheduled its commit.
       this.ledger[r.path] = r.currentSha;
-      this.ledgerDirty = true;
-      this.scheduleCommit();
       this.touched.dirty.add(r.path);
       this.settler?.touch();
     }
@@ -2075,7 +2118,9 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
       if (a.hash === null) delete this.ledger[a.path];
       else this.ledger[a.path] = a.hash;
     }
-    if (applied.length > 0) this.ledgerDirty = true;
+    if (applied.length === 0) return;
+    this.ledgerDirty = true;
+    this.armLedgerTimer();
   }
 
   /**
@@ -2124,6 +2169,8 @@ export default class CtrlNotesPlugin extends Plugin implements SettingsHost {
     try {
       outcome = await pullIfUnchanged(this.vaultFiles(), p.path, p.pushed, p.vault, {
         fetchBytes: (sha) => this.fetchBytes(sha),
+        // At once rather than on the timer: a pull is one rare write outside any flush, and
+        // costs nothing to make durable with the file it just wrote.
         onApplied: (a) => {
           this.recordApplied([a]);
           this.commitLedger();

@@ -192,6 +192,35 @@ describe("Pump — persisting before the ack", () => {
   });
 });
 
+/**
+ * A snapshot is planned and guarded against the ledger as it stood when it began. The shell
+ * updates its ledger in place, so a push answer landing mid-snapshot would otherwise change
+ * the guard under it: a path the snapshot omits, holding an edit this device just pushed,
+ * would suddenly match its ledger entry and look unedited — and be trashed.
+ */
+describe("Pump — a snapshot's ledger", () => {
+  /** **Proven able to fail** by handing `applySnapshot` the live ledger instead of a copy:
+   * the edited note is trashed. */
+  it("keeps an edited path it omits even when a push answer moves the ledger mid-apply", async () => {
+    const edited = "my edit\n";
+    const editedSha = await contentHash(edited);
+    const vault = fakeVault({ "n.md": edited });
+    const live: Record<string, string> = { "n.md": await contentHash("the old version\n") };
+    const exists = vault.exists.bind(vault);
+    // This device's push of the edit is answered while the snapshot checks the path: the
+    // shell writes the pushed sha into the ledger it hands the pump, in place.
+    vault.exists = async (path, sensitive) => {
+      if (path === "n.md") live["n.md"] = editedSha;
+      return exists(path, sensitive);
+    };
+    const h = harness({ vault, ledger: () => live });
+
+    await h.pump.handleDown({ type: "snapshot", seq: 5, files: [], more: false });
+
+    expect(vault.text("n.md")).toBe(edited);
+  });
+});
+
 describe("Pump — inbound", () => {
   it("an inbound event is applied and then acked", async () => {
     const sha = await contentHash("hello\n");
