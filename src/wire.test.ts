@@ -168,24 +168,56 @@ describe("the batch limits a ready frame carries", () => {
       seq: 7,
       max_batch_ops: 0,
       max_batch_bytes: 0,
+      max_delete_batch_ops: 0,
     });
   });
 
   /** **Proven able to fail** by treating only `undefined` as absent: `null` throws. */
   it("read as 0 when null", () => {
     expect(
-      decodeDown({ type: "ready", seq: 7, max_batch_ops: null, max_batch_bytes: null }),
-    ).toMatchObject({ max_batch_ops: 0, max_batch_bytes: 0 });
+      decodeDown({
+        type: "ready",
+        seq: 7,
+        max_batch_ops: null,
+        max_batch_bytes: null,
+        max_delete_batch_ops: null,
+      }),
+    ).toMatchObject({ max_batch_ops: 0, max_batch_bytes: 0, max_delete_batch_ops: 0 });
   });
 
   it("are read when present", () => {
     expect(
+      decodeDown({
+        type: "ready",
+        seq: 7,
+        max_batch_ops: 100,
+        max_batch_bytes: 4194304,
+        max_delete_batch_ops: 100,
+      }),
+    ).toMatchObject({ max_batch_ops: 100, max_batch_bytes: 4194304, max_delete_batch_ops: 100 });
+  });
+
+  /**
+   * What a vault that batches puts and predates `delete_batch` sends — the downgrade every
+   * vault is on until it moves. Its deletes must go singly, or it drops the frame and the pump
+   * waits for good. **Proven able to fail** by reading an absent `max_delete_batch_ops` as
+   * `max_batch_ops`.
+   */
+  it("read no delete batching from a ready that batches puts only", () => {
+    expect(
       decodeDown({ type: "ready", seq: 7, max_batch_ops: 100, max_batch_bytes: 4194304 }),
-    ).toMatchObject({ max_batch_ops: 100, max_batch_bytes: 4194304 });
+    ).toEqual({
+      type: "ready",
+      seq: 7,
+      max_batch_ops: 100,
+      max_batch_bytes: 4194304,
+      max_delete_batch_ops: 0,
+    });
   });
 
   it("are still an error when present and not numbers", () => {
     expect(() => decodeDown({ type: "ready", seq: 7, max_batch_ops: "100" })).toThrow();
+    expect(() => decodeDown({ type: "ready", seq: 7, max_delete_batch_ops: "100" })).toThrow();
   });
 });
 

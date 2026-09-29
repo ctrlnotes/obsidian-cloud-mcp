@@ -13,7 +13,9 @@
 //
 // **A `put_batch` is still one frame and one answer** (bulk-ingest design BI5): consecutive
 // small puts at the head of the queue go together (`batch.ts`'s `planBatch`), and one
-// `Down::AppliedBatch` answers them all, keyed by their distinct paths.
+// `Down::AppliedBatch` answers them all, keyed by their distinct paths. **So is a
+// `delete_batch`**: consecutive deletes at the head go together, answered by the same frame
+// and settled by the same code, each entry exactly as a single `delete` would be.
 //
 // **§11: content addressing makes a retry a no-op.** A change is never removed from the
 // outbound queue until its own reply names it done — a connection dropping mid-upload
@@ -83,6 +85,14 @@ export interface PumpDeps {
    * landing (`Down::Applied.seq`) — see `handleDown`'s `applied` branch for why the last one
    * counts too: the vault will not send this device's own write back as a further event. */
   readonly onCursor: (seq: number) => void;
+  /**
+   * Make everything `onApplied` and `onCursor` recorded durable, now. Called **once** per
+   * inbound flush or snapshot — after its last `onApplied` and its `onCursor`, and **before
+   * its ack is sent** — so an ack never claims a position this device has not persisted, and
+   * a batch of events costs one write rather than one per file. Absent, nothing is persisted
+   * here (the caller persists as it records).
+   */
+  readonly persist?: () => void;
   /** A push came back refused — `retry.ts` is what classifies it; this file only reports it. */
   readonly onRefused?: (refused: DownRefused) => void;
   readonly attachments?: DeriveOptions["attachments"];
@@ -168,10 +178,10 @@ export class Pump {
 
   private readonly pending: QueuedPush[] = [];
   /** How many entries at the head of `pending` the one outstanding frame carries: 0 when
-   * nothing is in flight, 1 for a single frame, n ≥ 2 for a `put_batch` (`planBatch` never
-   * plans a batch of one). */
+   * nothing is in flight, 1 for a single frame, n ≥ 2 for a `put_batch` or `delete_batch`
+   * (`planBatch` never plans a batch of one). */
   private inFlight = 0;
-  /** What this connection's vault accepts in one `put_batch`, or `null` for no batching. Set
+  /** What this connection's vault accepts in one batch, or `null` for no batching. Set
    * from each `ready`, because a reconnect may land on a vault with different limits. */
   private limits: BatchLimits | null = null;
 
@@ -252,7 +262,7 @@ export class Pump {
   }
 
   /**
-   * What this connection's vault accepts in one `put_batch` (`batch.ts`'s `batchLimitsFrom`).
+   * What this connection's vault accepts in one batch (`batch.ts`'s `batchLimitsFrom`).
    * Call from each `ready`, BEFORE `resume()`, so the re-send of whatever was in flight is
    * planned against the vault that is actually there.
    */
@@ -353,9 +363,29 @@ export class Pump {
     }
   }
 
-  /** The header, then exactly one binary frame per entry, in order (`wire.ts`'s
-   * `UpPutBatch`) — `planBatch` admits only puts that fit one frame. */
+  /**
+   * One batch frame for `changes`, all of the head's kind (`planBatch` never mixes them). A
+   * `delete_batch` is its header alone; a `put_batch` is the header, then exactly one binary
+   * frame per entry, in order (`wire.ts`'s `UpPutBatch`) — `planBatch` admits only puts that
+   * fit one frame.
+   */
   private sendBatch(changes: readonly Change[]): void {
+    // Never drop an entry in silence: one of another kind would be left in flight with no
+    // answer ever naming it. `planBatch` never mixes kinds, so this is a bug if it throws —
+    // and `trySend` rejects every head rather than send part of them.
+    const kind = changes[0]?.op;
+    const stray = changes.find((c) => c.op !== kind);
+    if (stray !== undefined) {
+      throw new Error(`Ctrl Notes: a ${kind ?? "empty"} batch cannot carry a ${stray.op}`);
+    }
+    if (kind === "delete") {
+      const deletes = changes.flatMap((c) => (c.op === "delete" ? [c] : []));
+      this.deps.transport.send({
+        type: "delete_batch",
+        deletes: deletes.map((c) => ({ path: c.path, base_sha: c.base })),
+      });
+      return;
+    }
     const puts = changes.flatMap((c) => (c.op === "put" ? [c] : []));
     this.deps.transport.send({
       type: "put_batch",
@@ -420,9 +450,11 @@ export class Pump {
   }
 
   /**
-   * Settle every entry of the batch in flight from its one answer, by path. **An entry the
-   * answer does not name is rejected**, not left to hold the queue for good; `main.ts`
-   * redirties it. A refused entry behaves as a single `refused` does.
+   * Settle every entry of the batch in flight from its one answer, by path — a `put_batch`'s
+   * or a `delete_batch`'s alike. **An entry the answer does not name is rejected**, not left
+   * to hold the queue for good; `main.ts` redirties it. A refused entry behaves as a single
+   * `refused` does, so a delete refused over a stale base (an edit beat it) is handled as a
+   * single delete's refusal is.
    */
   private settleBatch(down: DownAppliedBatch): void {
     if (this.inFlight < 2) return; // Not an answer to anything outstanding — ignore it.
@@ -512,10 +544,12 @@ export class Pump {
     // Never at or past an event still outstanding, however well this batch
     // went. `outstanding`'s own comment says what acking past one costs.
     const floor = this.outstanding.size === 0 ? null : Math.min(...this.outstanding);
-    if (ackThrough !== null && (floor === null || ackThrough < floor)) {
-      this.deps.onCursor(ackThrough);
-      this.ack(ackThrough);
-    }
+    const acking = ackThrough !== null && (floor === null || ackThrough < floor);
+    if (acking) this.deps.onCursor(ackThrough);
+    // Once for the whole flush, and before the ack: an ack past what is persisted is a
+    // resume point a crash cannot back up.
+    this.deps.persist?.();
+    if (acking) this.ack(ackThrough);
     this.requestResync();
   }
 
@@ -586,7 +620,9 @@ export class Pump {
     );
     const { applied, complete, threw } = await applySnapshot(
       this.deps.vault,
-      this.deps.ledger(),
+      // A copy: the ledger is updated in place as paths apply, and the snapshot is planned
+      // and guarded against the ledger as it stood when it began.
+      { ...this.deps.ledger() },
       files,
       {
         fetchBytes: this.deps.fetchBytes,
@@ -629,8 +665,10 @@ export class Pump {
       this.outstanding.clear();
       for (const path of giveUp) this.localFailures.delete(path);
       this.deps.onCursor(down.seq);
-      this.ack(down.seq);
     }
+    // `flushEvents`' rule: one write, before the ack.
+    this.deps.persist?.();
+    if (complete) this.ack(down.seq);
   }
 
   private ack(seq: number): void {

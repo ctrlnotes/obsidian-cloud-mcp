@@ -3788,6 +3788,310 @@ describe("a first sync, batched when the vault takes batches", () => {
 });
 
 /**
+ * The ledger is persisted once per unit of work, never per entry: a 20,000-entry ledger costs
+ * ~25 ms to copy and serialise, and a write per settled change or echoed event capped bulk
+ * sync at a few dozen files a second. And never acked past: the state an ack claims is on
+ * disk before the ack leaves.
+ */
+describe("the sync ledger, persisted once per unit of work", () => {
+  const PAIRED = { controlplaneOrigin: "https://cp.test", vaultId: "vault-1", deviceId: "dev-1" };
+  const KEY = "ctrlrouter:sync-state";
+  const PATHS = Array.from({ length: 100 }, (_, i) => `note-${String(i).padStart(3, "0")}.md`);
+
+  interface Stored {
+    cursor: number;
+    hashes: Record<string, string>;
+  }
+
+  /** Load a device whose ledger names every path in `PATHS`, holding `files` on disk, and
+   * count every write of its sync state from here on. */
+  const synced = async (files: Record<string, string>, ledgerPaths: readonly string[] = PATHS) => {
+    stubWebSocket();
+    const sha = await contentHash("body\n");
+    const hashes = Object.fromEntries(ledgerPaths.map((p) => [p, sha]));
+    const plugin = await load(files, {
+      ...PAIRED,
+      appOptions: { localStorage: { [KEY]: { vaultId: "vault-1", cursor: 0, hashes } } },
+    });
+    const writes: Stored[] = [];
+    const save = plugin.app.saveLocalStorage.bind(plugin.app);
+    plugin.app.saveLocalStorage = (key: string, value: unknown) => {
+      if (key === KEY) writes.push(structuredClone(value) as Stored);
+      save(key, value);
+    };
+    const stored = () => plugin.app.loadLocalStorage(KEY) as Stored;
+    await vi.waitFor(() => expect(FakeWebSocket.instances[0]).toBeDefined(), UNTIL);
+    return { plugin, ws: FakeWebSocket.instances[0] as FakeWebSocket, writes, stored };
+  };
+
+  /**
+   * 100 deletes go up as one `delete_batch`, and its one `applied_batch` answer is one write.
+   * **Proven able to fail** by persisting in `applyPushOutcome` again: 100 writes.
+   */
+  it("persists a 100-entry delete_batch answer once", async () => {
+    const { ws, writes, stored } = await synced({}); // every ledger path is gone from disk
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({
+      type: "ready",
+      seq: 0,
+      max_batch_ops: 100,
+      max_batch_bytes: 4194304,
+      max_delete_batch_ops: 100,
+    });
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "delete_batch")).toBe(true),
+      UNTIL,
+    );
+    const batch = ws.upFrames().find((f) => f.type === "delete_batch");
+    const named = (batch?.deletes ?? []) as { path: string }[];
+    expect(named.map((d) => d.path).sort()).toEqual(PATHS);
+    expect(ws.upFrames().filter((f) => f.type === "delete")).toEqual([]);
+
+    writes.length = 0;
+    ws.emit({
+      type: "applied_batch",
+      applied: PATHS.map((path, i) => ({ path, seq: i + 1, sha: "" })),
+      refused: [],
+    });
+    await vi.waitFor(() => expect(stored().hashes).toEqual({}), UNTIL);
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(writes).toHaveLength(1);
+  });
+
+  /**
+   * A vault that batches puts and predates `delete_batch` (its `ready` has no delete field)
+   * gets single deletes: it would drop the unknown frame and the pump would wait for good.
+   */
+  it("sends single deletes to a vault whose ready batches puts only", async () => {
+    const { ws } = await synced({});
+    ws.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: "AAAA" });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "hello")).toBe(true), UNTIL);
+    ws.emit({ type: "ready", seq: 0, max_batch_ops: 100, max_batch_bytes: 4194304 });
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "delete")).toBe(true),
+      UNTIL,
+    );
+    await settleMicrotasks(QUIET_MS + 500);
+    expect(ws.upFrames().filter((f) => f.type === "delete_batch")).toEqual([]);
+    expect(ws.upFrames().filter((f) => f.type === "delete")).toHaveLength(1); // one in flight
+  });
+
+  /**
+   * 100 inbound deletes arriving together are one flush and one write, and the ack for them
+   * leaves only after that write: at the moment it is sent, the stored cursor is 100 and the
+   * stored ledger no longer names a path the flush deleted. **Proven able to fail** by
+   * persisting after the ack (the state stored at the ack still holds cursor 0), or per event
+   * (100 writes). One write in practice; two are allowed, since a flush slower than
+   * `LEDGER_WRITE_MS` under load also takes the timed write.
+   */
+  it("persists a 100-event flush once, before its ack", async () => {
+    const files = Object.fromEntries(PATHS.map((p) => [p, "body\n"]));
+    const { ws, writes, stored } = await synced(files);
+    const atAck: Stored[] = [];
+    const send = ws.send.bind(ws);
+    ws.send = (data: string | Uint8Array) => {
+      if (typeof data === "string" && (JSON.parse(data) as { type?: string }).type === "ack") {
+        atAck.push(stored());
+      }
+      send(data);
+    };
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500); // nothing to push: disk matches the ledger
+
+    writes.length = 0;
+    for (const [i, path] of PATHS.entries()) {
+      ws.emit({ type: "event", seq: i + 1, kind: "delete", path, sha: null, at_ms: 0 });
+    }
+    await vi.waitFor(() => expect(atAck).toHaveLength(1), UNTIL);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    expect(ws.upFrames().filter((f) => f.type === "ack")).toEqual([{ type: "ack", seq: 100 }]);
+    expect(atAck[0]).toMatchObject({ cursor: 100, hashes: {} });
+    expect(writes.length).toBeGreaterThanOrEqual(1);
+    expect(writes.length).toBeLessThanOrEqual(2);
+    expect(stored()).toMatchObject({ cursor: 100, hashes: {} });
+  });
+
+  /**
+   * A flush in which every event is skipped still moves the cursor, and the ack for it must
+   * find that cursor stored. **Proven able to fail** by not marking the state dirty in
+   * `advanceCursor`: nothing is written and the ack claims seq 1 over a stored 0.
+   */
+  it("stores the cursor of a flush that applied nothing before acking it", async () => {
+    const { ws, stored } = await synced({ "note-000.md": "body\n" }, ["note-000.md"]);
+    const atAck: Stored[] = [];
+    const send = ws.send.bind(ws);
+    ws.send = (data: string | Uint8Array) => {
+      if (typeof data === "string" && (JSON.parse(data) as { type?: string }).type === "ack") {
+        atAck.push(stored());
+      }
+      send(data);
+    };
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    // A kind this build does not know: skipped, and acked past.
+    ws.emit({ type: "event", seq: 1, kind: "future-kind", path: "x.md", sha: null, at_ms: 0 });
+    await vi.waitFor(() => expect(atAck).toHaveLength(1), UNTIL);
+    expect(atAck[0]?.cursor).toBe(1);
+  });
+
+  /**
+   * A flush that writes and then never finishes, as a catch-up waiting on content for minutes
+   * does: 62 deletes and a put of `b.md` land, and the last delete's trash never returns. Its
+   * events may arrive as more than one flush; whichever holds seq 64 never ends and never
+   * acks it. Resolves once `b.md` is recorded in memory.
+   */
+  const midFlush = async () => {
+    const deleted = Array.from({ length: 63 }, (_, i) => `d-${i}.md`);
+    const files: Record<string, string> = Object.fromEntries(deleted.map((p) => [p, "body\n"]));
+    const { plugin, ws, stored } = await synced(files, deleted);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    const adapter = plugin.app.vault.adapter as unknown as {
+      trashLocal: (path: string) => Promise<void>;
+    };
+    const trash = adapter.trashLocal.bind(adapter);
+    adapter.trashLocal = (path: string) =>
+      path === "d-62.md" ? new Promise<void>(() => {}) : trash(path);
+
+    const b = new TextEncoder().encode("from the vault\n");
+    const bSha = await contentHash("from the vault\n");
+    for (const [i, path] of deleted.slice(0, 62).entries()) {
+      ws.emit({ type: "event", seq: i + 1, kind: "delete", path, sha: null, at_ms: 0 });
+    }
+    ws.emit({ type: "event", seq: 63, kind: "put", path: "b.md", sha: bSha, at_ms: 0 });
+    ws.emit({ type: "event", seq: 64, kind: "delete", path: "d-62.md", sha: null, at_ms: 0 });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "want")).toBe(true), UNTIL);
+    ws.emit({ type: "blob", sha: bSha, bytes: b.byteLength });
+    ws.onmessage?.({ data: b.buffer });
+    const inMemory = () => (plugin as unknown as { syncState: Stored }).syncState.hashes;
+    await vi.waitFor(() => expect(inMemory()["b.md"]).toBe(bSha), {
+      timeout: 20_000,
+      interval: 1,
+    });
+    // What the disk holds now: `b.md`, and `d-62.md`, whose trash is still out.
+    const onDisk = { "b.md": bSha, "d-62.md": await contentHash("body\n") };
+    return { plugin, ws, stored, files, onDisk };
+  };
+
+  /**
+   * **The stored ledger never trails the disk for a whole flush.** Within `LEDGER_WRITE_MS`
+   * of the writes, with the flush still running and seq 64 unacked, the stored ledger says
+   * what the disk says; and a device restarted from that disk and that storage sends
+   * nothing — neither the deletes again with their old bases, nor `b.md` back as new.
+   *
+   * **Proven able to fail** by dropping the timed write in `recordApplied` (the stored ledger
+   * still names the deleted paths and not `b.md`, and the restarted device pushes), or by not
+   * marking the ledger dirty there.
+   */
+  it("writes the ledger during a flush that never finishes, and a restart then sends nothing", async () => {
+    const { plugin, ws, stored, files, onDisk } = await midFlush();
+
+    await vi.waitFor(() => expect(stored().hashes).toEqual(onDisk), UNTIL);
+    expect(stored().cursor).toBeLessThan(64);
+    expect(ws.upFrames().some((f) => f.type === "ack" && f.seq === 64)).toBe(false);
+
+    // Killed here, and started again over the same disk and the same storage.
+    const kept = structuredClone(stored());
+    plugin.unload();
+    await load(files, {
+      ...PAIRED,
+      appOptions: { localStorage: { [KEY]: { vaultId: "vault-1", ...kept } } },
+    });
+    await vi.waitFor(() => expect(FakeWebSocket.instances[1]).toBeDefined(), UNTIL);
+    const second = FakeWebSocket.instances[1] as FakeWebSocket;
+    await bringUp(second, kept.cursor);
+    await settleMicrotasks(QUIET_MS + 500);
+    const pushes = ["put", "delete", "put_batch", "delete_batch", "rename"];
+    expect(second.upFrames().filter((f) => pushes.includes(f.type as string))).toEqual([]);
+  });
+
+  /**
+   * Unload writes whatever has landed, however recently: the timed write may not have come
+   * round, and a disabled plugin gets no second chance. Checked the instant `unload` returns.
+   * **Proven able to fail** by dropping the flush from `onunload` and `disconnectSyncing`.
+   */
+  it("writes the ledger on unload, mid-flush", async () => {
+    const { plugin, stored, onDisk } = await midFlush();
+    plugin.unload();
+    expect(stored().hashes).toEqual(onDisk);
+  });
+
+  /**
+   * A derive compares what it read against the ledger as it stood when it began. The ledger
+   * is updated in place, so an inbound write landing while a read is in flight must not
+   * become the base that read is judged against: the read holds the bytes from BEFORE the
+   * other device's edit, and against the new base they look like an edit of this device's,
+   * pushed as a fast-forward that reverts the other device's change.
+   *
+   * **Proven able to fail** by handing `deriveChanges` the live ledger instead of a copy: a
+   * put of the old bytes goes up with the other device's sha as its base.
+   */
+  it("does not push stale bytes over an inbound edit that landed while the derive read them", async () => {
+    const { plugin, ws } = await synced({ "note-000.md": "body\n" }, ["note-000.md"]);
+    await bringUp(ws);
+    await settleMicrotasks(QUIET_MS + 500);
+
+    // The derive's read takes its bytes at once and answers only when released, as a read
+    // racing a write can on a real disk.
+    const adapter = plugin.app.vault.adapter as unknown as {
+      readBinary: (path: string) => Promise<ArrayBuffer>;
+    };
+    const realRead = adapter.readBinary.bind(adapter);
+    let release = (): void => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let held = false;
+    adapter.readBinary = async (path: string) => {
+      if (path !== "note-000.md" || held) return realRead(path);
+      held = true;
+      const early = await realRead(path);
+      await gate;
+      return early;
+    };
+    fireVaultEvent("modify", "note-000.md");
+    await vi.waitFor(() => expect(held).toBe(true), UNTIL);
+
+    // Another device's edit arrives and is applied while that read is out.
+    const theirs = new TextEncoder().encode("their edit\n");
+    const theirSha = await contentHash("their edit\n");
+    ws.emit({ type: "event", seq: 1, kind: "put", path: "note-000.md", sha: theirSha, at_ms: 0 });
+    await vi.waitFor(() => expect(ws.upFrames().some((f) => f.type === "want")).toBe(true), UNTIL);
+    ws.emit({ type: "blob", sha: theirSha, bytes: theirs.byteLength });
+    ws.onmessage?.({ data: theirs.buffer });
+    await vi.waitFor(
+      () => expect(ws.upFrames().some((f) => f.type === "ack" && f.seq === 1)).toBe(true),
+      UNTIL,
+    );
+
+    release();
+    await settleMicrotasks(QUIET_MS + 500);
+    const reverting = ws
+      .upFrames()
+      .filter((f) => f.type === "put" && f.path === "note-000.md" && f.base_sha === theirSha);
+    expect(reverting).toEqual([]);
+    expect(await plugin.app.vault.adapter.read("note-000.md")).toBe("their edit\n");
+  });
+
+  /** Every persistence test here reads storage back: the fake must hold a copy, as Obsidian's
+   * JSON store does, or an in-place change to the ledger would read back as written. */
+  it("the fake host's localStorage stores and returns copies", () => {
+    const app = fakeApp({});
+    const value = { hashes: { "a.md": "x" } };
+    app.saveLocalStorage("k", value);
+    value.hashes["a.md"] = "changed";
+    const back = app.loadLocalStorage("k") as typeof value;
+    expect(back).toEqual({ hashes: { "a.md": "x" } });
+    expect(back).not.toBe(value);
+    expect(app.loadLocalStorage("k")).not.toBe(back);
+  });
+});
+
+/**
  * The shell's half of catch-up (issue #16): `main.ts` must hand the pump a batched fetch,
  * and must tell it and the fetcher when a socket goes. The pump and fetcher tests cannot see
  * either wire — each case here fails with its wiring removed.

@@ -88,6 +88,21 @@ describe("up frames: the plugin's encoder matches the fixture's shape", () => {
       }),
     );
   });
+
+  // The same ordering rule as `put_batch`: the first entry carries a string `base_sha`, the
+  // second the `null` a path this device never saw the vault hold sends.
+  test("delete_batch", () => {
+    assertShape(
+      fixture("vault-sync/up.delete_batch.json"),
+      encodedShape({
+        type: "delete_batch",
+        deletes: [
+          { path: "projects/alpha.md", base_sha: "9f2c1a4e" },
+          { path: "projects/beta.md", base_sha: null },
+        ],
+      }),
+    );
+  });
 });
 
 // Minor/nit fix, folded into one: the checks below used to be one-directional — they
@@ -115,8 +130,22 @@ describe("down frames: the plugin's decoder accepts the fixture verbatim, in sha
     const f = fixture("vault-sync/down.ready.json");
     const d = decodeDown(f);
     expect(d.type).toBe("ready");
-    expect(d.type === "ready" && [d.max_batch_ops, d.max_batch_bytes]).toEqual([100, 4194304]);
+    expect(
+      d.type === "ready" && [d.max_batch_ops, d.max_batch_bytes, d.max_delete_batch_ops],
+    ).toEqual([100, 4194304, 100]);
     assertShape(f, d as unknown as JsonValue);
+  });
+
+  // A vault that batches puts and predates `delete_batch`: no delete batching, by value.
+  test("ready (put batching only)", () => {
+    const f = fixture("vault-sync/down.ready_put_only.json");
+    const d = decodeDown(f);
+    expect(
+      d.type === "ready" && [d.max_batch_ops, d.max_batch_bytes, d.max_delete_batch_ops],
+    ).toEqual([100, 4194304, 0]);
+    // The decoder adds the field the fixture lacks, so the shape is checked without it.
+    const { max_delete_batch_ops: _absent, ...rest } = d as { max_delete_batch_ops: number };
+    assertShape(f, rest);
   });
 
   test("applied_batch", () => {

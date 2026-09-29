@@ -34,7 +34,9 @@ export type LocalStore = Pick<App, "loadLocalStorage" | "saveLocalStorage">;
 
 const KEY = "ctrlrouter:sync-state";
 
-export const EMPTY_STATE: SyncState = { cursor: 0, hashes: {} };
+/** Frozen, ledger included: the shell updates its ledger in place, and one that forgot to
+ * copy this first (`main.ts`'s `ownLedger`) must fail loudly rather than share it. */
+export const EMPTY_STATE: SyncState = Object.freeze({ cursor: 0, hashes: Object.freeze({}) });
 
 /**
  * `isSafeInteger`, not `isInteger`: `Number.MAX_VALUE` and `2 ** 53 + 2` are both integers

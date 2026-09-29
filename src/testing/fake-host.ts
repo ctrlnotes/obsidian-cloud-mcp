@@ -218,13 +218,19 @@ export const fakeApp = (
       },
       listSecrets: () => Promise.resolve(Object.keys(secrets)),
     },
-    loadLocalStorage: (key: string) => local.get(key) ?? null,
+    // **By value, both ways**, as Obsidian's JSON-backed store is: holding the caller's
+    // object would make a later in-place change to it (the sync ledger is updated in place)
+    // read back as persisted without ever being saved.
+    loadLocalStorage: (key: string) => {
+      const held = local.get(key);
+      return held === undefined ? null : structuredClone(held);
+    },
     // Obsidian removes the entry on `null`, which is what "there is nothing here" is —
     // `clearPairingState` relies on it, so the fake must model it rather than storing the
     // `null` and answering with it.
     saveLocalStorage: (key: string, v: unknown) => {
       if (v === null || v === undefined) local.delete(key);
-      else local.set(key, v);
+      else local.set(key, structuredClone(v));
     },
   } as unknown as App;
 };

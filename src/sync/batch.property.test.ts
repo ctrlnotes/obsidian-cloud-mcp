@@ -17,7 +17,9 @@ const size = fc.oneof(
 const change: fc.Arbitrary<Change> = fc
   .oneof(
     { weight: 6, arbitrary: fc.record({ path, size }) },
-    { weight: 1, arbitrary: fc.record({ path, op: fc.constantFrom("delete", "rename") }) },
+    // Deletes often enough that runs of them are common, not just single ones.
+    { weight: 3, arbitrary: fc.record({ path, op: fc.constant("delete" as const) }) },
+    { weight: 1, arbitrary: fc.record({ path, op: fc.constant("rename" as const) }) },
   )
   .map((c): Change => {
     if ("size" in c) {
@@ -29,18 +31,34 @@ const change: fc.Arbitrary<Change> = fc
   });
 const queue = fc.array(change, { maxLength: 30 });
 const limits: fc.Arbitrary<BatchLimits> = fc.record({
-  maxOps: fc.integer({ min: 2, max: 12 }),
+  // 0 is a vault that batches deletes only.
+  maxOps: fc.oneof(fc.constant(0), fc.integer({ min: 2, max: 12 })),
   maxBytes: fc.integer({ min: 1, max: 2 * PUT_CHUNK_BYTES }),
+  // 0 is a vault that batches puts and predates `delete_batch`.
+  maxDeleteOps: fc.oneof(fc.constant(0), fc.integer({ min: 2, max: 12 })),
 });
 
 const bytesOf = (c: Change): number => (c.op === "put" ? c.content.byteLength : 0);
 
-/** Whether `c` may join a batch already holding `taken` — every criterion but the op count. */
-const fits = (taken: readonly Change[], c: Change, l: BatchLimits): boolean =>
-  c.op === "put" &&
-  c.content.byteLength <= PUT_CHUNK_BYTES &&
-  !taken.some((t) => t.path === c.path) &&
-  taken.reduce((sum, t) => sum + bytesOf(t), 0) + c.content.byteLength <= l.maxBytes;
+/**
+ * Whether `c` may join a batch already holding `taken` (or start one, when empty) — every
+ * criterion but the op count. A batch is one kind: the head's.
+ */
+const fits = (taken: readonly Change[], c: Change, l: BatchLimits): boolean => {
+  const kind = taken[0]?.op ?? c.op;
+  if (c.op !== kind || taken.some((t) => t.path === c.path)) return false;
+  if (c.op === "delete") return l.maxDeleteOps >= 2;
+  return (
+    c.op === "put" &&
+    l.maxOps >= 2 &&
+    c.content.byteLength <= PUT_CHUNK_BYTES &&
+    taken.reduce((sum, t) => sum + bytesOf(t), 0) + c.content.byteLength <= l.maxBytes
+  );
+};
+
+/** The op limit for a batch headed by `c`. */
+const opLimit = (c: Change, l: BatchLimits): number =>
+  c.op === "delete" ? l.maxDeleteOps : l.maxOps;
 
 describe("planBatch, as a property", () => {
   it("sends something whenever there is something, and never more than there is", () => {
@@ -64,23 +82,28 @@ describe("planBatch, as a property", () => {
   });
 
   /**
-   * Every batch obeys the wire: at most `maxOps` entries, at most `maxBytes` of content, puts
-   * only, each one frame, paths distinct. **Proven able to fail** by dropping the path check
-   * from `planBatch`: a duplicate appears within a few runs.
+   * Every batch obeys the wire: all puts or all deletes, never a rename, paths distinct. A put
+   * batch holds at most `maxOps` entries and `maxBytes` of content, each one frame; a delete
+   * batch at most `maxDeleteOps` entries, and none at all when that is 0. **Proven able to
+   * fail** by dropping the path check from `planBatch`: a duplicate appears within a few runs.
    */
-  it("a batch holds only small puts to distinct paths, within both limits", () => {
+  it("a batch is small puts or deletes to distinct paths, within the limits", () => {
     fc.assert(
       fc.property(queue, limits, (q, l) => {
         const n = planBatch(q, l);
         if (n < 2) return;
         const batch = q.slice(0, n);
+        const kind = batch[0]?.op;
+        expect(new Set(batch.map((c) => c.path)).size).toBe(n);
+        for (const c of batch) expect(c.op).toBe(kind);
+        if (kind === "delete") {
+          expect(n).toBeLessThanOrEqual(l.maxDeleteOps);
+          return;
+        }
+        expect(kind).toBe("put");
         expect(n).toBeLessThanOrEqual(l.maxOps);
         expect(batch.reduce((sum, c) => sum + bytesOf(c), 0)).toBeLessThanOrEqual(l.maxBytes);
-        for (const c of batch) {
-          expect(c.op).toBe("put");
-          expect(bytesOf(c)).toBeLessThanOrEqual(PUT_CHUNK_BYTES);
-        }
-        expect(new Set(batch.map((c) => c.path)).size).toBe(n);
+        for (const c of batch) expect(bytesOf(c)).toBeLessThanOrEqual(PUT_CHUNK_BYTES);
       }),
       { numRuns: 500 },
     );
@@ -97,7 +120,8 @@ describe("planBatch, as a property", () => {
         const n = planBatch(q, l);
         if (n >= 2) {
           const next = q[n];
-          if (n < Math.min(q.length, l.maxOps) && next !== undefined) {
+          const head = q[0] as Change;
+          if (n < Math.min(q.length, opLimit(head, l)) && next !== undefined) {
             expect(fits(q.slice(0, n), next, l)).toBe(false);
           }
         } else if (q.length >= 2) {
