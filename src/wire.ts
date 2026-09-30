@@ -47,21 +47,6 @@
 export const WIRE_VERSION = 4;
 
 /**
- * The oldest version this build still speaks, and it answers `hello` in whichever version the
- * vault's `challenge` named.
- *
- * **3 is still spoken because release-11 vaults speak it**, and the vault compares exactly
- * (`vault::sync::pure::admit`): speaking only 4 would lock this plugin out of every vault not
- * yet moved to a v4 release. A v3 closing carries no `retry` (decoded as `later`), and a v3
- * `ready` no batch limits ("no batching").
- *
- * TODO(v3): once no v3 vault remains, delete this, the per-connection `wireVersion` in
- * `socket.ts` (and its v3 pre-ready exemption), `optionalNum` and the v3 revoked-device advice
- * on `status.ts`'s retrying clause.
- */
-export const MIN_WIRE_VERSION = 3;
-
-/**
  * The largest single upload this vault will accept — pinned to
  * `apps/vault/src/sync/wire.rs`'s `MAX_FRAME_BYTES`.
  *
@@ -390,7 +375,7 @@ export class WireVersionMismatchError extends Error {
   constructor(readonly serverWireVersion: number) {
     super(
       `the vault wants to speak wire version ${serverWireVersion}; this plugin build only ` +
-        `speaks versions ${MIN_WIRE_VERSION} to ${WIRE_VERSION}; update the plugin`,
+        `speaks version ${WIRE_VERSION}; update the plugin`,
     );
   }
 }
@@ -431,8 +416,10 @@ function numOrNull(v: unknown, field: string): number | null {
 }
 
 /**
- * A count a vault older than the field does not send: absent (or `null`) is 0, which every
- * caller reads as "not offered". Present and not a number is still an error.
+ * A count a vault may leave out: absent (or `null`) is 0, which every caller reads as "not
+ * offered". Present and not a number is still an error. `ready`'s batch limits use it, because
+ * a vault that does not batch is not a malformed one, and `max_delete_batch_ops` arrived within
+ * version 4 (vault release 15).
  */
 function optionalNum(v: unknown, field: string): number {
   return v === undefined || v === null ? 0 : num(v, field);
@@ -462,7 +449,7 @@ export function decodeDown(raw: unknown): Down {
   switch (type) {
     case "challenge": {
       const wireVersion = num(v.wire_version, "wire_version");
-      if (wireVersion < MIN_WIRE_VERSION || wireVersion > WIRE_VERSION) {
+      if (wireVersion !== WIRE_VERSION) {
         throw new WireVersionMismatchError(wireVersion);
       }
       return {

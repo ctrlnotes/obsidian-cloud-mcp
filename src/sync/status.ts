@@ -321,14 +321,10 @@ function refusalReport(reason: string): StatusReport {
 
 /**
  * The retrying clause, quoting the vault's sentence verbatim (`socket.ts` reports a retried
- * closing without its own prefix). It carries the revoked-elsewhere advice too: a v3 vault
- * sends no `retry`, so its "not authorised" is retried (at most every five minutes) and this
- * clause is the only place its owner can learn why nothing is syncing.
- * TODO(v3): drop the advice here once no v3 vault remains.
+ * closing without its own prefix).
  */
 function retryingText(reason: string): string {
-  const said = `Reconnecting: the vault said "${reason}".`;
-  return reason.endsWith(REVOKED_ELSEWHERE_REASON) ? `${said} ${REVOKED_ELSEWHERE_ADVICE}` : said;
+  return `Reconnecting: the vault said "${reason}".`;
 }
 
 /**

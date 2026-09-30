@@ -3,7 +3,7 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Down, Up } from "../wire.ts";
-import { encodeUp, MIN_WIRE_VERSION, WIRE_VERSION } from "../wire.ts";
+import { encodeUp, WIRE_VERSION } from "../wire.ts";
 import {
   IDLE_REASON,
   MAX_RETRY_MS,
@@ -432,14 +432,14 @@ describe("SyncSocket", () => {
 
   /** Climbs the ladder with a pre-ready closing on each connection, and returns the socket
    * count after each wait of `WORK_RETRY_MAX_MS`. */
-  const preReadyClosings = async (wireVersion: number, closing: object): Promise<number[]> => {
+  const preReadyClosings = async (closing: object): Promise<number[]> => {
     const h = harness({ hasWork: () => true, random: () => 1 });
     h.socket.connect();
     await flush();
     const counts: number[] = [];
     for (let failure = 1; failure <= 8; failure++) {
       const t = latest(h);
-      t.emit({ type: "challenge", wire_version: wireVersion, challenge: CHALLENGE_B64 });
+      t.emit({ type: "challenge", wire_version: WIRE_VERSION, challenge: CHALLENGE_B64 });
       await flush();
       t.emit(closing);
       await flush();
@@ -450,29 +450,11 @@ describe("SyncSocket", () => {
     return counts;
   };
 
-  /**
-   * A v3 vault's refusal of the hello carries no `retry` and may be a revoked device, so it
-   * keeps the ordinary five-minute ceiling even with work queued, rather than BI4's 30 s.
-   *
-   * **Proven able to fail** by passing `true` for `capForWork` unconditionally: every
-   * reconnect lands inside 30 s.
-   */
-  it("a v3 vault's pre-ready refusal is not retried faster for queued work", async () => {
+  /** A pre-ready `later` (a busy vault's `handshake timed out`) keeps BI4's work cap: the vault
+   * says `never` for a device it will not admit. */
+  it("a pre-ready later closing keeps the work cap", async () => {
     vi.useFakeTimers();
-    const counts = await preReadyClosings(MIN_WIRE_VERSION, {
-      type: "closing",
-      reason: "not authorised",
-    });
-    // 1, 2, 4, 8 and 16 s land inside each 30 s wait; the 32 s rung does not.
-    expect(counts.slice(0, 5)).toEqual([2, 3, 4, 5, 6]);
-    expect(counts[5]).toBe(6);
-  });
-
-  /** The control: a v4 vault's pre-ready `later` (a busy vault's `handshake timed out`) keeps
-   * the cap, because a v4 vault says `never` for a device it will not admit. */
-  it("a v4 vault's pre-ready later closing keeps the work cap", async () => {
-    vi.useFakeTimers();
-    const counts = await preReadyClosings(WIRE_VERSION, {
+    const counts = await preReadyClosings({
       type: "closing",
       reason: "handshake timed out",
       retry: "later",
@@ -571,19 +553,13 @@ describe("SyncSocket", () => {
     // Against WIRE_VERSION rather than a literal: the number moves whenever a
     // frame changes shape, and a test that hardcodes it fails for the wrong
     // reason every time it does.
-    expect(h.closings[0]).toContain(`speaks versions ${MIN_WIRE_VERSION} to ${WIRE_VERSION}`);
+    expect(h.closings[0]).toContain(`speaks version ${WIRE_VERSION}`);
     expect(t.closed).toBe(true);
     expect(t.sent).toHaveLength(0); // never answered a version it does not speak
   });
 
-  /**
-   * A release-11 vault speaks 3 and admits only a v3 hello (`vault::sync::pure::admit`
-   * compares exactly). Answering in this build's newest version would lock this plugin out of
-   * every vault not yet moved to a v4 release.
-   *
-   * **Proven able to fail** by sending `WIRE_VERSION` in `hello`: the frame says 4.
-   */
-  it("hello answers with the version the challenge named (3 against an older vault)", async () => {
+  /** Every vault speaks 4 now; a version-3 challenge is refused and never answered. */
+  it("refuses a version-3 challenge and answers nothing", async () => {
     const h = harness();
     h.socket.connect();
     await flush();
@@ -591,9 +567,9 @@ describe("SyncSocket", () => {
     t.emit({ type: "challenge", wire_version: 3, challenge: CHALLENGE_B64 });
     await flush();
 
-    const [hello] = t.upFrames();
-    expect(hello).toMatchObject({ type: "hello", wire_version: 3 });
-    expect(h.closings).toEqual([]);
+    expect(h.closings).toHaveLength(1);
+    expect(h.closings[0]).toContain("version 3");
+    expect(t.sent).toHaveLength(0);
   });
 
   it("a dropped socket reconnects with backoff, not immediately", async () => {

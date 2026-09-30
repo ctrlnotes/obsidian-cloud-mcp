@@ -15,13 +15,12 @@
 // **A `closing` frame says whether to retry, in a field, and only the field decides**
 // (bulk-ingest design BI1). `retry: "never"` is a reason a human has to fix: `terminal`,
 // reported once through `onClosing`, no retry, and `connect()` must be called again
-// deliberately. Anything else — `later`, an absent field (a v3 vault), an unknown value — gets
+// deliberately. Anything else — `later`, an absent field, an unknown value — gets
 // the backoff-and-retry an ordinary drop gets (`resumable`). The reason's text chooses only HOW
 // to retry (a restart waits a fixed delay, an idle close parks), never WHETHER.
 //
 // **While this device has work outstanding, a retry waits at most `WORK_RETRY_MAX_MS`**
-// (BI4), however far the backoff has climbed — except after a v3 vault's refusal of the
-// hello, which may be a revoked device and keeps the ordinary ceiling.
+// (BI4), however far the backoff has climbed.
 //
 // **A vault restarting for an update is neither, and gets a third treatment** (staged
 // rollout design §5). On SIGTERM the vault sends `closing` with `VAULT_RESTART_REASON`, then
@@ -259,9 +258,6 @@ export class SyncSocket {
    * header). */
   private awaitingReadyAfterHello = false;
   private ackedSeq: number;
-  /** The version the vault's `challenge` named, which `hello` answers in: a v3 vault admits
-   * only a v3 hello. TODO(v3): `WIRE_VERSION` again once no v3 vault remains. */
-  private wireVersion = 0;
 
   constructor(
     private readonly deps: SyncSocketDeps,
@@ -473,11 +469,8 @@ export class SyncSocket {
       } else if (down.retry === "never") {
         this.terminal(socket, this.closingMessage(down.reason));
       } else {
-        // The vault's own words, not `closingMessage`'s. A v3 vault's refusal of the hello may
-        // be a revoked device, so it keeps the ordinary ceiling (this module's header); a v4
-        // vault says `never` for that. TODO(v3): drop with `MIN_WIRE_VERSION`.
-        const v3Refusal = this.awaitingReadyAfterHello && this.wireVersion < WIRE_VERSION;
-        this.resumable(socket, down.reason, !v3Refusal);
+        // The vault's own words, not `closingMessage`'s.
+        this.resumable(socket, down.reason);
       }
       return;
     }
@@ -507,7 +500,6 @@ export class SyncSocket {
     // first" branch, which would replace the vault's own reason with a confusing one and
     // skip `closingMessage`'s vault-id diagnosis entirely.
     this.awaitingReadyAfterHello = true;
-    this.wireVersion = down.wire_version;
     await this.answerChallenge(socket, down.challenge);
   }
 
@@ -518,8 +510,7 @@ export class SyncSocket {
     const signature = await this.deps.identity.signChallenge(this.deps.vaultId, challenge);
     const hello: Up = {
       type: "hello",
-      // The challenge's own version, not this build's newest: see `wireVersion`.
-      wire_version: this.wireVersion,
+      wire_version: WIRE_VERSION,
       device_id: this.deps.deviceId,
       signature,
       since_seq: this.ackedSeq > 0 ? this.ackedSeq : null,
@@ -560,13 +551,13 @@ export class SyncSocket {
    * `terminal`, `wanted` stays true and the retry is the one an ordinary drop gets
    * (`scheduleRetry`); this path only adds the vault's message.
    */
-  private resumable(socket: SocketLike, message: string, capForWork: boolean): void {
+  private resumable(socket: SocketLike, message: string): void {
     this.clearTimers();
     const wasOpen = this.release(socket);
     socket.close();
     this.deps.onClosing(message, true);
     if (wasOpen) this.deps.onDisconnected?.();
-    this.scheduleRetry(capForWork);
+    this.scheduleRetry();
   }
 
   /**
@@ -632,12 +623,12 @@ export class SyncSocket {
     return true;
   }
 
-  private scheduleRetry(capForWork = true): void {
+  private scheduleRetry(): void {
     if (this.timer !== null) return;
     const random = this.deps.random ?? Math.random;
     // Jittered so connections that dropped together do not retry in lockstep (`retryWait`);
     // `retryMs` itself keeps its exact doubling, so the ladder never drifts.
-    const hasWork = capForWork && (this.deps.hasWork?.() ?? false);
+    const hasWork = this.deps.hasWork?.() ?? false;
     const wait = retryWait(this.retryMs, random(), hasWork);
     this.retryMs = Math.min(this.retryMs * 2, MAX_RETRY_MS);
     this.timer = window.setTimeout(() => {

@@ -296,21 +296,6 @@ describe("a device reconnecting by itself", () => {
     expect(text.startsWith("Up to date.")).toBe(true);
   });
 
-  /**
-   * A vault older than BI1 sends no `retry`, so its "not authorised" is retried like any
-   * other closing, and this clause is where its owner learns why nothing syncs. **Proven able
-   * to fail** by rendering the clause without the advice: the device-list match goes red.
-   */
-  it("carries the revoked-elsewhere advice when the reason is the opaque refusal", () => {
-    const text = describeStatus({
-      ...IDLE_STATUS,
-      retrying: "not authorised",
-    });
-    expect(text).toContain('Reconnecting: the vault said "not authorised".');
-    expect(text).toMatch(/device list/i);
-    expect(describeStatus({ ...IDLE_STATUS, retrying: "busy" })).not.toMatch(/device list/i);
-  });
-
   it("a refusal still outranks it", () => {
     const text = describeStatus({ ...IDLE_STATUS, refusal: "teapot", retrying: "busy" });
     expect(text).toBe("Sync was refused: teapot.");
