@@ -153,9 +153,9 @@ describe("a closing's retry field", () => {
 });
 
 /**
- * Bulk-ingest design BI5. A vault older than `put_batch` sends a `ready` with no limits, and
- * that must read as "no batching", not as a malformed frame — a decode error on `ready` would
- * fail the handshake with every vault not yet moved to a batching release.
+ * Bulk-ingest design BI5. A vault that does not batch sends a `ready` with no limits, and that
+ * must read as "no batching", not as a malformed frame: a decode error on `ready` fails the
+ * handshake.
  */
 describe("the batch limits a ready frame carries", () => {
   it("read as 0 and 0 when the vault sends none", () => {

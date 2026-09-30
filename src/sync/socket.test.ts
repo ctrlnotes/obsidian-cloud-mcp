@@ -288,7 +288,7 @@ describe("SyncSocket", () => {
    *
    * **Proven able to fail** by decoding an absent `retry` as `never`: no second socket.
    */
-  it("a closing with no retry field (an older vault) retries with backoff", async () => {
+  it("a closing with no retry field retries with backoff, never terminal", async () => {
     vi.useFakeTimers();
     const h = harness();
     const t = await connected(h);
