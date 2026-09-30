@@ -10,7 +10,6 @@ import {
   decodeDown,
   encodeUp,
   MAX_WANT_SHAS,
-  MIN_WIRE_VERSION,
   NO_REASON_GIVEN,
   readDownFrame,
   UnknownDownFrameError,
@@ -94,10 +93,7 @@ describe("a wire_version mismatch refuses and names the version", () => {
   });
 });
 
-/**
- * Bulk-ingest design BI1: 4 is this build's version, and 3 is still spoken so that a vault not
- * yet moved to a v4 release can be reached (`MIN_WIRE_VERSION`'s doc comment).
- */
+/** Bulk-ingest design BI1: 4 is this build's version, and the only one it speaks. */
 describe("the wire versions this build speaks", () => {
   const challenge = (wire_version: number) => ({
     type: "challenge",
@@ -105,22 +101,22 @@ describe("the wire versions this build speaks", () => {
     challenge: "Y2hhbA",
   });
 
-  it("is 3 to 4", () => {
-    expect([MIN_WIRE_VERSION, WIRE_VERSION]).toEqual([3, 4]);
+  it("is 4", () => {
+    expect(WIRE_VERSION).toBe(4);
   });
 
-  it.each([3, 4])("accepts a challenge of %i", (v) => {
-    expect(decodeDown(challenge(v))).toMatchObject({ type: "challenge", wire_version: v });
+  it("accepts a challenge of 4", () => {
+    expect(decodeDown(challenge(4))).toMatchObject({ type: "challenge", wire_version: 4 });
   });
 
-  it.each([2, 5])("refuses a challenge of %i", (v) => {
+  it.each([2, 3, 5])("refuses a challenge of %i", (v) => {
     expect(() => decodeDown(challenge(v))).toThrow(WireVersionMismatchError);
   });
 });
 
 /**
  * BI1's `retry`, decoded leniently: only an explicit `never` stops this device. Anything else —
- * absent (a v3 vault), a value from some future vault, the wrong type — is `later`, and none of
+ * absent, a value from some future vault, the wrong type — is `later`, and none of
  * them may throw, because a decode error on a frame after the handshake is terminal.
  *
  * **Proven able to fail** by decoding with `str(v.retry, …)`: the absent, 7 and null rows throw.
@@ -157,9 +153,9 @@ describe("a closing's retry field", () => {
 });
 
 /**
- * Bulk-ingest design BI5. A vault older than `put_batch` sends a `ready` with no limits, and
- * that must read as "no batching", not as a malformed frame — a decode error on `ready` would
- * fail the handshake with every vault not yet moved to a batching release.
+ * Bulk-ingest design BI5. A vault that does not batch sends a `ready` with no limits, and that
+ * must read as "no batching", not as a malformed frame: a decode error on `ready` fails the
+ * handshake.
  */
 describe("the batch limits a ready frame carries", () => {
   it("read as 0 and 0 when the vault sends none", () => {
