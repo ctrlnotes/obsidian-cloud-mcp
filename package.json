@@ -14,8 +14,8 @@
     "lint": "biome check . && eslint --max-warnings 0 src package.json manifest.json && eslint --quiet -c eslint.tests.config.mjs src vitest.config.ts"
   },
   "devDependencies": {
-    "@biomejs/biome": "2.5.14",
-    "@types/node": "24.19.0",
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "24.19.1",
     "@typescript/native": "npm:typescript@7.0.2",
     "esbuild": "0.28.2",
     "eslint": "10.11.0",
@@ -23,8 +23,8 @@
     "fast-check": "4.10.2",
     "obsidian": "1.13.1",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.70.1",
-    "vitest": "5.0.2"
+    "typescript-eslint": "8.71.0",
+    "vitest": "5.0.3"
   },
   "dependencies": {
     "@noble/ed25519": "3.2.0"
